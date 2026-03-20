@@ -1,0 +1,72 @@
+//! # seameet
+//!
+//! Real-time audio/video peer for WebRTC.
+//! Rust receives, processes, and re-emits media between browser participants.
+//!
+//! ## Quick start
+//!
+//! ```rust,no_run
+//! use seameet::{Room, RoomConfig, RoomEvent, Passthrough, WsSignaling, ParticipantId};
+//! use tokio_stream::StreamExt;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), seameet::SeaMeetError> {
+//!     let room = Room::new(RoomConfig::default());
+//!     let mut events = room.events();
+//!
+//!     // Connect participant A
+//!     let signaling_a = WsSignaling::connect("ws://localhost:8080").await?;
+//!     let handle_a = room.add_participant(
+//!         ParticipantId::random(),
+//!         signaling_a,
+//!         Passthrough,
+//!     ).await?;
+//!
+//!     // Listen to room events
+//!     while let Some(event) = events.next().await {
+//!         match event {
+//!             RoomEvent::RoomEnded { .. } => break,
+//!             RoomEvent::SpeechStarted { participant } => {
+//!                 println!("{participant} started speaking");
+//!             }
+//!             _ => {}
+//!         }
+//!     }
+//!     Ok(())
+//! }
+//! ```
+
+pub mod room;
+
+// ── Core types ──────────────────────────────────────────────────────────
+
+pub use seameet_core::{
+    EncodedAudio, EncodedVideo, ParticipantId, PcmFrame, RoomEvent, SeaMeetError, TrackDirection,
+    TrackHandle, TrackId, VideoFrame,
+};
+
+// ── Traits ──────────────────────────────────────────────────────────────
+
+pub use seameet_core::{AudioSource, Decoder, Encoder, Processor, ProcessorHint, VideoSource};
+
+// ── Codec implementations ───────────────────────────────────────────────
+
+pub use seameet_codec::{
+    AudioPassthrough, OpusDecoder, OpusEncoder, OpusEncoderConfig, Vp8Decoder, Vp8Encoder,
+    Vp8EncoderConfig,
+};
+pub use seameet_core::Passthrough;
+
+// ── Signaling ───────────────────────────────────────────────────────────
+
+pub use seameet_signaling::{SdpMessage, SignalingBackend, WsSignaling, WsSignalingConfig};
+
+// ── Pipeline (low-level escape hatch) ───────────────────────────────────
+
+pub use seameet_pipeline::{
+    InboundPipeline, OutboundPipeline, PeerConnection, PeerEvent, ProcessorChain,
+};
+
+// ── High-level facade ───────────────────────────────────────────────────
+
+pub use room::{Room, RoomConfig, RoomHandle};
