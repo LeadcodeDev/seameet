@@ -7,9 +7,11 @@
 pub mod inbound;
 pub mod outbound;
 pub mod peer;
+pub mod peer_connection;
 pub mod processor;
 
 pub use inbound::{InboundEvent, InboundPipeline};
 pub use outbound::{rtp_channel, OutboundPipeline};
 pub use peer::Peer;
+pub use peer_connection::{PeerConnection, PeerEvent};
 pub use processor::ProcessorChain;

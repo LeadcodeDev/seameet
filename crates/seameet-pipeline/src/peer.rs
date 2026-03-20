@@ -1,11 +1,14 @@
+use bytes::Bytes;
 use seameet_core::frame::{EncodedAudio, PcmFrame, VideoFrame};
-use seameet_core::traits::{Decoder, Encoder};
+use seameet_core::traits::{Decoder, Encoder, Processor};
 use seameet_core::{ParticipantId, SeaMeetError};
-use tokio::sync::broadcast;
+use seameet_rtp::RtpSender;
+use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
 use crate::inbound::InboundPipeline;
 use crate::outbound::OutboundPipeline;
+use crate::peer_connection::{PeerConnection, PeerEvent};
 
 /// Aggregates an inbound and outbound pipeline for a single participant.
 pub struct Peer<
@@ -47,6 +50,43 @@ where
         }
     }
 
+    /// Creates a peer backed by a [`PeerConnection`], wiring RTP events
+    /// from the connection into the inbound pipeline and outbound RTP
+    /// through the connection's UDP socket.
+    ///
+    /// * `processor` — an optional processor to attach to the outbound pipeline.
+    /// * `rtp_tx` — the sender side of the channel that `RtpSender` writes to.
+    ///   The caller should spawn a task that reads from the corresponding receiver
+    ///   and forwards bytes through the `PeerConnection`.
+    pub fn from_peer_connection(
+        id: ParticipantId,
+        decoder: D,
+        encoder: E,
+        pc: &PeerConnection,
+        processor: Option<Box<dyn Processor>>,
+    ) -> (Self, broadcast::Receiver<PeerEvent>) {
+        let (rtp_tx, _rtp_rx) = mpsc::channel::<Bytes>(256);
+        let sender = RtpSender::new(rand::random(), rtp_tx);
+        let mut outbound = OutboundPipeline::new(encoder, sender);
+        if let Some(p) = processor {
+            outbound.add_processor(p);
+        }
+
+        let (audio_tx, _) = broadcast::channel(64);
+        let (video_tx, _) = broadcast::channel(16);
+        let inbound = InboundPipeline::new(decoder, audio_tx.clone(), video_tx.clone());
+        let events = pc.events();
+
+        let peer = Self {
+            id,
+            inbound,
+            outbound,
+            audio_tx,
+            video_tx,
+        };
+        (peer, events)
+    }
+
     /// Returns a receiver for decoded audio frames from this peer.
     pub fn audio_rx(&self) -> broadcast::Receiver<PcmFrame> {
         self.audio_tx.subscribe()
@@ -55,6 +95,50 @@ where
     /// Returns a receiver for decoded video frames from this peer.
     pub fn video_rx(&self) -> broadcast::Receiver<VideoFrame> {
         self.video_tx.subscribe()
+    }
+
+    /// Runs with a [`PeerConnection`] event stream, forwarding received RTP
+    /// packets into the inbound pipeline.
+    pub async fn run_with_events(
+        mut self,
+        mut peer_events: broadcast::Receiver<PeerEvent>,
+        mut stop: broadcast::Receiver<()>,
+    ) -> Result<(), SeaMeetError> {
+        debug!(participant = %self.id, "peer started (with PeerConnection)");
+
+        loop {
+            tokio::select! {
+                result = peer_events.recv() => {
+                    match result {
+                        Ok(PeerEvent::RtpReceived(pkt)) => {
+                            self.inbound.push_rtp(pkt);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            if let Err(e) = self.inbound.drain(now_ms) {
+                                debug!("inbound drain error: {e}");
+                            }
+                        }
+                        Ok(PeerEvent::Disconnected) => {
+                            debug!(participant = %self.id, "peer disconnected");
+                            return Ok(());
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug!(skipped = n, "peer event lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = stop.recv() => {
+                    debug!("peer stopped by signal");
+                    return Ok(());
+                }
+            }
+        }
     }
 
     /// Runs both inbound and outbound pipelines until stopped.
