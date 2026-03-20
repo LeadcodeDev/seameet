@@ -4,4 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-seameet-core = { path = "../seameet-core" }
+seameet-core       = { path = "../seameet-core" }
+tokio              = { workspace = true }
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tokio-tungstenite  = "0.21"
+futures-util       = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid  = { workspace = true }
