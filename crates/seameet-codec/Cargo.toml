@@ -3,5 +3,14 @@ name = "seameet-codec"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default  = []
+opus-ffi = ["dep:audiopus"]
+vp8-ffi  = ["dep:vpx"]
+
 [dependencies]
 seameet-core = { path = "../seameet-core" }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+audiopus     = { version = "0.3.0-rc.0", optional = true }
+vpx          = { version = "0.3", optional = true }
