@@ -194,7 +194,6 @@ async fn test_room_close() {
 /// A dummy signaling backend that does nothing (for test use).
 struct DummySignaling;
 
-#[async_trait::async_trait]
 impl seameet::SignalingBackend for DummySignaling {
     async fn send(&self, _msg: seameet::SdpMessage) -> Result<(), SeaMeetError> {
         Ok(())

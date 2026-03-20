@@ -2,6 +2,7 @@
 name        = "seameet"
 version     = "0.1.0"
 edition     = "2021"
+rust-version.workspace = true
 description = "Real-time audio/video peer for WebRTC — receive, process, re-emit"
 license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/yourname/seameet"
@@ -25,7 +26,6 @@ vp8-ffi  = ["seameet-codec/vp8-ffi"]
 
 [dev-dependencies]
 tokio         = { workspace = true }
-async-trait   = { workspace = true }
 seameet-rtp   = { path = "../seameet-rtp" }
 seameet-pipeline = { path = "../seameet-pipeline" }
 tokio-stream  = { workspace = true }

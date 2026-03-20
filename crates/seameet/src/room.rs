@@ -348,7 +348,6 @@ mod tests {
     /// A dummy signaling backend for tests.
     struct DummySignaling;
 
-    #[async_trait::async_trait]
     impl seameet_signaling::SignalingBackend for DummySignaling {
         async fn send(&self, _msg: seameet_signaling::SdpMessage) -> Result<(), SeaMeetError> {
             Ok(())

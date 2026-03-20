@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use seameet_core::SeaMeetError;
 use tokio::net::TcpStream;
@@ -114,7 +113,6 @@ impl WsSignaling {
     }
 }
 
-#[async_trait]
 impl SignalingBackend for WsSignaling {
     async fn send(&self, msg: SdpMessage) -> Result<(), SeaMeetError> {
         let json = serde_json::to_string(&msg)

@@ -9,17 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "audiopus"
 version = "0.3.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -887,7 +876,6 @@ dependencies = [
 name = "seameet"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "seameet-codec",
  "seameet-core",
  "seameet-pipeline",
@@ -954,7 +942,6 @@ dependencies = [
 name = "seameet-signaling"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "futures-util",
  "seameet-core",
  "serde",
