@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -6,6 +6,7 @@ use seameet_codec::AudioPassthrough;
 use seameet_core::events::RoomEvent;
 use seameet_core::frame::{PcmFrame, VideoFrame};
 use seameet_core::traits::Processor;
+use seameet_core::track::TrackId;
 use seameet_core::{ParticipantId, SeaMeetError};
 use seameet_pipeline::peer_connection::PeerConnection;
 use seameet_pipeline::Peer;
@@ -85,6 +86,8 @@ struct ParticipantEntry {
     handle: RoomHandle,
     stop_tx: broadcast::Sender<()>,
     _task: JoinHandle<()>,
+    /// Active screen share track IDs for this participant.
+    screen_tracks: HashSet<TrackId>,
 }
 
 /// High-level room — manages participants, signaling, and media pipelines.
@@ -238,6 +241,7 @@ impl Room {
                     handle: room_handle.clone(),
                     stop_tx,
                     _task: task,
+                    screen_tracks: HashSet::new(),
                 },
             );
             info!(
@@ -355,6 +359,51 @@ impl Room {
         tokio::task::yield_now().await;
 
         Ok(())
+    }
+
+    /// Returns all active screen share tracks in the room, across all participants.
+    pub fn active_screen_shares(&self) -> Vec<(ParticipantId, TrackId)> {
+        let participants = self.participants.read().expect("lock not poisoned");
+        participants
+            .iter()
+            .flat_map(|(pid, entry)| {
+                entry.screen_tracks.iter().map(move |tid| (*pid, *tid))
+            })
+            .collect()
+    }
+
+    /// Registers a screen share for a participant (called from signaling handler).
+    pub fn notify_screen_share_started(
+        &self,
+        participant: &ParticipantId,
+        track_id: TrackId,
+    ) {
+        if let Ok(mut participants) = self.participants.write() {
+            if let Some(entry) = participants.get_mut(participant) {
+                entry.screen_tracks.insert(track_id);
+            }
+        }
+        let _ = self.event_tx.send(RoomEvent::ScreenShareStarted {
+            participant: *participant,
+            track_id,
+        });
+    }
+
+    /// Unregisters a screen share for a participant.
+    pub fn notify_screen_share_stopped(
+        &self,
+        participant: &ParticipantId,
+        track_id: TrackId,
+    ) {
+        if let Ok(mut participants) = self.participants.write() {
+            if let Some(entry) = participants.get_mut(participant) {
+                entry.screen_tracks.remove(&track_id);
+            }
+        }
+        let _ = self.event_tx.send(RoomEvent::ScreenShareStopped {
+            participant: *participant,
+            track_id,
+        });
     }
 }
 
@@ -565,5 +614,48 @@ mod tests {
             .expect("task should not panic");
 
         let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_room_active_screen_shares_empty() {
+        let room = Room::new(RoomConfig::default());
+        assert!(room.active_screen_shares().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_room_active_screen_shares_count() {
+        let room = Room::new(RoomConfig::default());
+        let id1 = ParticipantId::random();
+        let id2 = ParticipantId::random();
+        let _ = room.add_participant(id1, DummySignaling, Passthrough).await.expect("add1");
+        let _ = room.add_participant(id2, DummySignaling, Passthrough).await.expect("add2");
+
+        room.notify_screen_share_started(&id1, TrackId(10));
+        room.notify_screen_share_started(&id2, TrackId(20));
+
+        let shares = room.active_screen_shares();
+        assert_eq!(shares.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_room_screen_share_events_sequence() {
+        let room = Room::new(RoomConfig::default());
+        let mut events = room.events();
+        let id = ParticipantId::random();
+        let _ = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+
+        // Consume ParticipantJoined.
+        let _ = tokio::time::timeout(Duration::from_secs(1), events.next()).await;
+
+        room.notify_screen_share_started(&id, TrackId(42));
+        room.notify_screen_share_stopped(&id, TrackId(42));
+
+        let evt1 = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await.expect("t1").expect("e1");
+        assert!(matches!(evt1, RoomEvent::ScreenShareStarted { track_id, .. } if track_id == TrackId(42)));
+
+        let evt2 = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await.expect("t2").expect("e2");
+        assert!(matches!(evt2, RoomEvent::ScreenShareStopped { track_id, .. } if track_id == TrackId(42)));
     }
 }

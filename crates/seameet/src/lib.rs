@@ -59,7 +59,7 @@ pub mod room;
 
 pub use seameet_core::{
     EncodedAudio, EncodedVideo, ParticipantId, PcmFrame, RoomEvent, SeaMeetError, TrackDirection,
-    TrackHandle, TrackId, VideoFrame,
+    TrackHandle, TrackId, VideoFrame, VideoTrackKind,
 };
 pub use uuid::Uuid;
 
@@ -77,6 +77,7 @@ pub use seameet_core::Passthrough;
 
 // ── Signaling ───────────────────────────────────────────────────────────
 
+pub use seameet_signaling::room_server::{dispatch as signaling_dispatch, SignalingState};
 pub use seameet_signaling::{SdpMessage, SignalingBackend, WsSignaling, WsSignalingConfig};
 
 // ── Pipeline (low-level escape hatch) ───────────────────────────────────

@@ -478,5 +478,49 @@ mod tests {
         assert!(!saw_offer, "C should not receive offers from room alpha");
     }
 
+    #[tokio::test]
+    async fn test_screen_share_routing() {
+        let url = start_server().await;
+        let id_a = ParticipantId::random();
+        let id_b = ParticipantId::random();
+
+        let a = WsSignaling::connect(&url).await.expect("connect A");
+        let mut b = WsSignaling::connect(&url).await.expect("connect B");
+
+        a.send(SdpMessage::Join {
+            participant: id_a,
+            room_id: "screen-room".into(),
+        })
+        .await
+        .expect("A join");
+        b.send(SdpMessage::Join {
+            participant: id_b,
+            room_id: "screen-room".into(),
+        })
+        .await
+        .expect("B join");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        a.send(SdpMessage::ScreenShareStarted {
+            from: id_a,
+            room_id: "screen-room".into(),
+            track_id: 99,
+        })
+        .await
+        .expect("A screen share");
+
+        let msg = recv_skip_control(&mut b).await;
+        match msg {
+            SdpMessage::ScreenShareStarted {
+                from, track_id, ..
+            } => {
+                assert_eq!(from, id_a);
+                assert_eq!(track_id, 99);
+            }
+            other => panic!("expected ScreenShareStarted, got {other:?}"),
+        }
+    }
+
     use std::collections::HashSet;
 }

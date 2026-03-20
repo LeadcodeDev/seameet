@@ -1,4 +1,5 @@
 use crate::participant::ParticipantId;
+use crate::track::TrackId;
 use std::any::Any;
 use std::fmt;
 use std::time::Duration;
@@ -44,6 +45,20 @@ pub enum RoomEvent {
         participant: ParticipantId,
         /// Estimated packet loss percentage (0.0–100.0).
         packet_loss_pct: f32,
+    },
+    /// A participant started a screen share.
+    ScreenShareStarted {
+        /// The sharing participant.
+        participant: ParticipantId,
+        /// The track identifier for this screen share.
+        track_id: TrackId,
+    },
+    /// A participant stopped a screen share.
+    ScreenShareStopped {
+        /// The participant that stopped sharing.
+        participant: ParticipantId,
+        /// The track identifier that was stopped.
+        track_id: TrackId,
     },
     /// A custom, application-defined event.
     Custom {
@@ -96,6 +111,22 @@ impl fmt::Debug for RoomEvent {
                 .field("participant", participant)
                 .field("packet_loss_pct", packet_loss_pct)
                 .finish(),
+            Self::ScreenShareStarted {
+                participant,
+                track_id,
+            } => f
+                .debug_struct("ScreenShareStarted")
+                .field("participant", participant)
+                .field("track_id", track_id)
+                .finish(),
+            Self::ScreenShareStopped {
+                participant,
+                track_id,
+            } => f
+                .debug_struct("ScreenShareStopped")
+                .field("participant", participant)
+                .field("track_id", track_id)
+                .finish(),
             Self::Custom { participant, .. } => f
                 .debug_struct("Custom")
                 .field("participant", participant)
@@ -108,6 +139,7 @@ impl fmt::Debug for RoomEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::track::TrackId;
     use uuid::Uuid;
 
     fn test_id() -> ParticipantId {
@@ -151,6 +183,24 @@ mod tests {
         };
         let dbg = format!("{:?}", evt);
         assert!(dbg.contains("12.5"));
+    }
+
+    #[test]
+    fn test_room_event_screen_debug() {
+        let id = test_id();
+        let started = RoomEvent::ScreenShareStarted {
+            participant: id,
+            track_id: TrackId(42),
+        };
+        let stopped = RoomEvent::ScreenShareStopped {
+            participant: id,
+            track_id: TrackId(42),
+        };
+        let dbg1 = format!("{:?}", started);
+        assert!(dbg1.contains("ScreenShareStarted"));
+        assert!(dbg1.contains("42"));
+        let dbg2 = format!("{:?}", stopped);
+        assert!(dbg2.contains("ScreenShareStopped"));
     }
 
     #[test]

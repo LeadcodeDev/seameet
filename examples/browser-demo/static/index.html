@@ -160,6 +160,7 @@
 
     <div class="controls">
       <button id="muteBtn" onclick="toggleMute()">Mute</button>
+      <button id="screenBtn" onclick="toggleScreenShare()">Share Screen</button>
     </div>
 
     <div class="videos">
@@ -185,6 +186,8 @@
       </div>
     </div>
 
+    <div id="screens" class="videos" style="margin-top:0"></div>
+
     <pre id="log"></pre>
 
     <script>
@@ -202,6 +205,10 @@
       let ws = null;
       let muted = false;
       let remoteParticipantId = null;
+      let mainStreamId = null;
+      let screenStream = null;
+      let screenSenders = [];
+      let currentScreenTrackId = null;
 
       // ── Logging ──
 
@@ -316,6 +323,16 @@
           handleRemoteDisconnect();
           return;
         }
+
+        if (data.type === "screen_share_started") {
+          log(`peer ${data.from.slice(0, 8)}... started screen share (track ${data.track_id})`);
+          return;
+        }
+
+        if (data.type === "screen_share_stopped") {
+          log(`peer ${data.from.slice(0, 8)}... stopped screen share (track ${data.track_id})`);
+          return;
+        }
       }
 
       // ── WebRTC ──
@@ -341,12 +358,50 @@
         };
 
         pc.ontrack = (evt) => {
-          log("remote track received");
-          const remote = document.getElementById("remote");
-          if (remote.srcObject !== evt.streams[0]) {
-            remote.srcObject = evt.streams[0];
+          if (evt.track.kind === "video") {
+            const streamId = evt.streams[0]?.id;
+            const isScreen = mainStreamId && streamId !== mainStreamId;
+
+            if (isScreen) {
+              const video = document.createElement("video");
+              video.autoplay = true;
+              video.playsInline = true;
+              video.srcObject = evt.streams[0];
+              video.dataset.streamId = streamId;
+              video.style.width = "100%";
+              video.style.borderRadius = "8px";
+              video.style.background = "#000";
+              const box = document.createElement("div");
+              box.className = "video-box";
+              box.style.position = "relative";
+              const label = document.createElement("div");
+              label.className = "video-label";
+              label.textContent = "Screen";
+              box.appendChild(video);
+              box.appendChild(label);
+              box.dataset.streamId = streamId;
+              document.getElementById("screens").appendChild(box);
+              log(`remote screen share received — stream ${streamId.slice(0, 8)}...`);
+
+              evt.track.onended = () => {
+                document.querySelector(`div.video-box[data-stream-id="${streamId}"]`)?.remove();
+                log(`remote screen share ended — stream ${streamId.slice(0, 8)}...`);
+              };
+            } else {
+              if (!mainStreamId) mainStreamId = streamId;
+              document.getElementById("remote").srcObject = evt.streams[0];
+              showRemoteOverlay(false);
+              log("remote camera track received");
+            }
+          } else {
+            // Audio track — attach to existing remote video element.
+            const remote = document.getElementById("remote");
+            if (remote.srcObject !== evt.streams[0]) {
+              remote.srcObject = evt.streams[0];
+            }
+            showRemoteOverlay(false);
+            log("remote audio track received");
           }
-          showRemoteOverlay(false);
         };
 
         pc.onconnectionstatechange = () => {
@@ -363,6 +418,19 @@
           }
         };
 
+        pc.onnegotiationneeded = async () => {
+          log("negotiation needed — sending new offer");
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendWs({
+            type: "offer",
+            from: participantId,
+            to: remoteParticipantId || null,
+            room_id: ROOM_ID,
+            sdp: offer.sdp,
+          });
+        };
+
         // Add local tracks.
         if (localStream) {
           localStream.getTracks().forEach((track) => {
@@ -372,18 +440,9 @@
       }
 
       async function createOffer() {
+        // createPeerConnection adds tracks which triggers onnegotiationneeded,
+        // which sends the offer automatically.
         createPeerConnection();
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        sendWs({
-          type: "offer",
-          from: participantId,
-          to: null,
-          room_id: ROOM_ID,
-          sdp: offer.sdp,
-        });
-        log("offer sent");
       }
 
       async function handleOffer(data) {
@@ -424,6 +483,95 @@
         }
       }
 
+      // ── Screen share ──
+
+      async function toggleScreenShare() {
+        if (screenStream) {
+          await stopScreenShare();
+        } else {
+          await startScreenShare();
+        }
+      }
+
+      async function startScreenShare() {
+        try {
+          screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: 15 },
+            audio: false,
+          });
+        } catch (e) {
+          log(`getDisplayMedia failed: ${e.message}`);
+          return;
+        }
+
+        const [track] = screenStream.getVideoTracks();
+        currentScreenTrackId = Math.floor(Math.random() * 0xffffffff);
+
+        // Show local preview.
+        const preview = document.createElement("video");
+        preview.autoplay = true;
+        preview.playsInline = true;
+        preview.muted = true;
+        preview.srcObject = screenStream;
+        preview.style.width = "100%";
+        preview.style.borderRadius = "8px";
+        preview.style.background = "#000";
+        const box = document.createElement("div");
+        box.className = "video-box";
+        box.id = "local-screen";
+        box.style.position = "relative";
+        const label = document.createElement("div");
+        label.className = "video-label";
+        label.textContent = "Your Screen";
+        box.appendChild(preview);
+        box.appendChild(label);
+        document.getElementById("screens").appendChild(box);
+
+        // Add track to PeerConnection — triggers onnegotiationneeded.
+        if (pc) {
+          screenSenders = [pc.addTrack(track, screenStream)];
+        }
+
+        sendWs({
+          type: "screen_share_started",
+          from: participantId,
+          room_id: ROOM_ID,
+          track_id: currentScreenTrackId,
+        });
+
+        track.onended = () => stopScreenShare();
+
+        document.getElementById("screenBtn").textContent = "Stop Sharing";
+        log(`screen share started — track ${currentScreenTrackId}`);
+      }
+
+      async function stopScreenShare() {
+        screenSenders.forEach((s) => {
+          if (pc) pc.removeTrack(s);
+        });
+        screenSenders = [];
+        if (screenStream) {
+          screenStream.getTracks().forEach((t) => t.stop());
+          screenStream = null;
+        }
+
+        // Remove local preview.
+        document.getElementById("local-screen")?.remove();
+
+        if (currentScreenTrackId !== null) {
+          sendWs({
+            type: "screen_share_stopped",
+            from: participantId,
+            room_id: ROOM_ID,
+            track_id: currentScreenTrackId,
+          });
+          log(`screen share stopped — track ${currentScreenTrackId}`);
+          currentScreenTrackId = null;
+        }
+
+        document.getElementById("screenBtn").textContent = "Share Screen";
+      }
+
       // ── Remote overlay ──
 
       function showRemoteOverlay(visible) {
@@ -440,6 +588,11 @@
         remote.srcObject = null;
         showRemoteOverlay(true);
         remoteParticipantId = null;
+        mainStreamId = null;
+
+        // Remove all remote screen share videos.
+        document.getElementById("screens").innerHTML = "";
+
         if (pc) {
           pc.close();
           pc = null;

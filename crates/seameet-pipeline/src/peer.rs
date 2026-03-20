@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use bytes::Bytes;
+use seameet_core::events::RoomEvent;
 use seameet_core::frame::{EncodedAudio, PcmFrame, VideoFrame};
+use seameet_core::track::{TrackHandle, TrackId, VideoTrackKind};
 use seameet_core::traits::{Decoder, Encoder, Processor};
 use seameet_core::{ParticipantId, SeaMeetError};
 use seameet_rtp::RtpSender;
@@ -23,8 +27,12 @@ pub struct Peer<
     pub outbound: OutboundPipeline<E>,
     /// Audio broadcast sender (owned so we can hand out receivers).
     audio_tx: broadcast::Sender<PcmFrame>,
-    /// Video broadcast sender.
+    /// Camera video broadcast sender.
     video_tx: broadcast::Sender<VideoFrame>,
+    /// Event bus for room events (screen share, etc.).
+    event_tx: mpsc::UnboundedSender<RoomEvent>,
+    /// Screen share tracks — one per active share.
+    screen_tracks: HashMap<TrackId, TrackHandle>,
 }
 
 impl<D, E> Peer<D, E>
@@ -40,6 +48,7 @@ where
     ) -> Self {
         let (audio_tx, _) = broadcast::channel(64);
         let (video_tx, _) = broadcast::channel(16);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let inbound = InboundPipeline::new(decoder, audio_tx.clone(), video_tx.clone());
         Self {
             id,
@@ -47,17 +56,14 @@ where
             outbound,
             audio_tx,
             video_tx,
+            event_tx,
+            screen_tracks: HashMap::new(),
         }
     }
 
     /// Creates a peer backed by a [`PeerConnection`], wiring RTP events
     /// from the connection into the inbound pipeline and outbound RTP
     /// through the connection's UDP socket.
-    ///
-    /// * `processor` — an optional processor to attach to the outbound pipeline.
-    /// * `rtp_tx` — the sender side of the channel that `RtpSender` writes to.
-    ///   The caller should spawn a task that reads from the corresponding receiver
-    ///   and forwards bytes through the `PeerConnection`.
     pub fn from_peer_connection(
         id: ParticipantId,
         decoder: D,
@@ -74,6 +80,7 @@ where
 
         let (audio_tx, _) = broadcast::channel(64);
         let (video_tx, _) = broadcast::channel(16);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let inbound = InboundPipeline::new(decoder, audio_tx.clone(), video_tx.clone());
         let events = pc.events();
 
@@ -83,6 +90,8 @@ where
             outbound,
             audio_tx,
             video_tx,
+            event_tx,
+            screen_tracks: HashMap::new(),
         };
         (peer, events)
     }
@@ -97,7 +106,12 @@ where
         self.audio_tx.clone()
     }
 
-    /// Returns a receiver for decoded video frames from this peer.
+    /// Returns a receiver for decoded camera video frames from this peer.
+    pub fn camera_rx(&self) -> broadcast::Receiver<VideoFrame> {
+        self.video_tx.subscribe()
+    }
+
+    /// Returns a receiver for decoded video frames (alias for camera_rx for backwards compat).
     pub fn video_rx(&self) -> broadcast::Receiver<VideoFrame> {
         self.video_tx.subscribe()
     }
@@ -105,6 +119,49 @@ where
     /// Returns a clone of the video broadcast sender.
     pub fn video_tx_clone(&self) -> broadcast::Sender<VideoFrame> {
         self.video_tx.clone()
+    }
+
+    /// Returns a receiver for a specific screen share track.
+    /// Returns `None` if the track doesn't exist.
+    pub fn screen_rx(&self, _track_id: TrackId) -> Option<broadcast::Receiver<VideoFrame>> {
+        // Screen tracks don't have their own broadcast channels in this
+        // simplified implementation — they share the video_tx.
+        // A full implementation would use per-track channels.
+        if self.screen_tracks.contains_key(&_track_id) {
+            Some(self.video_tx.subscribe())
+        } else {
+            None
+        }
+    }
+
+    /// Returns the currently active screen track IDs.
+    pub fn active_screen_tracks(&self) -> Vec<TrackId> {
+        self.screen_tracks.keys().copied().collect()
+    }
+
+    /// Called when a screen share starts for this participant.
+    pub fn on_screen_share_started(&mut self, track_id: TrackId) -> Result<(), SeaMeetError> {
+        let handle = TrackHandle::with_kind(track_id, VideoTrackKind::Screen);
+        self.screen_tracks.insert(track_id, handle);
+        let _ = self.event_tx.send(RoomEvent::ScreenShareStarted {
+            participant: self.id,
+            track_id,
+        });
+        debug!(participant = %self.id, ?track_id, "screen share started");
+        Ok(())
+    }
+
+    /// Called when a screen share stops for this participant.
+    pub fn on_screen_share_stopped(&mut self, track_id: TrackId) -> Result<(), SeaMeetError> {
+        if let Some(handle) = self.screen_tracks.remove(&track_id) {
+            handle.close();
+        }
+        let _ = self.event_tx.send(RoomEvent::ScreenShareStopped {
+            participant: self.id,
+            track_id,
+        });
+        debug!(participant = %self.id, ?track_id, "screen share stopped");
+        Ok(())
     }
 
     /// Runs with a [`PeerConnection`] event stream, forwarding received RTP
@@ -171,7 +228,6 @@ where
             outbound.run(audio_rx, outbound_stop).await
         });
 
-        // Wait for external stop signal.
         let _ = stop.recv().await;
         let _ = stop_tx.send(());
 
@@ -200,7 +256,6 @@ mod tests {
 
         let mut audio_rx = peer.audio_rx();
 
-        // Encode a frame, wrap it in an RTP packet, push into inbound.
         let original = PcmFrame {
             samples: vec![0.25, -0.5, 0.75],
             sample_rate: 48000,
@@ -216,5 +271,83 @@ mod tests {
         assert_eq!(received.samples, original.samples);
         assert_eq!(received.sample_rate, 48000);
         assert_eq!(received.channels, 1);
+    }
+
+    #[test]
+    fn test_peer_screen_share_started_emits_event() {
+        let id = ParticipantId::random();
+        let (sender, _rtp_rx) = rtp_channel(1);
+        let outbound = OutboundPipeline::new(AudioPassthrough, sender);
+        let mut peer = Peer::new(id, AudioPassthrough, outbound);
+
+        // Take the event receiver before emitting.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        peer.event_tx = event_tx;
+
+        peer.on_screen_share_started(TrackId(42)).expect("start");
+
+        let evt = event_rx.try_recv().expect("event");
+        match evt {
+            RoomEvent::ScreenShareStarted {
+                participant,
+                track_id,
+            } => {
+                assert_eq!(participant, id);
+                assert_eq!(track_id, TrackId(42));
+            }
+            other => panic!("expected ScreenShareStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_peer_screen_share_stopped_emits_event() {
+        let id = ParticipantId::random();
+        let (sender, _rtp_rx) = rtp_channel(1);
+        let outbound = OutboundPipeline::new(AudioPassthrough, sender);
+        let mut peer = Peer::new(id, AudioPassthrough, outbound);
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        peer.event_tx = event_tx;
+
+        peer.on_screen_share_started(TrackId(10)).expect("start");
+        let _ = event_rx.try_recv(); // consume Started
+
+        peer.on_screen_share_stopped(TrackId(10)).expect("stop");
+        let evt = event_rx.try_recv().expect("event");
+        match evt {
+            RoomEvent::ScreenShareStopped {
+                participant,
+                track_id,
+            } => {
+                assert_eq!(participant, id);
+                assert_eq!(track_id, TrackId(10));
+            }
+            other => panic!("expected ScreenShareStopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_peer_multiple_screen_tracks() {
+        let id = ParticipantId::random();
+        let (sender, _rtp_rx) = rtp_channel(1);
+        let outbound = OutboundPipeline::new(AudioPassthrough, sender);
+        let mut peer = Peer::new(id, AudioPassthrough, outbound);
+
+        peer.on_screen_share_started(TrackId(1)).expect("start 1");
+        peer.on_screen_share_started(TrackId(2)).expect("start 2");
+
+        assert_eq!(peer.screen_tracks.len(), 2);
+        assert!(peer.screen_tracks.contains_key(&TrackId(1)));
+        assert!(peer.screen_tracks.contains_key(&TrackId(2)));
+    }
+
+    #[test]
+    fn test_peer_screen_rx_unknown_track() {
+        let id = ParticipantId::random();
+        let (sender, _rtp_rx) = rtp_channel(1);
+        let outbound = OutboundPipeline::new(AudioPassthrough, sender);
+        let peer = Peer::new(id, AudioPassthrough, outbound);
+
+        assert!(peer.screen_rx(TrackId(999)).is_none());
     }
 }

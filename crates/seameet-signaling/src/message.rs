@@ -66,6 +66,24 @@ pub enum SdpMessage {
         /// Whether this peer should initiate the offer.
         initiator: bool,
     },
+    /// Emitted by the client when a screen share starts.
+    ScreenShareStarted {
+        /// The participant sharing their screen.
+        from: ParticipantId,
+        /// The room this share belongs to.
+        room_id: String,
+        /// Client-assigned track identifier.
+        track_id: u32,
+    },
+    /// Emitted by the client when a screen share stops.
+    ScreenShareStopped {
+        /// The participant that stopped sharing.
+        from: ParticipantId,
+        /// The room this share belongs to.
+        room_id: String,
+        /// Track identifier that was stopped.
+        track_id: u32,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -84,7 +102,9 @@ impl SdpMessage {
             | Self::Offer { room_id, .. }
             | Self::Answer { room_id, .. }
             | Self::IceCandidate { room_id, .. }
-            | Self::Ready { room_id, .. } => Some(room_id),
+            | Self::Ready { room_id, .. }
+            | Self::ScreenShareStarted { room_id, .. }
+            | Self::ScreenShareStopped { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -205,5 +225,36 @@ mod tests {
             .room_id(),
             None
         );
+        assert_eq!(
+            SdpMessage::ScreenShareStarted {
+                from: id_a(),
+                room_id: "r5".into(),
+                track_id: 1
+            }
+            .room_id(),
+            Some("r5")
+        );
+    }
+
+    #[test]
+    fn test_screen_share_started_message_serde() {
+        let msg = SdpMessage::ScreenShareStarted {
+            from: id_a(),
+            room_id: "r1".into(),
+            track_id: 42,
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"screen_share_started\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+
+        let msg2 = SdpMessage::ScreenShareStopped {
+            from: id_a(),
+            room_id: "r1".into(),
+            track_id: 42,
+        };
+        let json2 = serde_json::to_string(&msg2).expect("ser");
+        let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
+        assert_eq!(back2, msg2);
     }
 }
