@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/seameet-core",
+    "crates/seameet-signaling",
+    "crates/seameet-rtp",
+    "crates/seameet-codec",
+    "crates/seameet-pipeline",
+    "crates/seameet",
+]
+
+[workspace.dependencies]
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+thiserror    = "1"
+async-trait  = "0.1"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+ringbuf      = "0.4"
+str0m        = "0.6"
+tracing      = "0.1"
+rand         = "0.8"
+uuid         = { version = "1", features = ["v4", "serde"] }

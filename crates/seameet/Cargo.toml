@@ -1,0 +1,11 @@
+[package]
+name = "seameet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+seameet-core = { path = "../seameet-core" }
+seameet-signaling = { path = "../seameet-signaling" }
+seameet-rtp = { path = "../seameet-rtp" }
+seameet-codec = { path = "../seameet-codec" }
+seameet-pipeline = { path = "../seameet-pipeline" }

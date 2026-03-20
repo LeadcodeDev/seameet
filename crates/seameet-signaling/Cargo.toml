@@ -1,0 +1,7 @@
+[package]
+name = "seameet-signaling"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+seameet-core = { path = "../seameet-core" }
