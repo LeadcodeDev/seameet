@@ -12,7 +12,8 @@ seameet             = { path = "../../crates/seameet" }
 tokio               = { workspace = true }
 tokio-tungstenite   = "0.21"
 tracing             = { workspace = true }
-tracing-subscriber  = "0.3"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 axum                = "0.7"
 serde_json          = { workspace = true }
 futures-util        = "0.3"
+str0m               = { workspace = true }
