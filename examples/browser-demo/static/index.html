@@ -195,7 +195,6 @@
 
       const WS_URL = `ws://${location.hostname || "localhost"}:3001`;
       const ROOM_ID = "demo-room";
-      const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
       const participantId = crypto.randomUUID();
       document.getElementById("pid").textContent = participantId;
@@ -204,8 +203,6 @@
       let pc = null;
       let ws = null;
       let muted = false;
-      let remoteParticipantId = null;
-      let mainStreamId = null;
       let screenStream = null;
       let screenSenders = [];
       let currentScreenTrackId = null;
@@ -230,12 +227,8 @@
       function toggleMute() {
         if (!localStream) return;
         muted = !muted;
-        localStream.getAudioTracks().forEach((t) => {
-          t.enabled = !muted;
-        });
-        document.getElementById("muteBtn").textContent = muted
-          ? "Unmute"
-          : "Mute";
+        localStream.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+        document.getElementById("muteBtn").textContent = muted ? "Unmute" : "Mute";
         log(muted ? "microphone muted" : "microphone unmuted");
       }
 
@@ -253,22 +246,17 @@
         ws.onopen = () => {
           log("WS connected");
           setBadge("signaling");
-
           sendWs({
             type: "join",
             participant: participantId,
             room_id: ROOM_ID,
           });
-          log(`joined room ${ROOM_ID} as ${participantId.slice(0, 8)}...`);
+          log(`joined as ${participantId.slice(0, 8)}...`);
         };
 
         ws.onmessage = (evt) => {
           let data;
-          try {
-            data = JSON.parse(evt.data);
-          } catch {
-            return;
-          }
+          try { data = JSON.parse(evt.data); } catch { return; }
           handleSignalingMessage(data);
         };
 
@@ -277,158 +265,79 @@
           setBadge("disconnected");
         };
 
-        ws.onerror = (e) => {
-          log("WS error");
-        };
+        ws.onerror = () => { log("WS error"); };
       }
 
       async function handleSignalingMessage(data) {
+        // Server says we can create the PeerConnection and send an offer.
         if (data.type === "ready") {
-          log(`ready — initiator: ${data.initiator} (room: ${data.room_id})`);
-          if (data.initiator) {
-            // First in the room — wait for a peer to join.
-          }
+          log("server ready — creating offer");
+          await createOfferToServer();
           return;
         }
 
-        if (data.type === "join") {
-          // A new peer joined our room — create an offer for them.
-          remoteParticipantId = data.participant;
-          log(`peer ${data.participant.slice(0, 8)}... joined, creating offer`);
-          await createOffer();
-          return;
-        }
-
-        if (data.type === "offer") {
-          remoteParticipantId = data.from;
-          log(`received offer from ${data.from.slice(0, 8)}...`);
-          await handleOffer(data);
-          return;
-        }
-
+        // Server's SDP answer.
         if (data.type === "answer") {
-          log(`received answer from ${data.from.slice(0, 8)}...`);
-          await handleAnswer(data);
+          if (!pc) return;
+          await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+          log("server answer applied");
           return;
         }
 
+        // Server sends an ICE candidate (rare — usually in the SDP answer).
         if (data.type === "ice_candidate") {
-          log(`received ICE candidate from ${data.from.slice(0, 8)}...`);
-          await handleIceCandidate(data);
-          return;
-        }
-
-        if (data.type === "leave") {
-          log(`peer ${data.participant.slice(0, 8)}... left`);
-          handleRemoteDisconnect();
-          return;
-        }
-
-        if (data.type === "screen_share_started") {
-          log(`peer ${data.from.slice(0, 8)}... started screen share (track ${data.track_id})`);
-          return;
-        }
-
-        if (data.type === "screen_share_stopped") {
-          log(`peer ${data.from.slice(0, 8)}... stopped screen share (track ${data.track_id})`);
+          if (!pc) return;
+          try {
+            await pc.addIceCandidate({
+              candidate: data.candidate,
+              sdpMid: data.sdp_mid || null,
+              sdpMLineIndex: data.sdp_mline_index ?? null,
+            });
+            log("server ICE candidate applied");
+          } catch (e) {
+            log(`ICE candidate error: ${e.message}`);
+          }
           return;
         }
       }
 
-      // ── WebRTC ──
+      // ── WebRTC (browser ↔ server) ──
 
-      function createPeerConnection() {
-        if (pc) return;
-
-        pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      async function createOfferToServer() {
+        // No STUN needed — we connect directly to the server.
+        pc = new RTCPeerConnection({ iceServers: [] });
 
         pc.onicecandidate = (evt) => {
           if (!evt.candidate) return;
-          const target = remoteParticipantId || null;
           sendWs({
             type: "ice_candidate",
             from: participantId,
-            to: target,
+            to: participantId,
             room_id: ROOM_ID,
             candidate: evt.candidate.candidate,
             sdp_mid: evt.candidate.sdpMid,
             sdp_mline_index: evt.candidate.sdpMLineIndex,
           });
-          log("ICE candidate sent");
+          log("ICE candidate sent to server");
         };
 
         pc.ontrack = (evt) => {
-          if (evt.track.kind === "video") {
-            const streamId = evt.streams[0]?.id;
-            const isScreen = mainStreamId && streamId !== mainStreamId;
-
-            if (isScreen) {
-              const video = document.createElement("video");
-              video.autoplay = true;
-              video.playsInline = true;
-              video.srcObject = evt.streams[0];
-              video.dataset.streamId = streamId;
-              video.style.width = "100%";
-              video.style.borderRadius = "8px";
-              video.style.background = "#000";
-              const box = document.createElement("div");
-              box.className = "video-box";
-              box.style.position = "relative";
-              const label = document.createElement("div");
-              label.className = "video-label";
-              label.textContent = "Screen";
-              box.appendChild(video);
-              box.appendChild(label);
-              box.dataset.streamId = streamId;
-              document.getElementById("screens").appendChild(box);
-              log(`remote screen share received — stream ${streamId.slice(0, 8)}...`);
-
-              evt.track.onended = () => {
-                document.querySelector(`div.video-box[data-stream-id="${streamId}"]`)?.remove();
-                log(`remote screen share ended — stream ${streamId.slice(0, 8)}...`);
-              };
-            } else {
-              if (!mainStreamId) mainStreamId = streamId;
-              document.getElementById("remote").srcObject = evt.streams[0];
-              showRemoteOverlay(false);
-              log("remote camera track received");
-            }
-          } else {
-            // Audio track — attach to existing remote video element.
-            const remote = document.getElementById("remote");
-            if (remote.srcObject !== evt.streams[0]) {
-              remote.srcObject = evt.streams[0];
-            }
-            showRemoteOverlay(false);
-            log("remote audio track received");
+          log(`remote track received: ${evt.track.kind}`);
+          const remote = document.getElementById("remote");
+          if (remote.srcObject !== evt.streams[0]) {
+            remote.srcObject = evt.streams[0];
           }
+          showRemoteOverlay(false);
         };
 
         pc.onconnectionstatechange = () => {
           log(`connection state: ${pc.connectionState}`);
           if (pc.connectionState === "connected") {
             setBadge("connected");
-            log("peer connected");
-          } else if (
-            pc.connectionState === "disconnected" ||
-            pc.connectionState === "failed"
-          ) {
+            log("connected to server (SFU)");
+          } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
             setBadge("disconnected");
-            handleRemoteDisconnect();
           }
-        };
-
-        pc.onnegotiationneeded = async () => {
-          log("negotiation needed — sending new offer");
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          sendWs({
-            type: "offer",
-            from: participantId,
-            to: remoteParticipantId || null,
-            room_id: ROOM_ID,
-            sdp: offer.sdp,
-          });
         };
 
         // Add local tracks.
@@ -437,50 +346,19 @@
             pc.addTrack(track, localStream);
           });
         }
-      }
 
-      async function createOffer() {
-        // createPeerConnection adds tracks which triggers onnegotiationneeded,
-        // which sends the offer automatically.
-        createPeerConnection();
-      }
-
-      async function handleOffer(data) {
-        createPeerConnection();
-        await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        // Create and send offer to the server.
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
 
         sendWs({
-          type: "answer",
+          type: "offer",
           from: participantId,
-          to: data.from,
+          to: null,
           room_id: ROOM_ID,
-          sdp: answer.sdp,
+          sdp: offer.sdp,
         });
-        log("answer sent");
-      }
-
-      async function handleAnswer(data) {
-        if (!pc) return;
-        remoteParticipantId = data.from;
-        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
-        log("remote description set");
-      }
-
-      async function handleIceCandidate(data) {
-        if (!pc) return;
-        try {
-          await pc.addIceCandidate({
-            candidate: data.candidate,
-            sdpMid: data.sdp_mid || null,
-            sdpMLineIndex: data.sdp_mline_index ?? null,
-          });
-          log("ICE candidate applied");
-        } catch (e) {
-          log(`ICE candidate error: ${e.message}`);
-        }
+        log("offer sent to server");
       }
 
       // ── Screen share ──
@@ -507,19 +385,16 @@
         const [track] = screenStream.getVideoTracks();
         currentScreenTrackId = Math.floor(Math.random() * 0xffffffff);
 
-        // Show local preview.
+        // Local preview.
         const preview = document.createElement("video");
         preview.autoplay = true;
         preview.playsInline = true;
         preview.muted = true;
         preview.srcObject = screenStream;
-        preview.style.width = "100%";
-        preview.style.borderRadius = "8px";
-        preview.style.background = "#000";
+        preview.style.cssText = "width:100%;border-radius:8px;background:#000";
         const box = document.createElement("div");
         box.className = "video-box";
         box.id = "local-screen";
-        box.style.position = "relative";
         const label = document.createElement("div");
         label.className = "video-label";
         label.textContent = "Your Screen";
@@ -527,76 +402,45 @@
         box.appendChild(label);
         document.getElementById("screens").appendChild(box);
 
-        // Add track to PeerConnection — triggers onnegotiationneeded.
         if (pc) {
           screenSenders = [pc.addTrack(track, screenStream)];
+          // Renegotiate with server.
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendWs({
+            type: "offer",
+            from: participantId,
+            to: null,
+            room_id: ROOM_ID,
+            sdp: offer.sdp,
+          });
+          log("renegotiation offer sent (screen share)");
         }
 
-        sendWs({
-          type: "screen_share_started",
-          from: participantId,
-          room_id: ROOM_ID,
-          track_id: currentScreenTrackId,
-        });
-
         track.onended = () => stopScreenShare();
-
         document.getElementById("screenBtn").textContent = "Stop Sharing";
         log(`screen share started — track ${currentScreenTrackId}`);
       }
 
       async function stopScreenShare() {
-        screenSenders.forEach((s) => {
-          if (pc) pc.removeTrack(s);
-        });
+        screenSenders.forEach((s) => { if (pc) pc.removeTrack(s); });
         screenSenders = [];
         if (screenStream) {
           screenStream.getTracks().forEach((t) => t.stop());
           screenStream = null;
         }
-
-        // Remove local preview.
         document.getElementById("local-screen")?.remove();
-
-        if (currentScreenTrackId !== null) {
-          sendWs({
-            type: "screen_share_stopped",
-            from: participantId,
-            room_id: ROOM_ID,
-            track_id: currentScreenTrackId,
-          });
-          log(`screen share stopped — track ${currentScreenTrackId}`);
-          currentScreenTrackId = null;
-        }
-
+        currentScreenTrackId = null;
         document.getElementById("screenBtn").textContent = "Share Screen";
+        log("screen share stopped");
       }
 
       // ── Remote overlay ──
 
       function showRemoteOverlay(visible) {
         const el = document.getElementById("remoteOverlay");
-        if (visible) {
-          el.classList.remove("hidden");
-        } else {
-          el.classList.add("hidden");
-        }
-      }
-
-      function handleRemoteDisconnect() {
-        const remote = document.getElementById("remote");
-        remote.srcObject = null;
-        showRemoteOverlay(true);
-        remoteParticipantId = null;
-        mainStreamId = null;
-
-        // Remove all remote screen share videos.
-        document.getElementById("screens").innerHTML = "";
-
-        if (pc) {
-          pc.close();
-          pc = null;
-        }
+        if (visible) { el.classList.remove("hidden"); }
+        else { el.classList.add("hidden"); }
       }
 
       // ── Init ──
@@ -611,7 +455,6 @@
           log("getUserMedia ok");
         } catch (e) {
           log(`getUserMedia failed: ${e.message}`);
-          // Continue without media — signaling will still work.
         }
 
         connectSignaling();
