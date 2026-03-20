@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -7,25 +7,119 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::message::SdpMessage;
 
-/// Entry for a connected peer: its identifier and a channel to send it messages.
-#[derive(Debug)]
-struct PeerHandle {
-    id: ParticipantId,
-    tx: mpsc::UnboundedSender<String>,
+/// Per-participant outbound channel.
+type WsSink = mpsc::UnboundedSender<String>;
+
+/// Shared signaling state with double index (rooms ↔ participants).
+pub struct SignalingState {
+    /// Room → list of participant IDs in that room.
+    rooms: HashMap<String, Vec<ParticipantId>>,
+    /// Participant → (outbound channel, set of rooms joined).
+    participants: HashMap<ParticipantId, (WsSink, HashSet<String>)>,
 }
 
-type Rooms = Arc<Mutex<HashMap<String, Vec<PeerHandle>>>>;
+impl SignalingState {
+    /// Creates empty state.
+    fn new() -> Self {
+        Self {
+            rooms: HashMap::new(),
+            participants: HashMap::new(),
+        }
+    }
 
-/// In-memory WebSocket signaling server used for testing and local development.
+    /// Registers a participant in a room.
+    /// Returns `true` if this is the first participant (initiator).
+    pub fn join(&mut self, participant: ParticipantId, room_id: &str, sink: WsSink) -> bool {
+        let room = self.rooms.entry(room_id.to_owned()).or_default();
+        let is_first = room.is_empty();
+
+        if !room.contains(&participant) {
+            room.push(participant);
+        }
+
+        let entry = self
+            .participants
+            .entry(participant)
+            .or_insert_with(|| (sink, HashSet::new()));
+        entry.1.insert(room_id.to_owned());
+
+        is_first
+    }
+
+    /// Removes a participant from a specific room.
+    /// Returns `true` if the room is now empty.
+    pub fn leave(&mut self, participant: &ParticipantId, room_id: &str) -> bool {
+        let room_empty = if let Some(room) = self.rooms.get_mut(room_id) {
+            room.retain(|id| id != participant);
+            if room.is_empty() {
+                self.rooms.remove(room_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if let Some((_, rooms)) = self.participants.get_mut(participant) {
+            rooms.remove(room_id);
+            if rooms.is_empty() {
+                self.participants.remove(participant);
+            }
+        }
+
+        room_empty
+    }
+
+    /// Removes a participant from ALL rooms (called on WebSocket disconnect).
+    /// Returns the list of affected rooms with whether each is now empty.
+    pub fn disconnect(&mut self, participant: &ParticipantId) -> Vec<(String, bool)> {
+        let room_ids: Vec<String> = self
+            .participants
+            .get(participant)
+            .map(|(_, rooms)| rooms.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut affected = Vec::with_capacity(room_ids.len());
+        for rid in room_ids {
+            let empty = self.leave(participant, &rid);
+            affected.push((rid, empty));
+        }
+
+        // Ensure participant is fully removed.
+        self.participants.remove(participant);
+
+        affected
+    }
+
+    /// Returns the sinks of all other participants in a room.
+    pub fn peers(&self, room_id: &str, exclude: &ParticipantId) -> Vec<WsSink> {
+        let Some(room) = self.rooms.get(room_id) else {
+            return Vec::new();
+        };
+        room.iter()
+            .filter(|id| *id != exclude)
+            .filter_map(|id| self.participants.get(id).map(|(tx, _)| tx.clone()))
+            .collect()
+    }
+
+    /// Returns the sink of a specific participant, if connected.
+    fn sink(&self, participant: &ParticipantId) -> Option<WsSink> {
+        self.participants.get(participant).map(|(tx, _)| tx.clone())
+    }
+}
+
+/// In-memory WebSocket signaling server.
 ///
-/// Routes [`SdpMessage`]s between participants within named rooms.
+/// Routes [`SdpMessage`]s between participants across named rooms.
+/// A single WebSocket connection can join multiple rooms.
 pub struct RoomServer {
     listener: TcpListener,
-    rooms: Rooms,
+    state: Arc<Mutex<SignalingState>>,
 }
 
 impl RoomServer {
@@ -34,7 +128,7 @@ impl RoomServer {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
-            rooms: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(SignalingState::new())),
         })
     }
 
@@ -45,7 +139,7 @@ impl RoomServer {
 
     /// Starts accepting connections. Returns a [`JoinHandle`] for the server task.
     pub fn run(self) -> JoinHandle<()> {
-        let rooms = self.rooms;
+        let state = self.state;
         let listener = self.listener;
         tokio::spawn(async move {
             loop {
@@ -57,7 +151,7 @@ impl RoomServer {
                     }
                 };
                 debug!(%addr, "new TCP connection");
-                let rooms = Arc::clone(&rooms);
+                let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let ws = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -66,7 +160,7 @@ impl RoomServer {
                             return;
                         }
                     };
-                    Self::handle_connection(ws, rooms).await;
+                    Self::handle_connection(ws, state).await;
                 });
             }
         })
@@ -75,14 +169,13 @@ impl RoomServer {
     /// Handles a single WebSocket connection lifecycle.
     async fn handle_connection(
         ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        rooms: Rooms,
+        state: Arc<Mutex<SignalingState>>,
     ) {
         let (mut sink, mut stream) = ws.split();
 
-        // Channel for outbound messages to this peer.
+        // Outbound channel for this connection.
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-        // Spawn a writer task that forwards channel messages to the WebSocket sink.
         let writer = tokio::spawn(async move {
             while let Some(text) = rx.recv().await {
                 if sink.send(Message::Text(text)).await.is_err() {
@@ -92,120 +185,135 @@ impl RoomServer {
         });
 
         let mut participant_id: Option<ParticipantId> = None;
-        let mut room_id: Option<String> = None;
 
         while let Some(result) = stream.next().await {
             let msg = match result {
-                Ok(m) => m,
+                Ok(Message::Text(t)) => t,
+                Ok(Message::Close(_)) => break,
+                Ok(_) => continue,
                 Err(_) => break,
             };
 
-            match msg {
-                Message::Text(text) => {
-                    let sdp: SdpMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!("invalid message: {e}");
-                            continue;
-                        }
-                    };
+            let sdp: SdpMessage = match serde_json::from_str(&msg) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("invalid message: {e}");
+                    continue;
+                }
+            };
 
-                    // Handle Join: register peer in the room.
-                    if let SdpMessage::Join {
-                        participant,
-                        room_id: rid,
-                    } = &sdp
-                    {
-                        participant_id = Some(*participant);
-                        room_id = Some(rid.clone());
-                        let mut rooms_lock = rooms.lock().await;
-                        rooms_lock.entry(rid.clone()).or_default().push(PeerHandle {
-                            id: *participant,
-                            tx: tx.clone(),
-                        });
-                        debug!(participant = %participant, room = rid, "participant joined");
-                        continue;
+            // First message must be a Join to identify the participant.
+            if participant_id.is_none() {
+                if let SdpMessage::Join { participant, .. } = &sdp {
+                    participant_id = Some(*participant);
+                } else {
+                    continue;
+                }
+            }
+
+            let pid = participant_id.expect("set above");
+
+            match &sdp {
+                SdpMessage::Join {
+                    participant,
+                    room_id,
+                } => {
+                    let mut st = state.lock().await;
+                    let initiator = st.join(*participant, room_id, tx.clone());
+
+                    // Send Ready to the joining peer.
+                    let ready = SdpMessage::Ready {
+                        room_id: room_id.clone(),
+                        initiator,
+                    };
+                    if let Ok(json) = serde_json::to_string(&ready) {
+                        let _ = tx.send(json);
                     }
 
-                    // Route the message to peers in the same room.
-                    if let Some(ref rid) = room_id {
-                        Self::route_message(&rooms, rid, &sdp, participant_id).await;
+                    // If not initiator, forward the Join to existing peers.
+                    if !initiator {
+                        let peers = st.peers(room_id, participant);
+                        drop(st);
+                        if let Ok(json) = serde_json::to_string(&sdp) {
+                            for peer_tx in peers {
+                                let _ = peer_tx.send(json.clone());
+                            }
+                        }
+                    }
+
+                    info!(participant = %participant, room = room_id, "joined");
+                }
+                SdpMessage::Leave {
+                    participant,
+                    room_id,
+                } => {
+                    let mut st = state.lock().await;
+                    let peers = st.peers(room_id, participant);
+                    st.leave(participant, room_id);
+                    drop(st);
+
+                    if let Ok(json) = serde_json::to_string(&sdp) {
+                        for peer_tx in peers {
+                            let _ = peer_tx.send(json.clone());
+                        }
+                    }
+                    info!(participant = %participant, room = room_id, "left");
+                }
+                SdpMessage::Offer { room_id, to, .. } => {
+                    let st = state.lock().await;
+                    if let Some(target) = to {
+                        if let Some(peer_tx) = st.sink(target) {
+                            let _ = peer_tx.send(msg.clone());
+                        }
+                    } else {
+                        let peers = st.peers(room_id, &pid);
+                        drop(st);
+                        for peer_tx in peers {
+                            let _ = peer_tx.send(msg.clone());
+                        }
                     }
                 }
-                Message::Close(_) => break,
+                SdpMessage::Answer { to, .. } => {
+                    let st = state.lock().await;
+                    if let Some(peer_tx) = st.sink(to) {
+                        let _ = peer_tx.send(msg.clone());
+                    }
+                }
+                SdpMessage::IceCandidate { to, .. } => {
+                    let st = state.lock().await;
+                    if let Some(peer_tx) = st.sink(to) {
+                        let _ = peer_tx.send(msg.clone());
+                    }
+                }
                 _ => {}
             }
         }
 
-        // Connection closed — emit Leave and clean up.
-        if let (Some(pid), Some(ref rid)) = (participant_id, &room_id) {
-            debug!(participant = %pid, room = rid, "participant disconnected");
-            let leave = SdpMessage::Leave { participant: pid };
-            Self::route_message(&rooms, rid, &leave, Some(pid)).await;
+        // Connection closed — clean up all rooms.
+        if let Some(pid) = participant_id {
+            info!(participant = %pid, "disconnected");
+            let affected = {
+                let mut st = state.lock().await;
+                st.disconnect(&pid)
+            };
 
-            let mut rooms_lock = rooms.lock().await;
-            if let Some(room) = rooms_lock.get_mut(rid) {
-                room.retain(|p| p.id != pid);
-                if room.is_empty() {
-                    rooms_lock.remove(rid);
+            for (room_id, _) in affected {
+                let leave = SdpMessage::Leave {
+                    participant: pid,
+                    room_id: room_id.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&leave) {
+                    let st = state.lock().await;
+                    let peers = st.peers(&room_id, &pid);
+                    drop(st);
+                    for peer_tx in peers {
+                        let _ = peer_tx.send(json.clone());
+                    }
                 }
             }
         }
 
-        // Drop the sender so the writer task terminates.
         drop(tx);
         let _ = writer.await;
-    }
-
-    /// Routes a message to the target participant (`to` field) or broadcasts
-    /// to all others in the room.
-    async fn route_message(
-        rooms: &Rooms,
-        room_id: &str,
-        sdp: &SdpMessage,
-        sender: Option<ParticipantId>,
-    ) {
-        let target = Self::extract_target(sdp);
-        let json = match serde_json::to_string(sdp) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("failed to serialize message for routing: {e}");
-                return;
-            }
-        };
-
-        let rooms_lock = rooms.lock().await;
-        let Some(room) = rooms_lock.get(room_id) else {
-            return;
-        };
-
-        match target {
-            Some(target_id) => {
-                // Unicast to a specific participant.
-                for peer in room {
-                    if peer.id == target_id {
-                        let _ = peer.tx.send(json.clone());
-                    }
-                }
-            }
-            None => {
-                // Broadcast to everyone except the sender.
-                for peer in room {
-                    if Some(peer.id) != sender {
-                        let _ = peer.tx.send(json.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    /// Extracts the `to` field from a message to determine routing.
-    fn extract_target(sdp: &SdpMessage) -> Option<ParticipantId> {
-        match sdp {
-            SdpMessage::Offer { to, .. } => *to,
-            SdpMessage::Answer { to, .. } => Some(*to),
-            SdpMessage::IceCandidate { to, .. } => Some(*to),
-            SdpMessage::Join { .. } | SdpMessage::Leave { .. } | SdpMessage::Error { .. } => None,
-        }
     }
 }

@@ -61,6 +61,7 @@ pub use seameet_core::{
     EncodedAudio, EncodedVideo, ParticipantId, PcmFrame, RoomEvent, SeaMeetError, TrackDirection,
     TrackHandle, TrackId, VideoFrame,
 };
+pub use uuid::Uuid;
 
 // ── Traits ──────────────────────────────────────────────────────────────
 

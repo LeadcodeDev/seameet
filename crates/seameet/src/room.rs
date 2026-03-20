@@ -15,10 +15,13 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::Stream;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 /// Configuration for a [`Room`].
 #[derive(Debug, Clone)]
 pub struct RoomConfig {
+    /// Optional human-readable name. Defaults to `None`.
+    pub name: Option<String>,
     /// Maximum number of simultaneous participants. Defaults to `usize::MAX`.
     pub max_participants: usize,
     /// STUN/TURN server URLs for ICE.
@@ -32,6 +35,7 @@ pub struct RoomConfig {
 impl Default for RoomConfig {
     fn default() -> Self {
         Self {
+            name: None,
             max_participants: usize::MAX,
             ice_servers: Vec::new(),
             audio_frame_ms: 20,
@@ -83,8 +87,17 @@ struct ParticipantEntry {
     _task: JoinHandle<()>,
 }
 
-/// High-level room facade — manages participants, signaling, and media pipelines.
+/// High-level room — manages participants, signaling, and media pipelines.
+///
+/// Each room has a unique [`Uuid`] identifier and an optional human-readable
+/// name. Participants are stored in a `HashMap` protected by an `RwLock` so
+/// that reads (`has_participant`, `get_participant`, `fetch_participants`) do
+/// not block each other.
 pub struct Room {
+    /// Unique room identifier, generated at creation.
+    id: Uuid,
+    /// Optional human-readable name.
+    name: Option<String>,
     config: RoomConfig,
     participants: Arc<RwLock<HashMap<ParticipantId, ParticipantEntry>>>,
     global_stop_tx: broadcast::Sender<()>,
@@ -98,8 +111,16 @@ impl Room {
     pub fn new(config: RoomConfig) -> Self {
         let (global_stop_tx, _) = broadcast::channel(4);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        info!("room created");
+        let id = Uuid::new_v4();
+        let name = config.name.clone();
+        info!(
+            room_id = %id,
+            room_name = name.as_deref().unwrap_or("<unnamed>"),
+            "room created"
+        );
         Self {
+            id,
+            name,
             config,
             participants: Arc::new(RwLock::new(HashMap::new())),
             global_stop_tx,
@@ -107,6 +128,16 @@ impl Room {
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             created_at: Instant::now(),
         }
+    }
+
+    /// Returns the unique room identifier.
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// Returns the room name, if set.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Adds a participant to the room.
@@ -209,17 +240,15 @@ impl Room {
                     _task: task,
                 },
             );
-            info!(participant = %id, count = participants.len(), "participant joined");
+            info!(
+                room_id = %self.id,
+                participant = %id,
+                count = participants.len(),
+                "participant joined"
+            );
         }
 
         Ok(room_handle)
-    }
-
-    /// Returns the handles of all currently connected participants.
-    /// The order is not guaranteed.
-    pub fn fetch_participants(&self) -> Vec<RoomHandle> {
-        let participants = self.participants.read().expect("lock not poisoned");
-        participants.values().map(|e| e.handle.clone()).collect()
     }
 
     /// Returns `true` if a participant with this identifier is currently in the room.
@@ -238,6 +267,13 @@ impl Room {
             .get(id)
             .map(|e| e.handle.clone())
             .ok_or(SeaMeetError::ParticipantNotFound(*id))
+    }
+
+    /// Returns the handles of all currently connected participants.
+    /// The order is not guaranteed.
+    pub fn fetch_participants(&self) -> Vec<RoomHandle> {
+        let participants = self.participants.read().expect("lock not poisoned");
+        participants.values().map(|e| e.handle.clone()).collect()
     }
 
     /// Removes a participant from the room.
@@ -273,7 +309,7 @@ impl Room {
                 let _ = self.event_tx.send(RoomEvent::RoomEmpty);
             }
 
-            debug!(participant = %id, "participant removed");
+            debug!(room_id = %self.id, participant = %id, "participant removed");
         }
 
         Ok(())
@@ -298,6 +334,7 @@ impl Room {
     /// Closes the room, stopping all participant tasks.
     pub async fn close(&self) -> Result<(), SeaMeetError> {
         info!(
+            room_id = %self.id,
             duration = ?self.created_at.elapsed(),
             "closing room"
         );
@@ -364,10 +401,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_room_has_id_and_name() {
+        let room = Room::new(RoomConfig {
+            name: Some("test-room".into()),
+            ..Default::default()
+        });
+        assert!(!room.id().is_nil());
+        assert_eq!(room.name(), Some("test-room"));
+    }
+
+    #[tokio::test]
+    async fn test_room_default_name_is_none() {
+        let room = Room::new(RoomConfig::default());
+        assert!(room.name().is_none());
+    }
+
+    #[tokio::test]
     async fn test_has_participant_true() {
         let room = Room::new(RoomConfig::default());
         let id = ParticipantId::random();
-        let _h = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+        let _h = room
+            .add_participant(id, DummySignaling, Passthrough)
+            .await
+            .expect("add");
         assert!(room.has_participant(&id));
     }
 
@@ -382,7 +438,10 @@ mod tests {
     async fn test_get_participant_ok() {
         let room = Room::new(RoomConfig::default());
         let id = ParticipantId::random();
-        let _h = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+        let _h = room
+            .add_participant(id, DummySignaling, Passthrough)
+            .await
+            .expect("add");
         let handle = room.get_participant(&id).expect("get");
         assert_eq!(handle.participant_id, id);
     }
@@ -410,7 +469,10 @@ mod tests {
         let room = Room::new(RoomConfig::default());
         for _ in 0..3 {
             let id = ParticipantId::random();
-            let _ = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+            let _ = room
+                .add_participant(id, DummySignaling, Passthrough)
+                .await
+                .expect("add");
         }
         assert_eq!(room.fetch_participants().len(), 3);
     }
@@ -420,7 +482,10 @@ mod tests {
         let room = Room::new(RoomConfig::default());
         let mut events = room.events();
         let id = ParticipantId::random();
-        let _ = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+        let _ = room
+            .add_participant(id, DummySignaling, Passthrough)
+            .await
+            .expect("add");
 
         // Consume ParticipantJoined.
         let _ = tokio::time::timeout(Duration::from_secs(1), events.next()).await;
@@ -443,7 +508,10 @@ mod tests {
         let room = Room::new(RoomConfig::default());
         let mut events = room.events();
         let id = ParticipantId::random();
-        let _ = room.add_participant(id, DummySignaling, Passthrough).await.expect("add");
+        let _ = room
+            .add_participant(id, DummySignaling, Passthrough)
+            .await
+            .expect("add");
 
         // Consume ParticipantJoined.
         let _ = tokio::time::timeout(Duration::from_secs(1), events.next()).await;
@@ -469,7 +537,6 @@ mod tests {
     async fn test_remove_participant_noop() {
         let room = Room::new(RoomConfig::default());
         let id = ParticipantId::random();
-        // Should not panic or error on unknown id.
         let result = room.remove_participant(&id).await;
         assert!(result.is_ok());
     }
@@ -485,15 +552,11 @@ mod tests {
 
         let room2 = Arc::clone(&room);
 
-        // Spawn a task that reads the participant list.
         let reader = tokio::spawn(async move {
-            // This should not deadlock — the write lock in remove_participant
-            // is released before the task finishes.
             tokio::time::sleep(Duration::from_millis(20)).await;
             room2.has_participant(&id)
         });
 
-        // Remove in parallel.
         room.remove_participant(&id).await.expect("remove");
 
         let result = tokio::time::timeout(Duration::from_secs(1), reader)
@@ -501,7 +564,6 @@ mod tests {
             .expect("should not deadlock")
             .expect("task should not panic");
 
-        // The reader may see true or false depending on scheduling — either is fine.
         let _ = result;
     }
 }

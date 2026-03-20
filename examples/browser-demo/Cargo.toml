@@ -15,5 +15,4 @@ tracing             = { workspace = true }
 tracing-subscriber  = "0.3"
 axum                = "0.7"
 serde_json          = { workspace = true }
-uuid                = { workspace = true }
 futures-util        = "0.3"

@@ -1,364 +1,470 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>seameet — demo</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: system-ui, -apple-system, sans-serif;
-    background: #0f0f0f;
-    color: #e0e0e0;
-    padding: 1.5rem;
-    max-width: 900px;
-    margin: 0 auto;
-  }
-  h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
-  h1 span { font-weight: 400; color: #888; font-size: 0.9rem; }
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>seameet — demo</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        background: #0f0f0f;
+        color: #e0e0e0;
+        padding: 1.5rem;
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin-bottom: 0.5rem;
+      }
+      h1 span {
+        font-weight: 400;
+        color: #888;
+        font-size: 0.9rem;
+      }
 
-  .badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 12px;
-    font-size: 0.8rem;
-    font-weight: 600;
-    margin-left: 0.5rem;
-  }
-  .badge.connecting   { background: #555; color: #ccc; }
-  .badge.signaling    { background: #b56e00; color: #fff; }
-  .badge.connected    { background: #1a7a1a; color: #fff; }
-  .badge.disconnected { background: #a00; color: #fff; }
+      .badge {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-left: 0.5rem;
+      }
+      .badge.connecting {
+        background: #555;
+        color: #ccc;
+      }
+      .badge.signaling {
+        background: #b56e00;
+        color: #fff;
+      }
+      .badge.connected {
+        background: #1a7a1a;
+        color: #fff;
+      }
+      .badge.disconnected {
+        background: #a00;
+        color: #fff;
+      }
 
-  .info {
-    font-size: 0.85rem;
-    color: #aaa;
-    margin-bottom: 1rem;
-  }
+      .info {
+        font-size: 0.85rem;
+        color: #aaa;
+        margin-bottom: 1rem;
+      }
 
-  .controls {
-    margin-bottom: 1rem;
-  }
-  button {
-    background: #2a2a2a;
-    color: #e0e0e0;
-    border: 1px solid #444;
-    padding: 6px 16px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 0.85rem;
-  }
-  button:hover { background: #3a3a3a; }
-  button:active { background: #444; }
+      .controls {
+        margin-bottom: 1rem;
+      }
+      button {
+        background: #2a2a2a;
+        color: #e0e0e0;
+        border: 1px solid #444;
+        padding: 6px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.85rem;
+      }
+      button:hover {
+        background: #3a3a3a;
+      }
+      button:active {
+        background: #444;
+      }
 
-  .videos {
-    display: flex;
-    gap: 1rem;
-    margin-bottom: 1rem;
-    flex-wrap: wrap;
-  }
-  .video-box {
-    flex: 1;
-    min-width: 280px;
-    background: #1a1a1a;
-    border-radius: 8px;
-    overflow: hidden;
-    position: relative;
-  }
-  .video-box video {
-    width: 100%;
-    display: block;
-    background: #000;
-  }
-  .video-label {
-    position: absolute;
-    bottom: 6px;
-    left: 8px;
-    font-size: 0.75rem;
-    background: rgba(0,0,0,0.6);
-    padding: 2px 8px;
-    border-radius: 4px;
-  }
+      .videos {
+        display: flex;
+        gap: 1rem;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+      }
+      .video-box {
+        flex: 1;
+        min-width: 280px;
+        background: #1a1a1a;
+        border-radius: 8px;
+        overflow: hidden;
+        position: relative;
+      }
+      .video-box video {
+        width: 100%;
+        display: block;
+        background: #000;
+      }
+      .video-label {
+        position: absolute;
+        bottom: 6px;
+        left: 8px;
+        font-size: 0.75rem;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 2px 8px;
+        border-radius: 4px;
+      }
+      .video-overlay {
+        position: absolute;
+        inset: 0;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 0.75rem;
+        z-index: 2;
+        transition: opacity 0.3s;
+      }
+      .video-overlay.hidden {
+        display: none;
+      }
+      .video-overlay svg {
+        opacity: 0.35;
+      }
+      .video-overlay span {
+        font-size: 0.8rem;
+        color: #666;
+        letter-spacing: 0.02em;
+      }
 
-  #log {
-    background: #1a1a1a;
-    border: 1px solid #333;
-    border-radius: 8px;
-    padding: 0.75rem;
-    font-family: 'SF Mono', 'Fira Code', monospace;
-    font-size: 0.78rem;
-    line-height: 1.5;
-    height: 260px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: #aaa;
-  }
-</style>
-</head>
-<body>
+      #log {
+        background: #1a1a1a;
+        border: 1px solid #333;
+        border-radius: 8px;
+        padding: 0.75rem;
+        font-family: "SF Mono", "Fira Code", monospace;
+        font-size: 0.78rem;
+        line-height: 1.5;
+        height: 260px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #aaa;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>
+      seameet <span>— demo</span>
+      <span id="badge" class="badge connecting">connecting</span>
+    </h1>
+    <div class="info">Participant: <code id="pid">—</code></div>
 
-<h1>
-  seameet <span>— demo</span>
-  <span id="badge" class="badge connecting">connecting</span>
-</h1>
-<div class="info">Participant: <code id="pid">—</code></div>
+    <div class="controls">
+      <button id="muteBtn" onclick="toggleMute()">Mute</button>
+    </div>
 
-<div class="controls">
-  <button id="muteBtn" onclick="toggleMute()">Mute</button>
-</div>
+    <div class="videos">
+      <div class="video-box">
+        <video id="local" autoplay playsinline muted></video>
+        <div class="video-label">You</div>
+      </div>
+      <div class="video-box">
+        <div id="remoteOverlay" class="video-overlay">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="1" y1="1" x2="23" y2="23"/>
+            <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/>
+            <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/>
+            <path d="M10.71 5.05A16 16 0 0 1 22.56 9"/>
+            <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/>
+            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+            <line x1="12" y1="20" x2="12.01" y2="20"/>
+          </svg>
+          <span>No peer connected</span>
+        </div>
+        <video id="remote" autoplay playsinline></video>
+        <div class="video-label">Remote</div>
+      </div>
+    </div>
 
-<div class="videos">
-  <div class="video-box">
-    <video id="local" autoplay playsinline muted></video>
-    <div class="video-label">You</div>
-  </div>
-  <div class="video-box">
-    <video id="remote" autoplay playsinline></video>
-    <div class="video-label">Remote</div>
-  </div>
-</div>
+    <pre id="log"></pre>
 
-<pre id="log"></pre>
+    <script>
+      "use strict";
 
-<script>
-"use strict";
+      const WS_URL = `ws://${location.hostname || "localhost"}:3001`;
+      const ROOM_ID = "demo-room";
+      const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
-const WS_URL = `ws://${location.hostname || "localhost"}:3001`;
-const ROOM_ID = "demo-room";
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+      const participantId = crypto.randomUUID();
+      document.getElementById("pid").textContent = participantId;
 
-const participantId = crypto.randomUUID();
-document.getElementById("pid").textContent = participantId;
+      let localStream = null;
+      let pc = null;
+      let ws = null;
+      let muted = false;
+      let remoteParticipantId = null;
 
-let localStream = null;
-let pc = null;
-let ws = null;
-let muted = false;
-let remoteParticipantId = null;
+      // ── Logging ──
 
-// ── Logging ──
+      function log(msg) {
+        const ts = new Date().toISOString().split("T")[1].slice(0, 12);
+        const el = document.getElementById("log");
+        el.textContent += `[${ts}] ${msg}\n`;
+        el.scrollTop = el.scrollHeight;
+      }
 
-function log(msg) {
-  const ts = new Date().toISOString().split("T")[1].slice(0, 12);
-  const el = document.getElementById("log");
-  el.textContent += `[${ts}] ${msg}\n`;
-  el.scrollTop = el.scrollHeight;
-}
+      function setBadge(state) {
+        const el = document.getElementById("badge");
+        el.textContent = state;
+        el.className = "badge " + state;
+      }
 
-function setBadge(state) {
-  const el = document.getElementById("badge");
-  el.textContent = state;
-  el.className = "badge " + state;
-}
+      // ── Mute ──
 
-// ── Mute ──
+      function toggleMute() {
+        if (!localStream) return;
+        muted = !muted;
+        localStream.getAudioTracks().forEach((t) => {
+          t.enabled = !muted;
+        });
+        document.getElementById("muteBtn").textContent = muted
+          ? "Unmute"
+          : "Mute";
+        log(muted ? "microphone muted" : "microphone unmuted");
+      }
 
-function toggleMute() {
-  if (!localStream) return;
-  muted = !muted;
-  localStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
-  document.getElementById("muteBtn").textContent = muted ? "Unmute" : "Mute";
-  log(muted ? "microphone muted" : "microphone unmuted");
-}
+      // ── WebSocket signaling ──
 
-// ── WebSocket signaling ──
+      function sendWs(obj) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(obj));
+        }
+      }
 
-function sendWs(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
-}
+      function connectSignaling() {
+        ws = new WebSocket(WS_URL);
 
-function connectSignaling() {
-  ws = new WebSocket(WS_URL);
+        ws.onopen = () => {
+          log("WS connected");
+          setBadge("signaling");
 
-  ws.onopen = () => {
-    log("WS connected");
-    setBadge("signaling");
+          sendWs({
+            type: "join",
+            participant: participantId,
+            room_id: ROOM_ID,
+          });
+          log(`joined room ${ROOM_ID} as ${participantId.slice(0, 8)}...`);
+        };
 
-    sendWs({
-      type: "join",
-      participant: participantId,
-      room_id: ROOM_ID,
-    });
-    log(`joined room ${ROOM_ID} as ${participantId.slice(0, 8)}...`);
-  };
+        ws.onmessage = (evt) => {
+          let data;
+          try {
+            data = JSON.parse(evt.data);
+          } catch {
+            return;
+          }
+          handleSignalingMessage(data);
+        };
 
-  ws.onmessage = (evt) => {
-    let data;
-    try { data = JSON.parse(evt.data); } catch { return; }
-    handleSignalingMessage(data);
-  };
+        ws.onclose = () => {
+          log("WS disconnected");
+          setBadge("disconnected");
+        };
 
-  ws.onclose = () => {
-    log("WS disconnected");
-    setBadge("disconnected");
-  };
+        ws.onerror = (e) => {
+          log("WS error");
+        };
+      }
 
-  ws.onerror = (e) => {
-    log("WS error");
-  };
-}
+      async function handleSignalingMessage(data) {
+        if (data.type === "ready") {
+          log(`ready — initiator: ${data.initiator} (room: ${data.room_id})`);
+          if (data.initiator) {
+            // First in the room — wait for a peer to join.
+          }
+          return;
+        }
 
-async function handleSignalingMessage(data) {
-  if (data.type === "ready") {
-    log(`ready — peers in room: ${data.participant_count}`);
-    return;
-  }
+        if (data.type === "join") {
+          // A new peer joined our room — create an offer for them.
+          remoteParticipantId = data.participant;
+          log(`peer ${data.participant.slice(0, 8)}... joined, creating offer`);
+          await createOffer();
+          return;
+        }
 
-  if (data.type === "peer_joined") {
-    // A new peer joined the room — create an offer for them.
-    remoteParticipantId = data.participant;
-    log(`peer ${data.participant.slice(0, 8)}... joined, creating offer`);
-    await createOffer();
-    return;
-  }
+        if (data.type === "offer") {
+          remoteParticipantId = data.from;
+          log(`received offer from ${data.from.slice(0, 8)}...`);
+          await handleOffer(data);
+          return;
+        }
 
-  if (data.type === "offer") {
-    remoteParticipantId = data.from;
-    log(`received offer from ${data.from.slice(0, 8)}...`);
-    await handleOffer(data);
-    return;
-  }
+        if (data.type === "answer") {
+          log(`received answer from ${data.from.slice(0, 8)}...`);
+          await handleAnswer(data);
+          return;
+        }
 
-  if (data.type === "answer") {
-    log(`received answer from ${data.from.slice(0, 8)}...`);
-    await handleAnswer(data);
-    return;
-  }
+        if (data.type === "ice_candidate") {
+          log(`received ICE candidate from ${data.from.slice(0, 8)}...`);
+          await handleIceCandidate(data);
+          return;
+        }
 
-  if (data.type === "ice_candidate") {
-    log(`received ICE candidate from ${data.from.slice(0, 8)}...`);
-    await handleIceCandidate(data);
-    return;
-  }
+        if (data.type === "leave") {
+          log(`peer ${data.participant.slice(0, 8)}... left`);
+          handleRemoteDisconnect();
+          return;
+        }
+      }
 
-  if (data.type === "leave") {
-    log(`peer ${data.participant.slice(0, 8)}... left`);
-    return;
-  }
-}
+      // ── WebRTC ──
 
-// ── WebRTC ──
+      function createPeerConnection() {
+        if (pc) return;
 
-function createPeerConnection() {
-  if (pc) return;
+        pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        pc.onicecandidate = (evt) => {
+          if (!evt.candidate) return;
+          const target = remoteParticipantId || null;
+          sendWs({
+            type: "ice_candidate",
+            from: participantId,
+            to: target,
+            room_id: ROOM_ID,
+            candidate: evt.candidate.candidate,
+            sdp_mid: evt.candidate.sdpMid,
+            sdp_mline_index: evt.candidate.sdpMLineIndex,
+          });
+          log("ICE candidate sent");
+        };
 
-  pc.onicecandidate = (evt) => {
-    if (!evt.candidate) return;
-    const target = remoteParticipantId || null;
-    sendWs({
-      type: "ice_candidate",
-      from: participantId,
-      to: target,
-      candidate: evt.candidate.candidate,
-      sdp_mid: evt.candidate.sdpMid,
-      sdp_mline_index: evt.candidate.sdpMLineIndex,
-    });
-    log("ICE candidate sent");
-  };
+        pc.ontrack = (evt) => {
+          log("remote track received");
+          const remote = document.getElementById("remote");
+          if (remote.srcObject !== evt.streams[0]) {
+            remote.srcObject = evt.streams[0];
+          }
+          showRemoteOverlay(false);
+        };
 
-  pc.ontrack = (evt) => {
-    log("remote track received");
-    const remote = document.getElementById("remote");
-    if (remote.srcObject !== evt.streams[0]) {
-      remote.srcObject = evt.streams[0];
-    }
-  };
+        pc.onconnectionstatechange = () => {
+          log(`connection state: ${pc.connectionState}`);
+          if (pc.connectionState === "connected") {
+            setBadge("connected");
+            log("peer connected");
+          } else if (
+            pc.connectionState === "disconnected" ||
+            pc.connectionState === "failed"
+          ) {
+            setBadge("disconnected");
+            handleRemoteDisconnect();
+          }
+        };
 
-  pc.onconnectionstatechange = () => {
-    log(`connection state: ${pc.connectionState}`);
-    if (pc.connectionState === "connected") {
-      setBadge("connected");
-      log("peer connected");
-    } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
-      setBadge("disconnected");
-    }
-  };
+        // Add local tracks.
+        if (localStream) {
+          localStream.getTracks().forEach((track) => {
+            pc.addTrack(track, localStream);
+          });
+        }
+      }
 
-  // Add local tracks.
-  if (localStream) {
-    localStream.getTracks().forEach(track => {
-      pc.addTrack(track, localStream);
-    });
-  }
-}
+      async function createOffer() {
+        createPeerConnection();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
 
-async function createOffer() {
-  createPeerConnection();
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
+        sendWs({
+          type: "offer",
+          from: participantId,
+          to: null,
+          room_id: ROOM_ID,
+          sdp: offer.sdp,
+        });
+        log("offer sent");
+      }
 
-  // Broadcast offer to all peers in the room (to: null).
-  sendWs({
-    type: "offer",
-    from: participantId,
-    to: null,
-    sdp: offer.sdp,
-  });
-  log("offer sent");
-}
+      async function handleOffer(data) {
+        createPeerConnection();
+        await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
 
-async function handleOffer(data) {
-  createPeerConnection();
-  await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
 
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
+        sendWs({
+          type: "answer",
+          from: participantId,
+          to: data.from,
+          room_id: ROOM_ID,
+          sdp: answer.sdp,
+        });
+        log("answer sent");
+      }
 
-  sendWs({
-    type: "answer",
-    from: participantId,
-    to: data.from,
-    sdp: answer.sdp,
-  });
-  log("answer sent");
-}
+      async function handleAnswer(data) {
+        if (!pc) return;
+        remoteParticipantId = data.from;
+        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+        log("remote description set");
+      }
 
-async function handleAnswer(data) {
-  if (!pc) return;
-  remoteParticipantId = data.from;
-  await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
-  log("remote description set");
-}
+      async function handleIceCandidate(data) {
+        if (!pc) return;
+        try {
+          await pc.addIceCandidate({
+            candidate: data.candidate,
+            sdpMid: data.sdp_mid || null,
+            sdpMLineIndex: data.sdp_mline_index ?? null,
+          });
+          log("ICE candidate applied");
+        } catch (e) {
+          log(`ICE candidate error: ${e.message}`);
+        }
+      }
 
-async function handleIceCandidate(data) {
-  if (!pc) return;
-  try {
-    await pc.addIceCandidate({
-      candidate: data.candidate,
-      sdpMid: data.sdp_mid || null,
-      sdpMLineIndex: data.sdp_mline_index ?? null,
-    });
-    log("ICE candidate applied");
-  } catch (e) {
-    log(`ICE candidate error: ${e.message}`);
-  }
-}
+      // ── Remote overlay ──
 
-// ── Init ──
+      function showRemoteOverlay(visible) {
+        const el = document.getElementById("remoteOverlay");
+        if (visible) {
+          el.classList.remove("hidden");
+        } else {
+          el.classList.add("hidden");
+        }
+      }
 
-async function init() {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: true,
-    });
-    document.getElementById("local").srcObject = localStream;
-    log("getUserMedia ok");
-  } catch (e) {
-    log(`getUserMedia failed: ${e.message}`);
-    // Continue without media — signaling will still work.
-  }
+      function handleRemoteDisconnect() {
+        const remote = document.getElementById("remote");
+        remote.srcObject = null;
+        showRemoteOverlay(true);
+        remoteParticipantId = null;
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+      }
 
-  connectSignaling();
-}
+      // ── Init ──
 
-init();
-</script>
+      async function init() {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true,
+          });
+          document.getElementById("local").srcObject = localStream;
+          log("getUserMedia ok");
+        } catch (e) {
+          log(`getUserMedia failed: ${e.message}`);
+          // Continue without media — signaling will still work.
+        }
 
-</body>
+        connectSignaling();
+      }
+
+      init();
+    </script>
+  </body>
 </html>
