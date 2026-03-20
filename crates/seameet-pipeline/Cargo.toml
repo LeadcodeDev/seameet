@@ -4,4 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-seameet-core = { path = "../seameet-core" }
+seameet-core  = { path = "../seameet-core" }
+seameet-rtp   = { path = "../seameet-rtp" }
+seameet-codec = { path = "../seameet-codec" }
+tokio         = { workspace = true }
+tokio-stream  = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+ringbuf       = { workspace = true }
+rand          = { workspace = true }
+str0m         = { workspace = true }
+bytes         = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
