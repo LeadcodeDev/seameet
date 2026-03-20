@@ -24,6 +24,8 @@ use tracing::{debug, error, info, warn};
 enum PeerCmd {
     IceCandidate(String),
     Media(ForwardedMedia),
+    /// Request this peer's browser to send a keyframe.
+    RequestKeyframe,
 }
 
 /// Raw RTP packet forwarded between participants.
@@ -185,8 +187,13 @@ async fn handle_ws(
                 // Disable H264 to avoid PT 109 conflict (H264 RTX defaults to
                 // PT 109, which Chrome/Firefox use for Opus audio).
                 let mut config = RtcConfig::new()
-                    .set_rtp_mode(true);
-                config.codec_config().enable_h264(false);
+                    .set_rtp_mode(true)
+                    .enable_raw_packets(true);
+                {
+                    let cc = config.codec_config();
+                    cc.enable_h264(false);
+                    cc.enable_vp9(false);
+                }
                 let mut rtc = config.build();
 
                 if let Ok(c) = Candidate::host(local_addr, Protocol::Udp) {
@@ -208,6 +215,17 @@ async fn handle_ws(
                         continue;
                     }
                 };
+
+                // Log the SDP answer to debug video direction
+                let answer_sdp = answer.to_sdp_string();
+                for line in answer_sdp.lines() {
+                    if line.starts_with("m=") || line.starts_with("a=sendrecv")
+                        || line.starts_with("a=recvonly") || line.starts_with("a=sendonly")
+                        || line.starts_with("a=inactive") || line.starts_with("a=rtpmap")
+                    {
+                        debug!("SDP answer: {line}");
+                    }
+                }
 
                 let answer_msg = SdpMessage::Answer {
                     from: pid,
@@ -268,6 +286,9 @@ async fn run_media(
     let mut audio_tx_ssrc: Option<Ssrc> = None;
     let mut video_tx_ssrc: Option<Ssrc> = None;
     let mut media_started = false;
+    // Own sequence counters for TX streams (str0m expects sequential seq_nos).
+    let mut audio_tx_seq: u64 = 0;
+    let mut video_tx_seq: u64 = 0;
 
     loop {
         let timeout = drain_outputs(
@@ -306,7 +327,20 @@ async fn run_media(
                         }
                     }
                     Some(PeerCmd::Media(m)) => {
-                        write_forwarded_rtp(&mut rtc, &m, audio_mid, video_mid, audio_tx_ssrc, video_tx_ssrc);
+                        write_forwarded_rtp(
+                            &mut rtc, &m, audio_mid, video_mid,
+                            audio_tx_ssrc, video_tx_ssrc,
+                            &mut audio_tx_seq, &mut video_tx_seq,
+                        );
+                    }
+                    Some(PeerCmd::RequestKeyframe) => {
+                        if let Some(mid) = video_mid {
+                            let mut api = rtc.direct_api();
+                            if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                                info!(participant = %pid, "PLI requested by remote peer");
+                            }
+                        }
                     }
                     None => break,
                 }
@@ -339,7 +373,6 @@ async fn drain_outputs(
                 let _ = socket.try_send_to(&t.contents, t.destination);
             }
             Ok(Output::Event(event)) => {
-                debug!(participant = %pid, event = ?std::mem::discriminant(&event), "str0m event");
                 match event {
                     Event::Connected => {
                         info!(participant = %pid, "WebRTC CONNECTED");
@@ -351,27 +384,55 @@ async fn drain_outputs(
                         }
                         info!(participant = %pid, mid = ?m.mid, kind = ?m.kind, "media added");
 
-                        // Declare outgoing TX streams for forwarding.
+                        // Use the TX streams auto-created by str0m for sendrecv media.
+                        // Do NOT declare_stream_tx — that creates duplicates.
                         if !*media_started && audio_mid.is_some() && video_mid.is_some() {
                             *media_started = true;
-                            let a_ssrc = Ssrc::new();
-                            let v_ssrc = Ssrc::new();
                             {
                                 let mut api = rtc.direct_api();
                                 if let Some(mid) = *audio_mid {
-                                    api.declare_stream_tx(a_ssrc, None, mid, None);
+                                    if let Some(tx) = api.stream_tx_by_mid(mid, None) {
+                                        let ssrc = tx.ssrc();
+                                        *audio_tx_ssrc = Some(ssrc);
+                                        info!(participant = %pid, ?ssrc, "found audio TX stream");
+                                    }
                                 }
                                 if let Some(mid) = *video_mid {
-                                    api.declare_stream_tx(v_ssrc, None, mid, None);
+                                    if let Some(tx) = api.stream_tx_by_mid(mid, None) {
+                                        let ssrc = tx.ssrc();
+                                        *video_tx_ssrc = Some(ssrc);
+                                        info!(participant = %pid, ?ssrc, "found video TX stream");
+                                    }
                                 }
                             }
-                            *audio_tx_ssrc = Some(a_ssrc);
-                            *video_tx_ssrc = Some(v_ssrc);
-                            info!(participant = %pid, ?a_ssrc, ?v_ssrc, "declared TX streams");
+
+                            // Request a keyframe from own browser + all other peers.
+                            if let Some(mid) = *video_mid {
+                                let mut api = rtc.direct_api();
+                                if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                    rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                                    info!(participant = %pid, "requested keyframe (PLI)");
+                                }
+                            }
+                            // Ask all other peers to send a keyframe so we can
+                            // start rendering their video immediately.
+                            let p = peers.lock().await;
+                            for (id, peer) in p.iter() {
+                                if id != pid {
+                                    let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                                }
+                            }
                         }
                     }
                     Event::RtpPacket(pkt) => {
-                        info!(participant = %pid, pt = *pkt.header.payload_type, seq = ?pkt.seq_no, "GOT RTP PACKET!");
+                        // Log first few packets of each PT to verify audio + video
+                        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if count < 20 || count % 500 == 0 {
+                            info!(participant = %pid, pt = *pkt.header.payload_type,
+                                  marker = pkt.header.marker, len = pkt.payload.len(),
+                                  "RTP packet received");
+                        }
                         // Heuristic: audio PT is typically 109 (Opus), video starts at 120.
                         let is_audio_pt = *pkt.header.payload_type < 112;
 
@@ -398,8 +459,27 @@ async fn drain_outputs(
                             }
                         }
                     }
+                    Event::KeyframeRequest(_) => {
+                        // Browser can't decode forwarded video — propagate PLI
+                        // to all other peers so they send a fresh keyframe.
+                        let p = peers.lock().await;
+                        for (id, peer) in p.iter() {
+                            if id != pid {
+                                let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                            }
+                        }
+                    }
                     Event::IceConnectionStateChange(state) => {
                         debug!(participant = %pid, ?state, "ICE state");
+                    }
+                    Event::RawPacket(raw) => {
+                        use str0m::rtp::RawPacket;
+                        match raw.as_ref() {
+                            RawPacket::RtcpTx(rtcp) => {
+                                debug!(participant = %pid, "RTCP TX: {rtcp:?}");
+                            }
+                            _ => {}
+                        }
                     }
                     _ => {}
                 }
@@ -421,19 +501,27 @@ fn write_forwarded_rtp(
     _video_mid: Option<Mid>,
     audio_tx_ssrc: Option<Ssrc>,
     video_tx_ssrc: Option<Ssrc>,
+    audio_tx_seq: &mut u64,
+    video_tx_seq: &mut u64,
 ) {
-    let ssrc = if media.is_audio { audio_tx_ssrc } else { video_tx_ssrc };
+    let (ssrc, seq) = if media.is_audio {
+        (audio_tx_ssrc, audio_tx_seq)
+    } else {
+        (video_tx_ssrc, video_tx_seq)
+    };
     let Some(ssrc) = ssrc else { return };
+
+    let current_seq = *seq;
+    *seq += 1;
 
     let mut api = rtc.direct_api();
     let Some(stream_tx) = api.stream_tx(&ssrc) else { return };
 
     let pt = media.pt.into();
-    let seq_no = media.seq_no.into();
 
     if let Err(e) = stream_tx.write_rtp(
         pt,
-        seq_no,
+        current_seq.into(),
         media.time,
         Instant::now(),
         media.marker,
@@ -441,7 +529,7 @@ fn write_forwarded_rtp(
         !media.is_audio, // nackable for video only
         media.payload.clone(),
     ) {
-        debug!("write_rtp error: {e}");
+        warn!("write_rtp error: {e}");
     }
 }
 

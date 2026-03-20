@@ -324,9 +324,12 @@
         pc.ontrack = (evt) => {
           log(`remote track received: ${evt.track.kind}`);
           const remote = document.getElementById("remote");
-          if (remote.srcObject !== evt.streams[0]) {
-            remote.srcObject = evt.streams[0];
+          // SFU sends tracks via direct_api without stream association,
+          // so evt.streams may be empty — create a MediaStream manually.
+          if (!remote.srcObject) {
+            remote.srcObject = new MediaStream();
           }
+          remote.srcObject.addTrack(evt.track);
           showRemoteOverlay(false);
         };
 
@@ -340,11 +343,17 @@
           }
         };
 
-        // Add local tracks.
+        // Add local tracks if available.
         if (localStream) {
           localStream.getTracks().forEach((track) => {
             pc.addTrack(track, localStream);
           });
+        } else {
+          // No local media — add transceivers so the offer has m-lines
+          // and we can still receive media from the server.
+          pc.addTransceiver("audio", { direction: "recvonly" });
+          pc.addTransceiver("video", { direction: "recvonly" });
+          log("no local media — receiving only");
         }
 
         // Create and send offer to the server.
@@ -452,7 +461,9 @@
             video: true,
           });
           document.getElementById("local").srcObject = localStream;
-          log("getUserMedia ok");
+          const audioTracks = localStream.getAudioTracks().length;
+          const videoTracks = localStream.getVideoTracks().length;
+          log(`getUserMedia ok — ${audioTracks} audio, ${videoTracks} video tracks`);
         } catch (e) {
           log(`getUserMedia failed: ${e.message}`);
         }
