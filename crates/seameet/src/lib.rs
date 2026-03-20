@@ -35,6 +35,23 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Participant management
+//!
+//! ```rust,no_run
+//! # use seameet::{Room, RoomConfig, ParticipantId, SeaMeetError};
+//! # fn example(room: &Room, id_a: &ParticipantId) -> Result<(), SeaMeetError> {
+//! // Check if a participant is present
+//! if room.has_participant(id_a) {
+//!     let handle = room.get_participant(id_a)?;
+//! }
+//!
+//! // List all participants
+//! let handles = room.fetch_participants();
+//! println!("{} participant(s) connected", handles.len());
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod room;
 

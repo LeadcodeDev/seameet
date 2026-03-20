@@ -92,9 +92,19 @@ where
         self.audio_tx.subscribe()
     }
 
+    /// Returns a clone of the audio broadcast sender.
+    pub fn audio_tx_clone(&self) -> broadcast::Sender<PcmFrame> {
+        self.audio_tx.clone()
+    }
+
     /// Returns a receiver for decoded video frames from this peer.
     pub fn video_rx(&self) -> broadcast::Receiver<VideoFrame> {
         self.video_tx.subscribe()
+    }
+
+    /// Returns a clone of the video broadcast sender.
+    pub fn video_tx_clone(&self) -> broadcast::Sender<VideoFrame> {
+        self.video_tx.clone()
     }
 
     /// Runs with a [`PeerConnection`] event stream, forwarding received RTP

@@ -180,7 +180,7 @@ async fn test_room_close() {
         .await
         .expect("add 2");
 
-    assert_eq!(room.participant_count().await, 2);
+    assert_eq!(room.participant_count(), 2);
 
     // Close should not panic.
     room.close().await.expect("close");
