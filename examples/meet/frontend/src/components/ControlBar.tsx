@@ -12,7 +12,7 @@ export function ControlBar() {
     toggleVideo,
     startScreenShare,
     stopScreenShare,
-    screenStream,
+    localScreenStream,
     leave,
     roomId,
   } = useCall()
@@ -27,8 +27,8 @@ export function ControlBar() {
   }, [roomId])
 
   const handleScreenShare = useCallback(async () => {
-    if (screenStream) {
-      stopScreenShare()
+    if (localScreenStream) {
+      await stopScreenShare()
     } else {
       try {
         await startScreenShare()
@@ -36,7 +36,7 @@ export function ControlBar() {
         // User cancelled or error
       }
     }
-  }, [screenStream, startScreenShare, stopScreenShare])
+  }, [localScreenStream, startScreenShare, stopScreenShare])
 
   return (
     <div className="flex items-center justify-center gap-3 p-4">
@@ -74,7 +74,7 @@ export function ControlBar() {
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
-            variant={screenStream ? 'default' : 'secondary'}
+            variant={localScreenStream ? 'default' : 'secondary'}
             size="icon"
             className="h-12 w-12 rounded-full"
             onClick={handleScreenShare}
@@ -82,7 +82,7 @@ export function ControlBar() {
             <Monitor className="h-5 w-5" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{screenStream ? 'Stop sharing' : 'Share screen'}</TooltipContent>
+        <TooltipContent>{localScreenStream ? 'Stop sharing' : 'Share screen'}</TooltipContent>
       </Tooltip>
 
       {/* Copy room link */}

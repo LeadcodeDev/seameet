@@ -22,6 +22,7 @@ pub enum PeerCmd {
         sdp: String,
         reply_tx: oneshot::Sender<String>,
     },
+    ScreenShareActive(bool),
 }
 
 pub struct ForwardedMedia {
@@ -31,14 +32,17 @@ pub struct ForwardedMedia {
     pub marker: bool,
     pub payload: Vec<u8>,
     pub is_audio: bool,
+    pub is_screen: bool,
     pub source_pid: ParticipantId,
 }
 
 pub struct SourceSlot {
     audio_mid: Mid,
     video_mid: Mid,
+    screen_mid: Option<Mid>,
     audio_tx_seq: u64,
     video_tx_seq: u64,
+    screen_tx_seq: u64,
     audio_pt: u8,
     video_pt: u8,
 }
@@ -107,6 +111,11 @@ pub async fn run_media(
 ) {
     let mut own_audio_mid: Option<Mid> = None;
     let mut own_video_mid: Option<Mid> = None;
+    let mut own_screen_mid: Option<Mid> = None;
+    let mut screen_share_active = false;
+    // Track the camera video SSRC to distinguish from screen share.
+    // The first video SSRC we see is always camera (screen comes later).
+    let mut camera_video_ssrc = None;
     let mut media_started = false;
     let mut ice_connected = false;
     let mut keyframes_requested_on_connect = false;
@@ -133,7 +142,7 @@ pub async fn run_media(
     }
     info!(
         participant = %pid,
-        ?own_audio_mid, ?own_video_mid,
+        ?own_audio_mid, ?own_video_mid, ?own_screen_mid,
         total_mids = all_mids.len(),
         "initial mids processed"
     );
@@ -151,6 +160,8 @@ pub async fn run_media(
             &pid,
             &peers,
             own_audio_pt,
+            own_screen_mid,
+            &mut camera_video_ssrc,
             &mut rtp_rx_count,
             &mut new_media,
             &mut ice_connected,
@@ -170,6 +181,11 @@ pub async fn run_media(
                 MediaKind::Video if own_video_mid.is_none() => {
                     own_video_mid = Some(*mid);
                 }
+                // NOTE: own_screen_mid is NOT set eagerly here.
+                // Receive-side video mids (for watching other peers) would be
+                // misidentified as screen share. Instead, own_screen_mid is
+                // detected dynamically in drain_outputs when we receive RTP
+                // on a video mid that isn't own_video_mid.
                 _ => {}
             }
         }
@@ -245,12 +261,18 @@ pub async fn run_media(
                     }
                     Some(PeerCmd::Media(m)) => {
                         let created_new = !source_slots.contains_key(&m.source_pid);
+                        let had_screen_mid = source_slots.get(&m.source_pid)
+                            .and_then(|s| s.screen_mid).is_some();
                         write_forwarded_rtp(
                             &mut rtc, &m, &mut source_slots, &mut rtp_tx_count,
-                            &all_mids, own_audio_mid, own_video_mid, own_audio_pt, own_video_pt,
+                            &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
                         );
-                        // Request keyframe from the source peer when we first create a slot.
-                        if created_new && source_slots.contains_key(&m.source_pid) {
+                        // Request keyframe when we first create a slot OR
+                        // when screen_mid was just set (initial keyframe was likely missed).
+                        let needs_keyframe = (created_new && source_slots.contains_key(&m.source_pid))
+                            || (!had_screen_mid && source_slots.get(&m.source_pid)
+                                .and_then(|s| s.screen_mid).is_some());
+                        if needs_keyframe {
                             let p = peers.read().await;
                             if let Some(peer) = p.get(&m.source_pid) {
                                 let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
@@ -263,6 +285,12 @@ pub async fn run_media(
                             if let Some(rx) = api.stream_rx_by_mid(mid, None) {
                                 rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                                 info!(participant = %pid, "PLI requested by remote peer");
+                            }
+                        }
+                        if let Some(mid) = own_screen_mid {
+                            let mut api = rtc.direct_api();
+                            if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                             }
                         }
                     }
@@ -279,6 +307,10 @@ pub async fn run_media(
                                 }
                                 MediaKind::Video if own_video_mid.is_none() => {
                                     own_video_mid = Some(*mid);
+                                }
+                                MediaKind::Video if screen_share_active && own_screen_mid.is_none() => {
+                                    own_screen_mid = Some(*mid);
+                                    info!(participant = %pid, ?mid, "screen share mid set from renegotiation");
                                 }
                                 _ => {}
                             }
@@ -308,6 +340,35 @@ pub async fn run_media(
                             }
                         }
                     }
+                    Some(PeerCmd::ScreenShareActive(active)) => {
+                        screen_share_active = active;
+                        if active && own_screen_mid.is_none() {
+                            // The renegotiation that added the screen transceiver
+                            // likely already completed before this signal arrived.
+                            // Find the screen mid retroactively: it's the last video
+                            // mid in all_mids that isn't own_video_mid.
+                            let used_mids: std::collections::HashSet<Mid> = source_slots
+                                .values()
+                                .flat_map(|s| {
+                                    let mut v = vec![s.audio_mid, s.video_mid];
+                                    if let Some(sm) = s.screen_mid { v.push(sm); }
+                                    v
+                                })
+                                .collect();
+                            own_screen_mid = all_mids.iter().rev()
+                                .find(|(mid, kind)| {
+                                    matches!(kind, MediaKind::Video)
+                                        && Some(*mid) != own_video_mid
+                                        && !used_mids.contains(mid)
+                                })
+                                .map(|(mid, _)| *mid);
+                            info!(participant = %pid, ?own_screen_mid, "screen share mid found retroactively");
+                        }
+                        if !active {
+                            own_screen_mid = None;
+                        }
+                        info!(participant = %pid, active, ?own_screen_mid, "screen share state changed");
+                    }
                     None => break,
                 }
             }
@@ -318,6 +379,12 @@ pub async fn run_media(
                 if media_started && last_pli.elapsed() >= Duration::from_secs(2) {
                     last_pli = Instant::now();
                     if let Some(mid) = own_video_mid {
+                        let mut api = rtc.direct_api();
+                        if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                            rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                        }
+                    }
+                    if let Some(mid) = own_screen_mid {
                         let mut api = rtc.direct_api();
                         if let Some(rx) = api.stream_rx_by_mid(mid, None) {
                             rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
@@ -414,6 +481,8 @@ async fn drain_outputs(
     pid: &ParticipantId,
     peers: &Peers,
     own_audio_pt: u8,
+    own_screen_mid: Option<Mid>,
+    camera_video_ssrc: &mut Option<u32>,
     rtp_rx_count: &mut u64,
     new_media: &mut Vec<(Mid, MediaKind)>,
     ice_connected: &mut bool,
@@ -436,11 +505,25 @@ async fn drain_outputs(
                     *rtp_rx_count += 1;
                     let is_audio_pt = *pkt.header.payload_type == own_audio_pt;
 
+                    // Identify screen share by SSRC, not by mid lookup.
+                    // stream_rx(&ssrc) can return wrong mid after renegotiation,
+                    // so we track the camera SSRC instead: the first video SSRC
+                    // is always camera; any different video SSRC when screen share
+                    // is active must be the screen track.
+                    let ssrc_raw: u32 = (*pkt.header.ssrc).into();
+                    if !is_audio_pt && camera_video_ssrc.is_none() {
+                        *camera_video_ssrc = Some(ssrc_raw);
+                    }
+                    let is_screen = !is_audio_pt
+                        && own_screen_mid.is_some()
+                        && camera_video_ssrc.map_or(false, |cam| ssrc_raw != cam);
+
                     if *rtp_rx_count <= 5 || *rtp_rx_count % 500 == 0 {
                         info!(
                             participant = %pid,
                             pt = *pkt.header.payload_type,
                             is_audio = is_audio_pt,
+                            is_screen,
                             marker = pkt.header.marker,
                             len = pkt.payload.len(),
                             total = *rtp_rx_count,
@@ -455,6 +538,7 @@ async fn drain_outputs(
                         marker: pkt.header.marker,
                         payload: pkt.payload,
                         is_audio: is_audio_pt,
+                        is_screen,
                         source_pid: *pid,
                     };
 
@@ -468,6 +552,7 @@ async fn drain_outputs(
                                 marker: forward.marker,
                                 payload: forward.payload.clone(),
                                 is_audio: forward.is_audio,
+                                is_screen: forward.is_screen,
                                 source_pid: forward.source_pid,
                             }));
                         }
@@ -507,17 +592,46 @@ fn get_or_create_slot<'a>(
     all_mids: &[(Mid, MediaKind)],
     own_audio_mid: Option<Mid>,
     own_video_mid: Option<Mid>,
+    own_screen_mid: Option<Mid>,
     own_audio_pt: u8,
     own_video_pt: u8,
 ) -> Option<&'a mut SourceSlot> {
     if source_slots.contains_key(&source_pid) {
+        // Update screen_mid if it was previously None and a free video mid is now available.
+        let needs_screen = source_slots.get(&source_pid).unwrap().screen_mid.is_none();
+        if needs_screen {
+            let used_mids: std::collections::HashSet<Mid> = source_slots
+                .values()
+                .flat_map(|s| {
+                    let mut v = vec![s.audio_mid, s.video_mid];
+                    if let Some(sm) = s.screen_mid { v.push(sm); }
+                    v
+                })
+                .collect();
+            let free_screen = all_mids.iter().find(|(mid, kind)| {
+                matches!(kind, MediaKind::Video)
+                    && Some(*mid) != own_video_mid
+                    && Some(*mid) != own_screen_mid
+                    && !used_mids.contains(mid)
+            });
+            if let Some((s_mid, _)) = free_screen {
+                let s_mid = *s_mid;
+                let slot = source_slots.get_mut(&source_pid).unwrap();
+                slot.screen_mid = Some(s_mid);
+                info!(source = %source_pid, screen_mid = ?s_mid, "updated slot with screen mid");
+            }
+        }
         return source_slots.get_mut(&source_pid);
     }
 
     // Collect mids already used by existing slots.
     let used_mids: std::collections::HashSet<Mid> = source_slots
         .values()
-        .flat_map(|s| [s.audio_mid, s.video_mid])
+        .flat_map(|s| {
+            let mut v = vec![s.audio_mid, s.video_mid];
+            if let Some(sm) = s.screen_mid { v.push(sm); }
+            v
+        })
         .collect();
 
     // Find a free audio mid and a free video mid.
@@ -529,6 +643,7 @@ fn get_or_create_slot<'a>(
     let free_video = all_mids.iter().find(|(mid, kind)| {
         matches!(kind, MediaKind::Video)
             && Some(*mid) != own_video_mid
+            && Some(*mid) != own_screen_mid
             && !used_mids.contains(mid)
     });
 
@@ -539,15 +654,19 @@ fn get_or_create_slot<'a>(
     let a_mid = *a_mid;
     let v_mid = *v_mid;
 
-    // NOTE: We do NOT check if TX streams exist here (unlike the previous
-    // version). The Room library doesn't check either. TX streams may not
-    // be available until ICE/DTLS completes, but the slot must be created
-    // so that sequence numbers are tracked continuously. write_rtp will
-    // gracefully handle missing TX streams.
+    // Also try to find a free video mid for screen share.
+    let free_screen = all_mids.iter().find(|(mid, kind)| {
+        matches!(kind, MediaKind::Video)
+            && Some(*mid) != own_video_mid
+            && Some(*mid) != own_screen_mid
+            && *mid != v_mid
+            && !used_mids.contains(mid)
+    });
+    let screen_mid = free_screen.map(|(mid, _)| *mid);
 
     info!(
         source = %source_pid,
-        ?a_mid, ?v_mid,
+        ?a_mid, ?v_mid, ?screen_mid,
         "lazy-created source slot"
     );
 
@@ -556,8 +675,10 @@ fn get_or_create_slot<'a>(
         SourceSlot {
             audio_mid: a_mid,
             video_mid: v_mid,
+            screen_mid,
             audio_tx_seq: 0,
             video_tx_seq: 0,
+            screen_tx_seq: 0,
             audio_pt: own_audio_pt,
             video_pt: own_video_pt,
         },
@@ -573,18 +694,22 @@ fn write_forwarded_rtp(
     all_mids: &[(Mid, MediaKind)],
     own_audio_mid: Option<Mid>,
     own_video_mid: Option<Mid>,
+    own_screen_mid: Option<Mid>,
     own_audio_pt: u8,
     own_video_pt: u8,
 ) {
     let Some(slot) = get_or_create_slot(
         media.source_pid, source_slots,
-        all_mids, own_audio_mid, own_video_mid, own_audio_pt, own_video_pt,
+        all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
     ) else {
         return;
     };
 
     let (mid, seq, pt) = if media.is_audio {
         (slot.audio_mid, &mut slot.audio_tx_seq, slot.audio_pt)
+    } else if media.is_screen {
+        let Some(screen_mid) = slot.screen_mid else { return };
+        (screen_mid, &mut slot.screen_tx_seq, slot.video_pt)
     } else {
         (slot.video_mid, &mut slot.video_tx_seq, slot.video_pt)
     };

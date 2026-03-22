@@ -15,9 +15,9 @@ interface CallContextValue {
   videoEnabled: boolean
   toggleAudio: () => void
   toggleVideo: () => void
-  startScreenShare: () => Promise<MediaStream>
-  stopScreenShare: () => void
-  screenStream: MediaStream | null
+  startScreenShare: () => Promise<void>
+  stopScreenShare: () => Promise<void>
+  localScreenStream: MediaStream | null
   connectionState: RTCPeerConnectionState
   signalingState: 'connecting' | 'open' | 'closed'
   leave: () => void
@@ -45,7 +45,14 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     },
   })
 
-  const media = useMediaDevices()
+  // Ref to call webrtc.stopScreenShare when browser native stop fires
+  const webrtcScreenStopRef = useRef<() => Promise<void>>(async () => {})
+
+  const media = useMediaDevices({
+    onScreenShareEnded: () => {
+      webrtcScreenStopRef.current()
+    },
+  })
 
   const webrtc = useWebRTC({
     participantId,
@@ -56,6 +63,7 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
 
   // Wire WebRTC handler — updated every render (safe, no side effects)
   webrtcHandlerRef.current = webrtc.handleMessage
+  webrtcScreenStopRef.current = webrtc.stopScreenShare
 
   // Join room when BOTH signaling is open AND localStream is available.
   // This matches the browser-demo behavior: getUserMedia THEN connect signaling.
@@ -76,6 +84,16 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     }
   }, [signaling.state])
 
+  const handleStartScreenShare = useCallback(async () => {
+    const stream = await media.startScreenShare()
+    await webrtc.startScreenShare(stream)
+  }, [media, webrtc])
+
+  const handleStopScreenShare = useCallback(async () => {
+    media.stopScreenShare()
+    await webrtc.stopScreenShare()
+  }, [media, webrtc])
+
   const leave = useCallback(() => {
     signaling.send({
       type: 'leave',
@@ -95,9 +113,9 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     videoEnabled: media.videoEnabled,
     toggleAudio: media.toggleAudio,
     toggleVideo: media.toggleVideo,
-    startScreenShare: media.startScreenShare,
-    stopScreenShare: media.stopScreenShare,
-    screenStream: media.screenStream,
+    startScreenShare: handleStartScreenShare,
+    stopScreenShare: handleStopScreenShare,
+    localScreenStream: webrtc.localScreenStream,
     connectionState: webrtc.connectionState,
     signalingState: signaling.state,
     leave,

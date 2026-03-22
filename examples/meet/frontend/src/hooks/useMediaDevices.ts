@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 
+export interface UseMediaDevicesOptions {
+  onScreenShareEnded?: () => void
+}
+
 export interface UseMediaDevicesReturn {
   localStream: MediaStream | null
   audioEnabled: boolean
@@ -12,13 +16,15 @@ export interface UseMediaDevicesReturn {
   error: string | null
 }
 
-export function useMediaDevices(): UseMediaDevicesReturn {
+export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevicesReturn {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
   const [error, setError] = useState<string | null>(null)
   const mountedRef = useRef(true)
+  const onScreenShareEndedRef = useRef(options?.onScreenShareEnded)
+  onScreenShareEndedRef.current = options?.onScreenShareEnded
 
   useEffect(() => {
     mountedRef.current = true
@@ -72,6 +78,7 @@ export function useMediaDevices(): UseMediaDevicesReturn {
     // Auto-stop when user clicks "Stop sharing" in browser UI
     stream.getVideoTracks()[0]?.addEventListener('ended', () => {
       setScreenStream(null)
+      onScreenShareEndedRef.current?.()
     })
     return stream
   }, [])

@@ -1,19 +1,20 @@
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { useCall } from '@/context/CallContext'
 import { VideoTile } from '@/components/VideoTile'
 
 export function VideoGrid() {
-  const { localStream, remotePeers, displayName, audioEnabled, videoEnabled } = useCall()
+  const { localStream, remotePeers, displayName, audioEnabled, videoEnabled, localScreenStream } = useCall()
 
   const peers = useMemo(() => Array.from(remotePeers.values()), [remotePeers])
-  const totalParticipants = 1 + peers.length
+  const screenShareCount = (localScreenStream ? 1 : 0) + peers.filter(p => p.screenStream).length
+  const totalTiles = 1 + peers.length + screenShareCount
 
   const gridCols = useMemo(() => {
-    if (totalParticipants === 1) return 'grid-cols-1'
-    if (totalParticipants <= 2) return 'grid-cols-2'
-    if (totalParticipants <= 4) return 'grid-cols-2'
+    if (totalTiles === 1) return 'grid-cols-1'
+    if (totalTiles <= 2) return 'grid-cols-2'
+    if (totalTiles <= 4) return 'grid-cols-2'
     return 'grid-cols-[repeat(auto-fit,minmax(300px,1fr))]'
-  }, [totalParticipants])
+  }, [totalTiles])
 
   return (
     <div className={`grid ${gridCols} gap-2 h-full auto-rows-fr`}>
@@ -26,16 +27,39 @@ export function VideoGrid() {
         videoEnabled={videoEnabled}
       />
 
-      {/* Remote peers */}
-      {peers.map((peer) => (
+      {/* Local screen share */}
+      {localScreenStream && (
         <VideoTile
-          key={peer.id}
-          stream={peer.stream}
-          name={peer.displayName}
-          isLocal={false}
+          stream={localScreenStream}
+          name={displayName}
+          isLocal
+          isScreenShare
           audioEnabled
           videoEnabled
         />
+      )}
+
+      {/* Remote peers */}
+      {peers.map((peer) => (
+        <React.Fragment key={peer.id}>
+          <VideoTile
+            stream={peer.stream}
+            name={peer.displayName}
+            isLocal={false}
+            audioEnabled
+            videoEnabled
+          />
+          {peer.screenStream && (
+            <VideoTile
+              stream={peer.screenStream}
+              name={peer.displayName}
+              isLocal={false}
+              isScreenShare
+              audioEnabled
+              videoEnabled
+            />
+          )}
+        </React.Fragment>
       ))}
     </div>
   )

@@ -8,6 +8,8 @@ export interface RemotePeer {
   stream: MediaStream
   audioTransceiver: RTCRtpTransceiver
   videoTransceiver: RTCRtpTransceiver
+  screenTransceiver: RTCRtpTransceiver | null
+  screenStream: MediaStream | null
 }
 
 export interface UseWebRTCOptions {
@@ -21,6 +23,9 @@ export interface UseWebRTCReturn {
   remotePeers: Map<string, RemotePeer>
   connectionState: RTCPeerConnectionState
   handleMessage: (msg: SignalingMessage) => void
+  startScreenShare: (screenStream: MediaStream) => Promise<void>
+  stopScreenShare: () => Promise<void>
+  localScreenStream: MediaStream | null
 }
 
 export function useWebRTC({
@@ -38,6 +43,8 @@ export function useWebRTC({
   const renegotiationPendingRef = useRef(false)
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
 
   // Message queue to serialize async message processing (like browser-demo's await)
   const messageQueueRef = useRef<SignalingMessage[]>([])
@@ -72,6 +79,8 @@ export function useWebRTC({
       stream,
       audioTransceiver,
       videoTransceiver,
+      screenTransceiver: null,
+      screenStream: null,
     }
 
     remotePeersRef.current.set(peerId, peer)
@@ -85,6 +94,9 @@ export function useWebRTC({
 
     try { info.audioTransceiver.direction = 'inactive' } catch { /* ignore */ }
     try { info.videoTransceiver.direction = 'inactive' } catch { /* ignore */ }
+    if (info.screenTransceiver) {
+      try { info.screenTransceiver.direction = 'inactive' } catch { /* ignore */ }
+    }
 
     remotePeersRef.current.delete(peerId)
     updateRemotePeersState()
@@ -143,6 +155,17 @@ export function useWebRTC({
     pc.ontrack = (evt) => {
       console.log(`[WebRTC] ontrack: ${evt.track.kind} (mid=${evt.transceiver.mid})`)
       for (const [peerId, info] of remotePeersRef.current) {
+        // Screen share transceiver
+        if (info.screenTransceiver && evt.transceiver === info.screenTransceiver) {
+          if (!info.screenStream) {
+            info.screenStream = new MediaStream()
+          }
+          info.screenStream.addTrack(evt.track)
+          updateRemotePeersState()
+          console.log(`[WebRTC] routed screen track to peer ${peerId.slice(0, 8)}`)
+          return
+        }
+        // Audio/video transceivers
         if (evt.transceiver === info.audioTransceiver ||
             evt.transceiver === info.videoTransceiver) {
           const ms = info.stream
@@ -277,7 +300,81 @@ export function useWebRTC({
       removeRemotePeer(data.participant)
       return
     }
-  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate])
+
+    if (data.type === 'screen_share_started') {
+      const peerId = data.from
+      const pc = pcRef.current
+      if (!pc) return
+      const info = remotePeersRef.current.get(peerId)
+      if (!info) return
+      console.log(`[WebRTC] screen_share_started from ${peerId.slice(0, 8)}`)
+      // Add a transceiver to receive the screen share
+      const screenTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+      info.screenTransceiver = screenTransceiver
+      info.screenStream = new MediaStream()
+      updateRemotePeersState()
+      await renegotiate()
+      return
+    }
+
+    if (data.type === 'screen_share_stopped') {
+      const peerId = data.from
+      const info = remotePeersRef.current.get(peerId)
+      if (!info) return
+      console.log(`[WebRTC] screen_share_stopped from ${peerId.slice(0, 8)}`)
+      if (info.screenTransceiver) {
+        try { info.screenTransceiver.direction = 'inactive' } catch { /* ignore */ }
+      }
+      info.screenTransceiver = null
+      info.screenStream = null
+      updateRemotePeersState()
+      return
+    }
+  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, updateRemotePeersState])
+
+  const startScreenShare = useCallback(async (screenStream: MediaStream) => {
+    const pc = pcRef.current
+    if (!pc) return
+    const track = screenStream.getVideoTracks()[0]
+    if (!track) return
+    // Use addTransceiver (NOT addTrack) to guarantee a NEW transceiver.
+    // addTrack can reuse existing transceivers created for remote peers,
+    // which would send screen data on the wrong mid.
+    const transceiver = pc.addTransceiver(track, { direction: 'sendrecv' })
+    screenTransceiverRef.current = transceiver
+    setLocalScreenStream(screenStream)
+    await renegotiate()
+    signalingRef.current.send({
+      type: 'screen_share_started',
+      from: participantIdRef.current,
+      room_id: roomIdRef.current,
+      track_id: 0,
+    })
+    console.log('[WebRTC] screen share started')
+  }, [renegotiate])
+
+  const stopScreenShare = useCallback(async () => {
+    const pc = pcRef.current
+    if (!pc) return
+    const transceiver = screenTransceiverRef.current
+    if (transceiver) {
+      transceiver.sender.track?.stop()
+      try {
+        pc.removeTrack(transceiver.sender)
+        transceiver.direction = 'inactive'
+      } catch { /* ignore */ }
+    }
+    screenTransceiverRef.current = null
+    setLocalScreenStream(null)
+    await renegotiate()
+    signalingRef.current.send({
+      type: 'screen_share_stopped',
+      from: participantIdRef.current,
+      room_id: roomIdRef.current,
+      track_id: 0,
+    })
+    console.log('[WebRTC] screen share stopped')
+  }, [renegotiate])
 
   // Process message queue sequentially (like browser-demo's await handleSignalingMessage)
   const drainQueue = useCallback(async () => {
@@ -318,5 +415,8 @@ export function useWebRTC({
     remotePeers,
     connectionState,
     handleMessage,
+    startScreenShare,
+    stopScreenShare,
+    localScreenStream,
   }
 }

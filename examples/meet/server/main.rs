@@ -394,6 +394,40 @@ async fn handle_ws(
                 }
             }
 
+            SdpMessage::ScreenShareStarted { from, room_id, track_id } => {
+                let p = peers.read().await;
+                // Notify the sender's run_media that screen share is active.
+                if let Some(peer) = p.get(&from) {
+                    let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(true));
+                }
+                // Broadcast to all other peers in the room.
+                let msg = SdpMessage::ScreenShareStarted { from, room_id, track_id };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    for (id, peer) in p.iter() {
+                        if Some(*id) != participant_id {
+                            let _ = peer.ws_tx.send(json.clone());
+                        }
+                    }
+                }
+            }
+
+            SdpMessage::ScreenShareStopped { from, room_id, track_id } => {
+                let p = peers.read().await;
+                // Notify the sender's run_media that screen share stopped.
+                if let Some(peer) = p.get(&from) {
+                    let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(false));
+                }
+                // Broadcast to all other peers in the room.
+                let msg = SdpMessage::ScreenShareStopped { from, room_id, track_id };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    for (id, peer) in p.iter() {
+                        if Some(*id) != participant_id {
+                            let _ = peer.ws_tx.send(json.clone());
+                        }
+                    }
+                }
+            }
+
             _ => {}
         }
     }
