@@ -95,13 +95,24 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
   }, [media, webrtc])
 
   const leave = useCallback(() => {
+    // Stop screen share if active before leaving
+    if (webrtc.localScreenStream) {
+      media.stopScreenShare()
+      // Send screen_share_stopped so other peers clean up the tile
+      signaling.send({
+        type: 'screen_share_stopped',
+        from: participantId,
+        room_id: roomId,
+        track_id: 0,
+      })
+    }
     signaling.send({
       type: 'leave',
       participant: participantId,
       room_id: roomId,
     })
     navigate('/')
-  }, [signaling, participantId, roomId, navigate])
+  }, [signaling, participantId, roomId, navigate, webrtc.localScreenStream, media])
 
   const value: CallContextValue = {
     participantId,

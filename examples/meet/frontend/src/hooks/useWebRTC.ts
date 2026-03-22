@@ -404,6 +404,12 @@ export function useWebRTC({
       if (disconnectTimerRef.current) {
         clearTimeout(disconnectTimerRef.current)
       }
+      // Stop screen share track if active
+      const screenTransceiver = screenTransceiverRef.current
+      if (screenTransceiver) {
+        screenTransceiver.sender.track?.stop()
+        screenTransceiverRef.current = null
+      }
       if (pcRef.current) {
         pcRef.current.close()
         pcRef.current = null
