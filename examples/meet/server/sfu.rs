@@ -47,6 +47,7 @@ pub struct SourceSlot {
     video_pt: u8,
 }
 
+#[derive(Clone)]
 pub struct SfuPeer {
     pub cmd_tx: mpsc::UnboundedSender<PeerCmd>,
     pub ws_tx: mpsc::UnboundedSender<String>,
