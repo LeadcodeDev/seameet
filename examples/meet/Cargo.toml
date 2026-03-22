@@ -1,0 +1,20 @@
+[package]
+name    = "meet"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "meet"
+path = "server/main.rs"
+
+[dependencies]
+seameet             = { path = "../../crates/seameet" }
+tokio               = { workspace = true }
+tokio-tungstenite   = "0.21"
+tracing             = { workspace = true }
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+serde_json          = { workspace = true }
+serde               = { workspace = true }
+futures-util        = "0.3"
+str0m               = { workspace = true }
+uuid                = { workspace = true }
