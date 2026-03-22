@@ -83,7 +83,8 @@ pub use seameet_signaling::{SdpMessage, SignalingBackend, WsSignaling, WsSignali
 // ── Pipeline (low-level escape hatch) ───────────────────────────────────
 
 pub use seameet_pipeline::{
-    InboundPipeline, OutboundPipeline, PeerConnection, PeerEvent, ProcessorChain,
+    InboundPipeline, MediaKind, Mid, OutboundPipeline, PeerCmd, PeerConnection, PeerEvent,
+    ProcessorChain,
 };
 
 // ── High-level facade ───────────────────────────────────────────────────

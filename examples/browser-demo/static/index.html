@@ -20,7 +20,7 @@
         background: #0f0f0f;
         color: #e0e0e0;
         padding: 1.5rem;
-        max-width: 900px;
+        max-width: 1200px;
         margin: 0 auto;
       }
       h1 {
@@ -92,6 +92,7 @@
       .video-box {
         flex: 1;
         min-width: 280px;
+        max-width: 50%;
         background: #1a1a1a;
         border-radius: 8px;
         overflow: hidden;
@@ -110,29 +111,6 @@
         background: rgba(0, 0, 0, 0.6);
         padding: 2px 8px;
         border-radius: 4px;
-      }
-      .video-overlay {
-        position: absolute;
-        inset: 0;
-        background: #000;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-direction: column;
-        gap: 0.75rem;
-        z-index: 2;
-        transition: opacity 0.3s;
-      }
-      .video-overlay.hidden {
-        display: none;
-      }
-      .video-overlay svg {
-        opacity: 0.35;
-      }
-      .video-overlay span {
-        font-size: 0.8rem;
-        color: #666;
-        letter-spacing: 0.02em;
       }
 
       #log {
@@ -160,7 +138,6 @@
 
     <div class="controls">
       <button id="muteBtn" onclick="toggleMute()">Mute</button>
-      <button id="screenBtn" onclick="toggleScreenShare()">Share Screen</button>
     </div>
 
     <div class="videos">
@@ -168,25 +145,10 @@
         <video id="local" autoplay playsinline muted></video>
         <div class="video-label">You</div>
       </div>
-      <div class="video-box">
-        <div id="remoteOverlay" class="video-overlay">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="1" y1="1" x2="23" y2="23"/>
-            <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/>
-            <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/>
-            <path d="M10.71 5.05A16 16 0 0 1 22.56 9"/>
-            <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/>
-            <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
-            <line x1="12" y1="20" x2="12.01" y2="20"/>
-          </svg>
-          <span>No peer connected</span>
-        </div>
-        <video id="remote" autoplay playsinline></video>
-        <div class="video-label">Remote</div>
-      </div>
     </div>
 
-    <div id="screens" class="videos" style="margin-top:0"></div>
+    <!-- Remote peers' videos are added here dynamically -->
+    <div id="remotes" class="videos"></div>
 
     <pre id="log"></pre>
 
@@ -203,9 +165,15 @@
       let pc = null;
       let ws = null;
       let muted = false;
-      let screenStream = null;
-      let screenSenders = [];
-      let currentScreenTrackId = null;
+
+      // Track remote peers: peerId -> { audioTransceiver, videoTransceiver, videoEl, boxEl }
+      const remotePeers = new Map();
+      // Whether we're currently renegotiating (to avoid overlapping offers).
+      let renegotiating = false;
+      // Whether a new renegotiation is needed after the current one completes.
+      let renegotiationPending = false;
+      // Timeout handle for renegotiation safety.
+      let renegotiationTimer = null;
 
       // ── Logging ──
 
@@ -269,22 +237,42 @@
       }
 
       async function handleSignalingMessage(data) {
-        // Server says we can create the PeerConnection and send an offer.
         if (data.type === "ready") {
-          log("server ready — creating offer");
-          await createOfferToServer();
+          const peers = data.peers || [];
+          log(`server ready — ${peers.length} existing peer(s)`);
+          await createOfferToServer(peers);
           return;
         }
 
-        // Server's SDP answer.
         if (data.type === "answer") {
           if (!pc) return;
-          await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+          clearTimeout(renegotiationTimer);
+          renegotiationTimer = null;
+          try {
+            await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+          } catch (e) {
+            log(`setRemoteDescription FAILED: ${e.message}`);
+            renegotiating = false;
+            return;
+          }
           log("server answer applied");
+          renegotiating = false;
+
+          // After renegotiation, re-play all remote video elements to ensure
+          // the browser renders incoming media (some browsers pause after SDP change).
+          for (const [, info] of remotePeers) {
+            info.videoEl.play().catch(() => {});
+          }
+
+          // If another renegotiation was requested while we were waiting,
+          // trigger it now.
+          if (renegotiationPending) {
+            renegotiationPending = false;
+            await renegotiate();
+          }
           return;
         }
 
-        // Server sends an ICE candidate (rare — usually in the SDP answer).
         if (data.type === "ice_candidate") {
           if (!pc) return;
           try {
@@ -293,18 +281,124 @@
               sdpMid: data.sdp_mid || null,
               sdpMLineIndex: data.sdp_mline_index ?? null,
             });
-            log("server ICE candidate applied");
           } catch (e) {
             log(`ICE candidate error: ${e.message}`);
           }
           return;
         }
+
+        if (data.type === "peer_joined") {
+          const peerId = data.participant;
+          log(`peer joined: ${peerId.slice(0, 8)}...`);
+          if (pc && !remotePeers.has(peerId)) {
+            addRemotePeer(peerId);
+            await renegotiate();
+          }
+          return;
+        }
+
+        if (data.type === "peer_left") {
+          const peerId = data.participant;
+          log(`peer left: ${peerId.slice(0, 8)}...`);
+          removeRemotePeer(peerId);
+          return;
+        }
       }
 
-      // ── WebRTC (browser ↔ server) ──
+      // ── Remote peer management ──
 
-      async function createOfferToServer() {
-        // No STUN needed — we connect directly to the server.
+      function addRemotePeer(peerId) {
+        if (remotePeers.has(peerId)) return;
+        if (!pc) return;
+
+        // Use sendrecv so the server's answer (sendrecv) matches the offer direction.
+        // recvonly would require the server to answer sendonly, but str0m answers sendrecv.
+        const audioTx = pc.addTransceiver("audio", { direction: "sendrecv" });
+        const videoTx = pc.addTransceiver("video", { direction: "sendrecv" });
+
+        // Create a video element for this peer.
+        const box = document.createElement("div");
+        box.className = "video-box";
+        box.id = `remote-${peerId}`;
+
+        const videoEl = document.createElement("video");
+        videoEl.autoplay = true;
+        videoEl.playsInline = true;
+        videoEl.srcObject = new MediaStream();
+        videoEl.style.cssText = "width:100%;display:block;background:#000";
+
+        const label = document.createElement("div");
+        label.className = "video-label";
+        label.textContent = peerId.slice(0, 8) + "...";
+
+        box.appendChild(videoEl);
+        box.appendChild(label);
+        document.getElementById("remotes").appendChild(box);
+
+        remotePeers.set(peerId, {
+          audioTransceiver: audioTx,
+          videoTransceiver: videoTx,
+          videoEl,
+          boxEl: box,
+        });
+
+        log(`added transceivers for peer ${peerId.slice(0, 8)}...`);
+      }
+
+      function removeRemotePeer(peerId) {
+        const info = remotePeers.get(peerId);
+        if (!info) return;
+
+        // Set transceivers to inactive instead of stopping them.
+        // stop() creates port=0 m-sections that break renegotiation.
+        try { info.audioTransceiver.direction = "inactive"; } catch {}
+        try { info.videoTransceiver.direction = "inactive"; } catch {}
+
+        // Remove the video element.
+        info.videoEl.srcObject = null;
+        info.boxEl.remove();
+        remotePeers.delete(peerId);
+        log(`removed peer ${peerId.slice(0, 8)}...`);
+      }
+
+      async function renegotiate() {
+        if (!pc) return;
+        if (renegotiating) {
+          renegotiationPending = true;
+          log("renegotiation queued (already in progress)");
+          return;
+        }
+        renegotiating = true;
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Safety timeout: if server never answers, reset state so future
+        // renegotiations aren't permanently blocked.
+        renegotiationTimer = setTimeout(() => {
+          if (renegotiating) {
+            log("renegotiation timeout (10s) — resetting");
+            renegotiating = false;
+            if (renegotiationPending) {
+              renegotiationPending = false;
+              renegotiate();
+            }
+          }
+        }, 10000);
+
+        sendWs({
+          type: "offer",
+          from: participantId,
+          to: null,
+          room_id: ROOM_ID,
+          sdp: offer.sdp,
+        });
+        log("renegotiation offer sent");
+      }
+
+      // ── WebRTC (browser <-> server) ──
+
+      async function createOfferToServer(existingPeers) {
         pc = new RTCPeerConnection({ iceServers: [] });
 
         pc.onicecandidate = (evt) => {
@@ -318,45 +412,66 @@
             sdp_mid: evt.candidate.sdpMid,
             sdp_mline_index: evt.candidate.sdpMLineIndex,
           });
-          log("ICE candidate sent to server");
         };
 
         pc.ontrack = (evt) => {
-          log(`remote track received: ${evt.track.kind}`);
-          const remote = document.getElementById("remote");
-          // SFU sends tracks via direct_api without stream association,
-          // so evt.streams may be empty — create a MediaStream manually.
-          if (!remote.srcObject) {
-            remote.srcObject = new MediaStream();
+          log(`remote track received: ${evt.track.kind} (mid=${evt.transceiver.mid})`);
+          // Find which peer this transceiver belongs to.
+          for (const [peerId, info] of remotePeers) {
+            if (evt.transceiver === info.audioTransceiver ||
+                evt.transceiver === info.videoTransceiver) {
+              const ms = info.videoEl.srcObject;
+              // Remove existing tracks of same kind to prevent duplicates
+              for (const old of ms.getTracks()) {
+                if (old.kind === evt.track.kind && old.id !== evt.track.id) {
+                  ms.removeTrack(old);
+                }
+              }
+              ms.addTrack(evt.track);
+              info.videoEl.play().catch(() => {});
+              log(`routed ${evt.track.kind} track to peer ${peerId.slice(0, 8)}...`);
+              return;
+            }
           }
-          remote.srcObject.addTrack(evt.track);
-          showRemoteOverlay(false);
+          log(`unmatched track (mid=${evt.transceiver.mid})`);
         };
 
+        let disconnectTimer = null;
         pc.onconnectionstatechange = () => {
           log(`connection state: ${pc.connectionState}`);
+          clearTimeout(disconnectTimer);
           if (pc.connectionState === "connected") {
             setBadge("connected");
-            log("connected to server (SFU)");
-          } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+          } else if (pc.connectionState === "failed") {
             setBadge("disconnected");
+          } else if (pc.connectionState === "disconnected") {
+            // "disconnected" is often transient during renegotiation.
+            // Only show it if it persists for 3 seconds.
+            disconnectTimer = setTimeout(() => {
+              if (pc.connectionState === "disconnected") {
+                setBadge("disconnected");
+              }
+            }, 3000);
           }
         };
 
-        // Add local tracks if available.
+        // Add local tracks (own camera/mic).
         if (localStream) {
           localStream.getTracks().forEach((track) => {
             pc.addTrack(track, localStream);
           });
         } else {
-          // No local media — add transceivers so the offer has m-lines
-          // and we can still receive media from the server.
-          pc.addTransceiver("audio", { direction: "recvonly" });
-          pc.addTransceiver("video", { direction: "recvonly" });
+          pc.addTransceiver("audio", { direction: "sendrecv" });
+          pc.addTransceiver("video", { direction: "sendrecv" });
           log("no local media — receiving only");
         }
 
-        // Create and send offer to the server.
+        // Add recvonly transceivers for each existing peer BEFORE the first offer.
+        for (const peerId of existingPeers) {
+          addRemotePeer(peerId);
+        }
+
+        // Create and send offer.
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
@@ -368,88 +483,6 @@
           sdp: offer.sdp,
         });
         log("offer sent to server");
-      }
-
-      // ── Screen share ──
-
-      async function toggleScreenShare() {
-        if (screenStream) {
-          await stopScreenShare();
-        } else {
-          await startScreenShare();
-        }
-      }
-
-      async function startScreenShare() {
-        try {
-          screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: 15 },
-            audio: false,
-          });
-        } catch (e) {
-          log(`getDisplayMedia failed: ${e.message}`);
-          return;
-        }
-
-        const [track] = screenStream.getVideoTracks();
-        currentScreenTrackId = Math.floor(Math.random() * 0xffffffff);
-
-        // Local preview.
-        const preview = document.createElement("video");
-        preview.autoplay = true;
-        preview.playsInline = true;
-        preview.muted = true;
-        preview.srcObject = screenStream;
-        preview.style.cssText = "width:100%;border-radius:8px;background:#000";
-        const box = document.createElement("div");
-        box.className = "video-box";
-        box.id = "local-screen";
-        const label = document.createElement("div");
-        label.className = "video-label";
-        label.textContent = "Your Screen";
-        box.appendChild(preview);
-        box.appendChild(label);
-        document.getElementById("screens").appendChild(box);
-
-        if (pc) {
-          screenSenders = [pc.addTrack(track, screenStream)];
-          // Renegotiate with server.
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          sendWs({
-            type: "offer",
-            from: participantId,
-            to: null,
-            room_id: ROOM_ID,
-            sdp: offer.sdp,
-          });
-          log("renegotiation offer sent (screen share)");
-        }
-
-        track.onended = () => stopScreenShare();
-        document.getElementById("screenBtn").textContent = "Stop Sharing";
-        log(`screen share started — track ${currentScreenTrackId}`);
-      }
-
-      async function stopScreenShare() {
-        screenSenders.forEach((s) => { if (pc) pc.removeTrack(s); });
-        screenSenders = [];
-        if (screenStream) {
-          screenStream.getTracks().forEach((t) => t.stop());
-          screenStream = null;
-        }
-        document.getElementById("local-screen")?.remove();
-        currentScreenTrackId = null;
-        document.getElementById("screenBtn").textContent = "Share Screen";
-        log("screen share stopped");
-      }
-
-      // ── Remote overlay ──
-
-      function showRemoteOverlay(visible) {
-        const el = document.getElementById("remoteOverlay");
-        if (visible) { el.classList.remove("hidden"); }
-        else { el.classList.add("hidden"); }
       }
 
       // ── Init ──

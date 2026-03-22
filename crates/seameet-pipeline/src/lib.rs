@@ -13,5 +13,6 @@ pub mod processor;
 pub use inbound::{InboundEvent, InboundPipeline};
 pub use outbound::{rtp_channel, OutboundPipeline};
 pub use peer::Peer;
-pub use peer_connection::{PeerConnection, PeerEvent};
+pub use peer_connection::{PeerCmd, PeerConnection, PeerEvent};
+pub use str0m::media::{MediaKind, Mid};
 pub use processor::ProcessorChain;

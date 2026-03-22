@@ -2,21 +2,117 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use seameet_codec::AudioPassthrough;
 use seameet_core::events::RoomEvent;
 use seameet_core::frame::{PcmFrame, VideoFrame};
 use seameet_core::traits::Processor;
 use seameet_core::track::TrackId;
 use seameet_core::{ParticipantId, SeaMeetError};
-use seameet_pipeline::peer_connection::PeerConnection;
-use seameet_pipeline::Peer;
+use seameet_pipeline::peer_connection::{PeerCmd, PeerConnection, PeerEvent};
+use seameet_pipeline::{MediaKind, Mid};
+use seameet_rtp::PT_AUDIO;
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::Stream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+// ── Forwarding types ────────────────────────────────────────────────────
+
+/// RTP data broadcast across the room for forwarding to other participants.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ForwardedRtp {
+    source: ParticipantId,
+    /// Original payload type from the source peer.
+    pt: u8,
+    /// Extended sequence number from str0m.
+    seq_no: u64,
+    timestamp: u32,
+    marker: bool,
+    payload: Vec<u8>,
+    is_audio: bool,
+}
+
+/// Tracks the outbound m-line mapping for a single source peer.
+///
+/// Each participant maintains one `SourceSlot` per remote peer whose media
+/// it is forwarding. The slot records which m-lines (audio + video) are
+/// assigned to that source peer, along with monotonically increasing
+/// sequence numbers.
+struct SourceSlot {
+    audio_mid: Mid,
+    video_mid: Mid,
+    audio_seq: u64,
+    video_seq: u64,
+    audio_pt: u8,
+    video_pt: u8,
+}
+
+/// Finds or lazily creates a [`SourceSlot`] for `source_pid`.
+///
+/// When a participant first receives media from a new source peer, we
+/// allocate free audio + video m-lines from `all_mids`, excluding the
+/// participant's own receive mids and mids already assigned to other
+/// source peers.
+fn get_or_create_slot<'a>(
+    source_pid: ParticipantId,
+    source_slots: &'a mut HashMap<ParticipantId, SourceSlot>,
+    all_mids: &[(Mid, MediaKind)],
+    own_audio_mid: Option<Mid>,
+    own_video_mid: Option<Mid>,
+    audio_pt: u8,
+    video_pt: u8,
+) -> Option<&'a mut SourceSlot> {
+    if source_slots.contains_key(&source_pid) {
+        return source_slots.get_mut(&source_pid);
+    }
+
+    let used_mids: HashSet<Mid> = source_slots
+        .values()
+        .flat_map(|s| [s.audio_mid, s.video_mid])
+        .collect();
+
+    let free_audio = all_mids.iter().find(|(mid, kind)| {
+        matches!(kind, MediaKind::Audio)
+            && Some(*mid) != own_audio_mid
+            && !used_mids.contains(mid)
+    });
+    let free_video = all_mids.iter().find(|(mid, kind)| {
+        matches!(kind, MediaKind::Video)
+            && Some(*mid) != own_video_mid
+            && !used_mids.contains(mid)
+    });
+
+    let (Some((a_mid, _)), Some((v_mid, _))) = (free_audio, free_video) else {
+        warn!(source = %source_pid, "no free mids for source slot");
+        return None;
+    };
+    let a_mid = *a_mid;
+    let v_mid = *v_mid;
+
+    info!(
+        source = %source_pid,
+        ?a_mid, ?v_mid,
+        "created source slot"
+    );
+
+    source_slots.insert(
+        source_pid,
+        SourceSlot {
+            audio_mid: a_mid,
+            video_mid: v_mid,
+            audio_seq: 0,
+            video_seq: 0,
+            audio_pt,
+            video_pt,
+        },
+    );
+    source_slots.get_mut(&source_pid)
+}
+
+// ── Room configuration ──────────────────────────────────────────────────
 
 /// Configuration for a [`Room`].
 #[derive(Debug, Clone)]
@@ -45,16 +141,21 @@ impl Default for RoomConfig {
     }
 }
 
+// ── RoomHandle ──────────────────────────────────────────────────────────
+
 /// Handle returned when a participant is added to a [`Room`].
 ///
-/// Cloning a handle shares the same underlying peer connection and broadcast
+/// Provides methods to perform signaling operations (accept SDP offers,
+/// add ICE candidates) and subscribe to decoded audio/video streams.
+///
+/// Cloning a handle shares the same underlying command channel and broadcast
 /// senders — each clone can independently subscribe to audio/video streams.
 #[derive(Clone)]
 pub struct RoomHandle {
     /// The participant's identifier.
     pub participant_id: ParticipantId,
-    /// Low-level access to the peer connection (escape hatch).
-    pub peer_connection: Arc<TokioMutex<PeerConnection>>,
+    /// Command channel to the running PeerConnection.
+    cmd_tx: mpsc::UnboundedSender<PeerCmd>,
     /// Audio broadcast sender — call [`audio_rx`](Self::audio_rx) to subscribe.
     audio_tx: broadcast::Sender<PcmFrame>,
     /// Video broadcast sender — call [`video_rx`](Self::video_rx) to subscribe.
@@ -79,16 +180,45 @@ impl RoomHandle {
     pub fn video_rx(&self) -> broadcast::Receiver<VideoFrame> {
         self.video_tx.subscribe()
     }
+
+    /// Accepts a remote SDP offer and returns the local SDP answer.
+    ///
+    /// This sends the offer to the running PeerConnection via the command
+    /// channel and awaits the answer.
+    pub async fn accept_offer(&self, sdp: &str) -> Result<String, SeaMeetError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PeerCmd::AcceptOffer {
+                sdp: sdp.to_owned(),
+                reply: reply_tx,
+            })
+            .map_err(|_| SeaMeetError::PeerConnection("peer connection closed".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| SeaMeetError::PeerConnection("peer connection dropped reply".into()))?
+    }
+
+    /// Adds a remote ICE candidate to the running PeerConnection.
+    pub fn add_ice_candidate(&self, candidate: &str) -> Result<(), SeaMeetError> {
+        self.cmd_tx
+            .send(PeerCmd::AddIceCandidate(candidate.to_owned()))
+            .map_err(|_| SeaMeetError::PeerConnection("peer connection closed".into()))
+    }
 }
+
+// ── ParticipantEntry ────────────────────────────────────────────────────
 
 /// Internal state for a connected participant.
 struct ParticipantEntry {
     handle: RoomHandle,
     stop_tx: broadcast::Sender<()>,
-    _task: JoinHandle<()>,
+    _pc_task: JoinHandle<()>,
+    _fwd_task: JoinHandle<()>,
     /// Active screen share track IDs for this participant.
     screen_tracks: HashSet<TrackId>,
 }
+
+// ── Room ────────────────────────────────────────────────────────────────
 
 /// High-level room — manages participants, signaling, and media pipelines.
 ///
@@ -96,6 +226,11 @@ struct ParticipantEntry {
 /// name. Participants are stored in a `HashMap` protected by an `RwLock` so
 /// that reads (`has_participant`, `get_participant`, `fetch_participants`) do
 /// not block each other.
+///
+/// When participants are added, the room spawns tasks that drive each
+/// participant's PeerConnection and forward RTP between all peers (SFU
+/// pattern). Audio is decoded via the inbound pipeline and published on
+/// the audio broadcast channel. Video is forwarded as raw RTP packets.
 pub struct Room {
     /// Unique room identifier, generated at creation.
     id: Uuid,
@@ -106,6 +241,8 @@ pub struct Room {
     global_stop_tx: broadcast::Sender<()>,
     event_tx: mpsc::UnboundedSender<RoomEvent>,
     event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<RoomEvent>>>,
+    /// Room-wide RTP forwarding broadcast.
+    rtp_broadcast_tx: broadcast::Sender<ForwardedRtp>,
     created_at: Instant,
 }
 
@@ -114,6 +251,7 @@ impl Room {
     pub fn new(config: RoomConfig) -> Self {
         let (global_stop_tx, _) = broadcast::channel(4);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (rtp_broadcast_tx, _) = broadcast::channel(256);
         let id = Uuid::new_v4();
         let name = config.name.clone();
         info!(
@@ -129,6 +267,7 @@ impl Room {
             global_stop_tx,
             event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
+            rtp_broadcast_tx,
             created_at: Instant::now(),
         }
     }
@@ -145,15 +284,21 @@ impl Room {
 
     /// Adds a participant to the room.
     ///
+    /// Creates a PeerConnection, spawns a driving task (handles UDP +
+    /// commands), and a forwarding task (broadcasts received RTP to other
+    /// participants and writes incoming forwarded RTP to this participant's
+    /// PeerConnection via SourceSlots).
+    ///
     /// * `id` — unique participant identifier.
-    /// * `signaling` — the signaling backend for SDP/ICE exchange (used for
-    ///   future negotiation; the peer connection is created internally).
-    /// * `processor` — a media processor applied to outbound audio/video.
+    /// * `_signaling` — the signaling backend (reserved for future SDP
+    ///   renegotiation; the peer connection is created internally).
+    /// * `_processor` — a media processor applied to outbound audio/video
+    ///   (reserved for future outbound pipeline integration).
     pub async fn add_participant<S, P>(
         &self,
         id: ParticipantId,
         _signaling: S,
-        processor: P,
+        _processor: P,
     ) -> Result<RoomHandle, SeaMeetError>
     where
         S: seameet_signaling::SignalingBackend + Send + 'static,
@@ -173,28 +318,22 @@ impl Room {
         // Bind a UDP socket for this participant's peer connection.
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let pc = PeerConnection::new(socket).await?;
-        let pc = Arc::new(TokioMutex::new(pc));
 
-        // Build the peer (inbound + outbound) with AudioPassthrough codec.
-        let (peer, peer_events, audio_tx, video_tx) = {
-            let pc_lock = pc.lock().await;
-            let (peer, peer_events) = Peer::from_peer_connection(
-                id,
-                AudioPassthrough,
-                AudioPassthrough,
-                &pc_lock,
-                Some(Box::new(processor)),
-            );
-            let audio_tx = peer.audio_tx_clone();
-            let video_tx = peer.video_tx_clone();
-            (peer, peer_events, audio_tx, video_tx)
-        };
+        // Subscribe to PeerConnection events before run() consumes it.
+        let peer_events = pc.events();
+
+        // Create command channel.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        // Broadcast channels for decoded media from this participant.
+        let (audio_tx, _) = broadcast::channel(64);
+        let (video_tx, _) = broadcast::channel(16);
 
         let room_handle = RoomHandle {
             participant_id: id,
-            peer_connection: Arc::clone(&pc),
-            audio_tx,
-            video_tx,
+            cmd_tx: cmd_tx.clone(),
+            audio_tx: audio_tx.clone(),
+            video_tx: video_tx.clone(),
         };
 
         // Per-participant stop signal.
@@ -206,17 +345,35 @@ impl Room {
         // Emit ParticipantJoined event.
         let _ = self.event_tx.send(RoomEvent::ParticipantJoined(id));
 
-        // Spawn the peer task.
+        // ── Spawn PeerConnection driving task ──
+        let merged_stop_pc = merge_stop(stop_tx.subscribe(), self.global_stop_tx.subscribe());
+        let pc_task = tokio::spawn(async move {
+            let result = pc.run_with_commands(cmd_rx, merged_stop_pc).await;
+            if let Err(e) = &result {
+                debug!(participant = %id, "peer connection error: {e}");
+            }
+        });
+
+        // ── Spawn forwarding task ──
+        let rtp_broadcast_tx = self.rtp_broadcast_tx.clone();
+        let rtp_broadcast_rx = self.rtp_broadcast_tx.subscribe();
+        let fwd_cmd_tx = cmd_tx.clone();
         let event_tx = self.event_tx.clone();
         let participants_ref = Arc::clone(&self.participants);
+        let merged_stop_fwd = merge_stop(stop_rx, global_stop_rx);
 
-        let task = tokio::spawn(async move {
-            // Merge per-participant and global stop signals.
-            let merged_stop = merge_stop(stop_rx, global_stop_rx);
-            let result = peer.run_with_events(peer_events, merged_stop).await;
-            if let Err(e) = &result {
-                debug!(participant = %id, "peer error: {e}");
-            }
+        let fwd_task = tokio::spawn(async move {
+            run_forwarding_task(
+                id,
+                peer_events,
+                rtp_broadcast_tx,
+                rtp_broadcast_rx,
+                fwd_cmd_tx,
+                audio_tx,
+                merged_stop_fwd,
+            )
+            .await;
+
             // Emit ParticipantLeft.
             let _ = event_tx.send(RoomEvent::ParticipantLeft(id));
 
@@ -240,7 +397,8 @@ impl Room {
                 ParticipantEntry {
                     handle: room_handle.clone(),
                     stop_tx,
-                    _task: task,
+                    _pc_task: pc_task,
+                    _fwd_task: fwd_task,
                     screen_tracks: HashSet::new(),
                 },
             );
@@ -406,6 +564,171 @@ impl Room {
         });
     }
 }
+
+// ── Forwarding task ─────────────────────────────────────────────────────
+
+/// Runs the per-participant forwarding task.
+///
+/// Responsibilities:
+/// 1. Receives `PeerEvent`s from the PeerConnection (RTP received, media
+///    added, connected, etc.)
+/// 2. Decodes audio via the inbound pipeline and publishes `PcmFrame`s
+/// 3. Broadcasts all received RTP as `ForwardedRtp` to the room
+/// 4. Subscribes to `ForwardedRtp` from other participants and forwards
+///    to this participant's PeerConnection via `PeerCmd::WriteRtp`
+/// 5. Manages `SourceSlot`s for m-line mapping
+async fn run_forwarding_task(
+    id: ParticipantId,
+    mut peer_events: broadcast::Receiver<PeerEvent>,
+    rtp_broadcast_tx: broadcast::Sender<ForwardedRtp>,
+    mut rtp_broadcast_rx: broadcast::Receiver<ForwardedRtp>,
+    cmd_tx: mpsc::UnboundedSender<PeerCmd>,
+    audio_tx: broadcast::Sender<PcmFrame>,
+    mut stop: broadcast::Receiver<()>,
+) {
+    debug!(participant = %id, "forwarding task started");
+
+    // Track media lines discovered during SDP negotiation.
+    let mut all_mids: Vec<(Mid, MediaKind)> = Vec::new();
+    let mut own_audio_mid: Option<Mid> = None;
+    let mut own_video_mid: Option<Mid> = None;
+    let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+
+    // Inbound audio pipeline (passthrough decode for now).
+    let mut audio_decoder = seameet_codec::AudioPassthrough;
+
+    loop {
+        tokio::select! {
+            result = peer_events.recv() => {
+                match result {
+                    Ok(PeerEvent::RtpReceived { packet, seq_no }) => {
+                        let is_audio = packet.payload_type == PT_AUDIO;
+
+                        // Decode audio and publish to the audio broadcast channel.
+                        if is_audio {
+                            use seameet_core::traits::Decoder;
+                            use seameet_core::frame::EncodedAudio;
+                            let encoded = EncodedAudio(packet.payload.clone());
+                            if let Ok(frame) = audio_decoder.decode(encoded) {
+                                let _ = audio_tx.send(frame);
+                            }
+                        }
+
+                        // Broadcast to other participants for forwarding.
+                        let _ = rtp_broadcast_tx.send(ForwardedRtp {
+                            source: id,
+                            pt: packet.payload_type,
+                            seq_no,
+                            timestamp: packet.timestamp,
+                            marker: packet.marker,
+                            payload: packet.payload,
+                            is_audio,
+                        });
+                    }
+                    Ok(PeerEvent::MediaAdded { mid, kind }) => {
+                        if !all_mids.iter().any(|(m, _)| *m == mid) {
+                            all_mids.push((mid, kind));
+                        }
+                        // First audio/video mids are our own receive mids.
+                        match kind {
+                            MediaKind::Audio if own_audio_mid.is_none() => {
+                                own_audio_mid = Some(mid);
+                                debug!(participant = %id, ?mid, "own audio mid");
+                            }
+                            MediaKind::Video if own_video_mid.is_none() => {
+                                own_video_mid = Some(mid);
+                                debug!(participant = %id, ?mid, "own video mid");
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(PeerEvent::Connected) => {
+                        debug!(participant = %id, "peer connected");
+                        // Request initial keyframes from own video stream.
+                        if let Some(mid) = own_video_mid {
+                            let _ = cmd_tx.send(PeerCmd::RequestKeyframe { mid });
+                        }
+                    }
+                    Ok(PeerEvent::KeyframeRequest) => {
+                        // Remote wants a keyframe — request PLI from own video.
+                        if let Some(mid) = own_video_mid {
+                            let _ = cmd_tx.send(PeerCmd::RequestKeyframe { mid });
+                        }
+                    }
+                    Ok(PeerEvent::Disconnected) => {
+                        debug!(participant = %id, "peer disconnected");
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(participant = %id, skipped = n, "peer events lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!(participant = %id, "peer events closed");
+                        return;
+                    }
+                }
+            }
+            result = rtp_broadcast_rx.recv() => {
+                match result {
+                    Ok(fwd) if fwd.source != id => {
+                        // Forward RTP from another participant to this one.
+                        let created_new = !source_slots.contains_key(&fwd.source);
+
+                        if let Some(slot) = get_or_create_slot(
+                            fwd.source,
+                            &mut source_slots,
+                            &all_mids,
+                            own_audio_mid,
+                            own_video_mid,
+                            PT_AUDIO,
+                            seameet_rtp::PT_VIDEO,
+                        ) {
+                            let (mid, seq, pt) = if fwd.is_audio {
+                                let seq = slot.audio_seq;
+                                slot.audio_seq += 1;
+                                (slot.audio_mid, seq, slot.audio_pt)
+                            } else {
+                                let seq = slot.video_seq;
+                                slot.video_seq += 1;
+                                (slot.video_mid, seq, slot.video_pt)
+                            };
+
+                            let _ = cmd_tx.send(PeerCmd::WriteRtp {
+                                mid,
+                                pt,
+                                seq,
+                                timestamp: fwd.timestamp,
+                                marker: fwd.marker,
+                                payload: fwd.payload,
+                            });
+                        }
+
+                        // Request keyframe when we first create a slot for a new source.
+                        if created_new && source_slots.contains_key(&fwd.source) {
+                            if let Some(mid) = own_video_mid {
+                                let _ = cmd_tx.send(PeerCmd::RequestKeyframe { mid });
+                            }
+                        }
+                    }
+                    Ok(_) => {} // Own packets — skip.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(participant = %id, skipped = n, "rtp broadcast lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return;
+                    }
+                }
+            }
+            _ = stop.recv() => {
+                debug!(participant = %id, "forwarding task stopped");
+                return;
+            }
+        }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Merges two broadcast stop receivers into one: returns a receiver that
 /// fires when either signal arrives.

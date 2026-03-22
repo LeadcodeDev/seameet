@@ -95,6 +95,15 @@ impl Room {
         }
     }
 
+    /// Returns the IDs of all members except `exclude`.
+    pub fn peer_ids(&self, exclude: &ParticipantId) -> Vec<ParticipantId> {
+        self.members
+            .keys()
+            .filter(|id| *id != exclude)
+            .copied()
+            .collect()
+    }
+
     /// Returns the sinks of all members except `exclude`.
     pub fn peer_sinks(&self, exclude: &ParticipantId) -> Vec<WsSink> {
         self.members
@@ -325,11 +334,11 @@ impl RoomServer {
             };
 
             for (room_id, _) in affected {
-                let leave = SdpMessage::Leave {
+                let peer_left = SdpMessage::PeerLeft {
                     participant: pid,
                     room_id: room_id.clone(),
                 };
-                if let Ok(json) = serde_json::to_string(&leave) {
+                if let Ok(json) = serde_json::to_string(&peer_left) {
                     let st = state.lock().await;
                     let peers = st.peers(&room_id, &pid);
                     drop(st);
@@ -359,21 +368,35 @@ pub async fn dispatch(
             room_id,
         } => {
             let mut st = state.lock().await;
+
+            // Collect existing peer IDs *before* joining so we can populate Ready.peers
+            let existing_peers: Vec<ParticipantId> = st
+                .room(room_id)
+                .map(|r| r.peer_ids(participant))
+                .unwrap_or_default();
+
             let initiator = st.join(*participant, room_id, self_tx.clone());
 
+            // Send Ready with the list of existing peers
             let ready = SdpMessage::Ready {
                 room_id: room_id.clone(),
                 initiator,
+                peers: existing_peers,
             };
             if let Ok(json) = serde_json::to_string(&ready) {
                 let _ = self_tx.send(json);
             }
 
+            // Notify existing peers about the new joiner with PeerJoined
             if !initiator {
-                let peers = st.peers(room_id, participant);
+                let peer_sinks = st.peers(room_id, participant);
                 drop(st);
-                if let Ok(json) = serde_json::to_string(sdp) {
-                    for peer_tx in peers {
+                let peer_joined = SdpMessage::PeerJoined {
+                    participant: *participant,
+                    room_id: room_id.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&peer_joined) {
+                    for peer_tx in peer_sinks {
                         let _ = peer_tx.send(json.clone());
                     }
                 }
@@ -390,7 +413,11 @@ pub async fn dispatch(
             st.leave(participant, room_id);
             drop(st);
 
-            if let Ok(json) = serde_json::to_string(sdp) {
+            let peer_left = SdpMessage::PeerLeft {
+                participant: *participant,
+                room_id: room_id.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&peer_left) {
                 for peer_tx in peers {
                     let _ = peer_tx.send(json.clone());
                 }

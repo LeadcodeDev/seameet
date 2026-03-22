@@ -65,6 +65,23 @@ pub enum SdpMessage {
         room_id: String,
         /// Whether this peer should initiate the offer.
         initiator: bool,
+        /// List of peers already present in the room.
+        #[serde(default)]
+        peers: Vec<ParticipantId>,
+    },
+    /// Sent by the server when a new peer joins the room.
+    PeerJoined {
+        /// The joining participant.
+        participant: ParticipantId,
+        /// The room identifier.
+        room_id: String,
+    },
+    /// Sent by the server when a peer leaves the room.
+    PeerLeft {
+        /// The departing participant.
+        participant: ParticipantId,
+        /// The room identifier.
+        room_id: String,
     },
     /// Emitted by the client when a screen share starts.
     ScreenShareStarted {
@@ -103,6 +120,8 @@ impl SdpMessage {
             | Self::Answer { room_id, .. }
             | Self::IceCandidate { room_id, .. }
             | Self::Ready { room_id, .. }
+            | Self::PeerJoined { room_id, .. }
+            | Self::PeerLeft { room_id, .. }
             | Self::ScreenShareStarted { room_id, .. }
             | Self::ScreenShareStopped { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
@@ -157,6 +176,7 @@ mod tests {
             SdpMessage::Ready {
                 room_id: "r1".into(),
                 initiator: true,
+                peers: vec![],
             },
             SdpMessage::Error {
                 code: 404,
@@ -212,7 +232,8 @@ mod tests {
         assert_eq!(
             SdpMessage::Ready {
                 room_id: "r4".into(),
-                initiator: false
+                initiator: false,
+                peers: vec![],
             }
             .room_id(),
             Some("r4")

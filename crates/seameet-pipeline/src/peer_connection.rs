@@ -4,17 +4,47 @@ use std::time::{Duration, Instant};
 use seameet_core::SeaMeetError;
 use seameet_rtp::{RtcpPacket, RtpPacket};
 use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::media::{KeyframeRequestKind, MediaKind, Mid};
 use str0m::net::{Protocol, Receive};
+use str0m::rtp::ExtensionValues;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use tokio::net::UdpSocket;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
+
+/// Commands that can be sent to a running [`PeerConnection`].
+pub enum PeerCmd {
+    /// Accept a remote SDP offer and reply with the local answer.
+    AcceptOffer {
+        sdp: String,
+        reply: oneshot::Sender<Result<String, SeaMeetError>>,
+    },
+    /// Add a remote ICE candidate.
+    AddIceCandidate(String),
+    /// Write an RTP packet to a specific media line.
+    WriteRtp {
+        mid: Mid,
+        pt: u8,
+        seq: u64,
+        timestamp: u32,
+        marker: bool,
+        payload: Vec<u8>,
+    },
+    /// Request a keyframe (PLI) on the given receive mid.
+    RequestKeyframe { mid: Mid },
+    /// Shut down the peer connection.
+    Shutdown,
+}
 
 /// Events emitted by the [`PeerConnection`].
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
     /// An RTP packet was received from the remote peer.
-    RtpReceived(RtpPacket),
+    RtpReceived {
+        packet: RtpPacket,
+        /// Extended sequence number from str0m (monotonically increasing u64).
+        seq_no: u64,
+    },
     /// An RTCP packet was received from the remote peer.
     RtcpReceived(RtcpPacket),
     /// ICE/DTLS connection established.
@@ -23,6 +53,10 @@ pub enum PeerEvent {
     Disconnected,
     /// A local ICE candidate was gathered.
     IceCandidate(String),
+    /// A new media line was added (from SDP negotiation).
+    MediaAdded { mid: Mid, kind: MediaKind },
+    /// A keyframe was requested by the remote peer (forward as PLI).
+    KeyframeRequest,
 }
 
 /// Wraps `str0m::Rtc` with a Tokio UDP socket, providing an async
@@ -192,6 +226,114 @@ impl PeerConnection {
         }
     }
 
+    /// Drives the peer connection event loop with a command channel.
+    ///
+    /// Like [`run`](Self::run), but also accepts [`PeerCmd`]s for signaling
+    /// operations and RTP writes while the connection is running.
+    pub async fn run_with_commands(
+        mut self,
+        mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
+        mut stop: broadcast::Receiver<()>,
+    ) -> Result<(), SeaMeetError> {
+        debug!(addr = %self.local_addr, "peer connection started (with commands)");
+        let mut buf = vec![0u8; 2000];
+        let mut last_connected = None::<Instant>;
+
+        loop {
+            let timeout = self.drain_outputs(&mut last_connected)?;
+
+            if !self.rtc.is_alive() {
+                debug!("rtc is no longer alive");
+                let _ = self.event_tx.send(PeerEvent::Disconnected);
+                return Ok(());
+            }
+
+            let wait = timeout
+                .map(|t| {
+                    let now = Instant::now();
+                    if t > now { t - now } else { Duration::ZERO }
+                })
+                .unwrap_or(Duration::from_millis(100));
+
+            tokio::select! {
+                result = self.socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((n, source)) => {
+                            let input = Input::Receive(
+                                Instant::now(),
+                                Receive {
+                                    proto: Protocol::Udp,
+                                    source,
+                                    destination: self.local_addr,
+                                    contents: (&buf[..n]).try_into()
+                                        .map_err(|e| SeaMeetError::PeerConnection(
+                                            format!("receive contents: {e}")
+                                        ))?,
+                                },
+                            );
+                            if let Err(e) = self.rtc.handle_input(input) {
+                                warn!("handle_input error: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("socket recv error: {e}");
+                        }
+                    }
+                }
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(PeerCmd::AcceptOffer { sdp, reply }) => {
+                            let result = self.accept_offer(&sdp);
+                            let _ = reply.send(result);
+                        }
+                        Some(PeerCmd::AddIceCandidate(c)) => {
+                            let _ = self.add_ice_candidate(&c);
+                        }
+                        Some(PeerCmd::WriteRtp { mid, pt, seq, timestamp, marker, payload }) => {
+                            let mut api = self.rtc.direct_api();
+                            if let Some(tx) = api.stream_tx_by_mid(mid, None) {
+                                if let Err(e) = tx.write_rtp(
+                                    pt.into(),
+                                    seq.into(),
+                                    timestamp,
+                                    Instant::now(),
+                                    marker,
+                                    ExtensionValues::default(),
+                                    false,
+                                    payload,
+                                ) {
+                                    warn!(?mid, "write_rtp error: {e}");
+                                }
+                            }
+                        }
+                        Some(PeerCmd::RequestKeyframe { mid }) => {
+                            let mut api = self.rtc.direct_api();
+                            if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                rx.request_keyframe(KeyframeRequestKind::Pli);
+                                debug!(?mid, "PLI requested");
+                            }
+                        }
+                        Some(PeerCmd::Shutdown) | None => {
+                            debug!("peer connection shutdown by command");
+                            self.rtc.disconnect();
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(wait) => {
+                    if let Err(e) = self.rtc.handle_input(Input::Timeout(Instant::now())) {
+                        warn!("timeout handle_input error: {e}");
+                    }
+                }
+                _ = stop.recv() => {
+                    debug!("peer connection stopped by signal");
+                    self.rtc.disconnect();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     /// Drains all pending outputs from str0m, sending transmits and
     /// emitting events. Returns the next timeout `Instant` if any.
     fn drain_outputs(
@@ -240,6 +382,7 @@ impl PeerConnection {
                 }
             }
             Event::RtpPacket(pkt) => {
+                let seq_no: u64 = (*pkt.seq_no).into();
                 let our_pkt = RtpPacket {
                     version: pkt.header.version,
                     padding: pkt.header.has_padding,
@@ -253,14 +396,24 @@ impl PeerConnection {
                     csrc: Vec::new(),
                     payload: pkt.payload,
                 };
-                let _ = self.event_tx.send(PeerEvent::RtpReceived(our_pkt));
+                let _ = self.event_tx.send(PeerEvent::RtpReceived {
+                    packet: our_pkt,
+                    seq_no,
+                });
+            }
+            Event::MediaAdded(m) => {
+                debug!(mid = ?m.mid, kind = ?m.kind, "media added");
+                let _ = self.event_tx.send(PeerEvent::MediaAdded {
+                    mid: m.mid,
+                    kind: m.kind,
+                });
             }
             Event::KeyframeRequest(req) => {
                 debug!(?req, "keyframe request received");
-                // Could be forwarded as RTCP PLI.
+                let _ = self.event_tx.send(PeerEvent::KeyframeRequest);
             }
             _ => {
-                // MediaAdded, MediaChanged, Stats, etc. — ignored for now.
+                // MediaChanged, Stats, etc. — ignored for now.
             }
         }
     }

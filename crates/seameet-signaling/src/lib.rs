@@ -31,7 +31,7 @@ mod tests {
     async fn recv_skip_control(ws: &mut WsSignaling) -> SdpMessage {
         loop {
             let msg = ws.recv().await.expect("recv");
-            if matches!(msg, SdpMessage::Ready { .. } | SdpMessage::Join { .. }) {
+            if matches!(msg, SdpMessage::Ready { .. } | SdpMessage::Join { .. } | SdpMessage::PeerJoined { .. }) {
                 continue;
             }
             return msg;
@@ -188,14 +188,14 @@ mod tests {
         .expect("timeout waiting for leave");
 
         match msg {
-            SdpMessage::Leave {
+            SdpMessage::PeerLeft {
                 participant,
                 room_id,
             } => {
                 assert_eq!(participant, id_a);
                 assert_eq!(room_id, "room-leave");
             }
-            other => panic!("expected Leave, got {other:?}"),
+            other => panic!("expected PeerLeft, got {other:?}"),
         }
     }
 
@@ -320,11 +320,11 @@ mod tests {
         a.close().await.expect("A close");
         drop(a);
 
-        // B should receive Leave for A in all 3 rooms.
+        // B should receive PeerLeft for A in all 3 rooms.
         let mut leave_rooms = HashSet::new();
         for _ in 0..20 {
             match tokio::time::timeout(Duration::from_secs(2), b.recv()).await {
-                Ok(Ok(SdpMessage::Leave {
+                Ok(Ok(SdpMessage::PeerLeft {
                     participant,
                     room_id,
                 })) => {
@@ -341,15 +341,15 @@ mod tests {
 
         assert!(
             leave_rooms.contains("r1"),
-            "expected Leave in r1, got: {leave_rooms:?}"
+            "expected PeerLeft in r1, got: {leave_rooms:?}"
         );
         assert!(
             leave_rooms.contains("r2"),
-            "expected Leave in r2, got: {leave_rooms:?}"
+            "expected PeerLeft in r2, got: {leave_rooms:?}"
         );
         assert!(
             leave_rooms.contains("r3"),
-            "expected Leave in r3, got: {leave_rooms:?}"
+            "expected PeerLeft in r3, got: {leave_rooms:?}"
         );
     }
 
@@ -375,6 +375,7 @@ mod tests {
             SdpMessage::Ready {
                 room_id,
                 initiator,
+                ..
             } => {
                 assert_eq!(room_id, "init-room");
                 assert!(initiator, "first joiner should be initiator");
@@ -395,6 +396,7 @@ mod tests {
             SdpMessage::Ready {
                 room_id,
                 initiator,
+                ..
             } => {
                 assert_eq!(room_id, "init-room");
                 assert!(!initiator, "second joiner should not be initiator");

@@ -177,8 +177,8 @@ where
             tokio::select! {
                 result = peer_events.recv() => {
                     match result {
-                        Ok(PeerEvent::RtpReceived(pkt)) => {
-                            self.inbound.push_rtp(pkt);
+                        Ok(PeerEvent::RtpReceived { packet, seq_no: _ }) => {
+                            self.inbound.push_rtp(packet);
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
