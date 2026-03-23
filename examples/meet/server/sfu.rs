@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use seameet::ParticipantId;
+use seameet::{ParticipantId, SdpMessage};
 use str0m::change::SdpOffer;
 use str0m::media::{MediaKind, Mid};
 use str0m::net::Protocol;
@@ -29,6 +29,10 @@ pub enum PeerCmd {
     PeerMuteChanged {
         pid: ParticipantId,
         muted: bool,
+    },
+    /// Notify this peer's media task about the current remote peer count.
+    PeerCountChanged {
+        remote_peer_count: usize,
     },
 }
 
@@ -64,6 +68,9 @@ pub struct SfuPeer {
 pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
 /// Maps remote UDP address → ParticipantId for efficient packet routing.
 pub type RouteTable = Arc<RwLock<HashMap<SocketAddr, ParticipantId>>>;
+
+/// Maximum number of media packets buffered per source while awaiting renegotiation.
+const MEDIA_BUFFER_CAP: usize = 500;
 
 // ── UDP reader (single socket, broadcast to all peers) ─────────────────
 
@@ -117,6 +124,8 @@ pub async fn run_media(
     own_audio_pt: u8,
     own_video_pt: u8,
     initial_mids: Vec<(Mid, MediaKind)>,
+    ws_tx: mpsc::UnboundedSender<String>,
+    room_id: String,
 ) {
     let mut own_audio_mid: Option<Mid> = None;
     let mut own_video_mid: Option<Mid> = None;
@@ -136,6 +145,7 @@ pub async fn run_media(
     let mut all_mids: Vec<(Mid, MediaKind)> = Vec::new();
     let mut rtp_rx_count: u64 = 0;
     let mut rtp_tx_count: u64 = 0;
+    let mut pending_media: HashMap<ParticipantId, Vec<ForwardedMedia>> = HashMap::new();
 
     // Process mids collected right after accept_offer (before ICE/DTLS).
     for (mid, kind) in &initial_mids {
@@ -269,6 +279,22 @@ pub async fn run_media(
                         if m.is_audio && muted_peers.contains(&m.source_pid) {
                             continue;
                         }
+                        // Check if slot exists or can be created.
+                        let has_slot = source_slots.contains_key(&m.source_pid)
+                            || get_or_create_slot(
+                                m.source_pid, &mut source_slots,
+                                &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+                            ).is_some();
+
+                        if !has_slot {
+                            // Buffer media while waiting for renegotiation.
+                            let buf = pending_media.entry(m.source_pid).or_default();
+                            if buf.len() < MEDIA_BUFFER_CAP {
+                                buf.push(m);
+                            }
+                            continue;
+                        }
+
                         let created_new = !source_slots.contains_key(&m.source_pid);
                         let had_screen_mid = source_slots.get(&m.source_pid)
                             .and_then(|s| s.screen_mid).is_some();
@@ -335,6 +361,33 @@ pub async fn run_media(
                             "renegotiation complete — source slots preserved"
                         );
 
+                        // Flush buffered media now that new mids are available.
+                        if !pending_media.is_empty() {
+                            let sources: Vec<ParticipantId> = pending_media.keys().copied().collect();
+                            let mut flushed_count = 0usize;
+                            for source_pid in sources {
+                                if let Some(buffered) = pending_media.remove(&source_pid) {
+                                    for m in &buffered {
+                                        write_forwarded_rtp(
+                                            &mut rtc, m, &mut source_slots, &mut rtp_tx_count,
+                                            &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+                                        );
+                                        flushed_count += 1;
+                                    }
+                                    // Request keyframe for flushed source.
+                                    if source_slots.contains_key(&source_pid) {
+                                        let p = peers.read().await;
+                                        if let Some(peer) = p.get(&source_pid) {
+                                            let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                                        }
+                                    }
+                                }
+                            }
+                            if flushed_count > 0 {
+                                info!(participant = %pid, flushed_count, "flushed buffered media after renegotiation");
+                            }
+                        }
+
                         // Request keyframes after renegotiation to avoid freeze.
                         if let Some(mid) = own_video_mid {
                             let mut api = rtc.direct_api();
@@ -394,6 +447,26 @@ pub async fn run_media(
                             muted_peers.remove(&peer_pid);
                         }
                         info!(participant = %pid, peer = %peer_pid, muted = is_muted, "peer mute state updated");
+                    }
+                    Some(PeerCmd::PeerCountChanged { remote_peer_count }) => {
+                        let own_count = 2 + if own_screen_mid.is_some() { 1 } else { 0 };
+                        if let Some(deficit) = needs_renegotiation(
+                            &all_mids, own_count, &source_slots, remote_peer_count,
+                        ) {
+                            let msg = SdpMessage::RequestRenegotiation {
+                                room_id: room_id.clone(),
+                                needed_slots: deficit,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = ws_tx.send(json);
+                            }
+                            info!(
+                                participant = %pid,
+                                deficit,
+                                remote_peer_count,
+                                "requested renegotiation for more slots"
+                            );
+                        }
                     }
                     None => break,
                 }
@@ -615,6 +688,60 @@ async fn drain_outputs(
                 return None;
             }
         }
+    }
+}
+
+/// Determines whether a renegotiation is needed to accommodate the given remote peer count.
+///
+/// Returns `Some(deficit)` if more slots are needed, `None` otherwise.
+pub fn needs_renegotiation(
+    all_mids: &[(Mid, MediaKind)],
+    own_count: usize,
+    slots: &HashMap<ParticipantId, SourceSlot>,
+    remote_peer_count: usize,
+) -> Option<u32> {
+    if remote_peer_count == 0 {
+        return None;
+    }
+
+    // Count mids already used by existing slots.
+    let used_mids: std::collections::HashSet<Mid> = slots
+        .values()
+        .flat_map(|s| {
+            let mut v = vec![s.audio_mid, s.video_mid];
+            if let Some(sm) = s.screen_mid {
+                v.push(sm);
+            }
+            v
+        })
+        .collect();
+
+    // Count free audio and video mids (excluding own mids).
+    let free_audio = all_mids
+        .iter()
+        .filter(|(mid, kind)| {
+            matches!(kind, MediaKind::Audio) && !used_mids.contains(mid)
+        })
+        .count()
+        .saturating_sub(own_count.min(1)); // subtract 1 for own audio
+
+    let free_video = all_mids
+        .iter()
+        .filter(|(mid, kind)| {
+            matches!(kind, MediaKind::Video) && !used_mids.contains(mid)
+        })
+        .count()
+        .saturating_sub(own_count.saturating_sub(1)); // subtract own video (+ screen if present)
+
+    // Available slots = min of free audio and free video pairs.
+    let slots_available = free_audio.min(free_video);
+    // Peers that still need a slot.
+    let peers_without_slot = remote_peer_count.saturating_sub(slots.len());
+
+    if peers_without_slot > slots_available {
+        Some((peers_without_slot - slots_available) as u32)
+    } else {
+        None
     }
 }
 
@@ -1367,5 +1494,50 @@ a=mid:3\r\n";
         // All peers should get screen mids (one each from the 3 extra video mids)
         let screens: Vec<_> = slots.values().filter(|s| s.screen_mid.is_some()).collect();
         assert_eq!(screens.len(), 3, "each peer should get a screen mid");
+    }
+
+    // ── needs_renegotiation ───────────────────────────────────────────
+
+    #[test]
+    fn test_needs_renegotiation_sufficient_mids() {
+        // 8 mids (own audio+video + 3 pairs for peers), 1 slot used, 2 remote peers
+        let all_mids = make_mids();
+        let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let own_a = Some(mid("0"));
+        let own_v = Some(mid("1"));
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+
+        // 2 remote peers, 1 slot used, 1 free pair available → no deficit
+        assert_eq!(needs_renegotiation(&all_mids, 2, &slots, 2), None);
+    }
+
+    #[test]
+    fn test_needs_renegotiation_deficit() {
+        // Only own mids + 1 slot pair. 3 remote peers but only 1 slot.
+        let all_mids = vec![
+            (mid("0"), MediaKind::Audio),
+            (mid("1"), MediaKind::Video),
+            (mid("2"), MediaKind::Audio),
+            (mid("3"), MediaKind::Video),
+        ];
+        let slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+
+        // 3 remote peers, 0 slots used, only 1 free pair → deficit = 2
+        let deficit = needs_renegotiation(&all_mids, 2, &slots, 3);
+        assert!(deficit.is_some());
+        assert_eq!(deficit.unwrap(), 2);
+    }
+
+    #[test]
+    fn test_needs_renegotiation_zero_peers() {
+        let all_mids = make_mids();
+        let slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        assert_eq!(needs_renegotiation(&all_mids, 2, &slots, 0), None);
+    }
+
+    #[test]
+    fn test_media_buffer_cap() {
+        // Verify the buffer cap constant is what we expect.
+        assert_eq!(MEDIA_BUFFER_CAP, 500);
     }
 }

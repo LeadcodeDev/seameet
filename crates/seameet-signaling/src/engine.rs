@@ -410,6 +410,8 @@ pub async fn dispatch(
                 let _ = peer_tx.send(raw.to_owned());
             }
         }
+        // RequestRenegotiation is server→client only; ignore if received from client.
+        SdpMessage::RequestRenegotiation { .. } => {}
         SdpMessage::ScreenShareStarted { room_id, .. }
         | SdpMessage::ScreenShareStopped { room_id, .. }
         | SdpMessage::MuteAudio { room_id, .. }

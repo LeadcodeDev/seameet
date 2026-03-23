@@ -139,6 +139,13 @@ pub enum SdpMessage {
         /// Frames per second.
         fps: u32,
     },
+    /// Sent by the server to request the client to renegotiate with more slots.
+    RequestRenegotiation {
+        /// The room this request belongs to.
+        room_id: String,
+        /// Number of additional slots (audio+video pairs) needed.
+        needed_slots: u32,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -164,7 +171,8 @@ impl SdpMessage {
             | Self::ScreenShareStopped { room_id, .. }
             | Self::MuteAudio { room_id, .. }
             | Self::UnmuteAudio { room_id, .. }
-            | Self::VideoConfigChanged { room_id, .. } => Some(room_id),
+            | Self::VideoConfigChanged { room_id, .. }
+            | Self::RequestRenegotiation { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -220,6 +228,10 @@ mod tests {
                 initiator: true,
                 peers: vec![],
                 display_names: HashMap::new(),
+            },
+            SdpMessage::RequestRenegotiation {
+                room_id: "r1".into(),
+                needed_slots: 3,
             },
             SdpMessage::Error {
                 code: 404,
@@ -300,6 +312,14 @@ mod tests {
             }
             .room_id(),
             Some("r5")
+        );
+        assert_eq!(
+            SdpMessage::RequestRenegotiation {
+                room_id: "r6".into(),
+                needed_slots: 2
+            }
+            .room_id(),
+            Some("r6")
         );
     }
 

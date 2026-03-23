@@ -289,6 +289,12 @@ impl SignalingHooks for SfuHooks {
                 let peers_clone = Arc::clone(&room_peers);
                 let socket_clone = Arc::clone(&self.socket);
                 let routes_clone = Arc::clone(&self.routes);
+                let ws_tx_clone = self_tx.clone();
+                let sess = self.sessions.read().await;
+                let media_room_id = sess.get(&pid)
+                    .and_then(|s| s.current_room_id.clone())
+                    .unwrap_or_default();
+                drop(sess);
                 tokio::spawn(async move {
                     run_media(
                         rtc,
@@ -301,6 +307,8 @@ impl SignalingHooks for SfuHooks {
                         own_audio_pt.unwrap_or(111),
                         own_video_pt.unwrap_or(96),
                         initial_mids,
+                        ws_tx_clone,
+                        media_room_id,
                     )
                     .await;
                 });
@@ -442,6 +450,21 @@ impl SignalingHooks for SfuHooks {
                         has_media_task: false,
                         current_room_id: Some(room_id.clone()),
                     });
+                }
+
+                // Notify all peers in the room about the updated peer count.
+                {
+                    let rooms = self.rooms.read().await;
+                    if let Some(room) = rooms.get(room_id) {
+                        let p = room.peers.read().await;
+                        // +1 because this peer hasn't been added to the SFU peers yet.
+                        let remote_count = p.len();
+                        for (_id, peer) in p.iter() {
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerCountChanged {
+                                remote_peer_count: remote_count,
+                            });
+                        }
+                    }
                 }
 
                 // Let the engine handle the Join (room membership + Ready/PeerJoined).
