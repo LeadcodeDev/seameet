@@ -138,7 +138,8 @@ pub async fn run_media(
     let mut muted_peers: std::collections::HashSet<ParticipantId> = std::collections::HashSet::new();
     let mut media_started = false;
     let mut ice_connected = false;
-    let mut keyframes_requested_on_connect = false;
+    let mut connected_at: Option<Instant> = None;
+    let mut post_connect_pli_count: u32 = 0;
     let mut route_registered = false;
 
     let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
@@ -226,21 +227,32 @@ pub async fn run_media(
             }
         }
 
-        // Request keyframes once ICE connects — media written before DTLS
-        // was silently discarded, so we need fresh keyframes now.
-        if ice_connected && media_started && !keyframes_requested_on_connect {
-            keyframes_requested_on_connect = true;
-            info!(participant = %pid, "ICE connected — requesting keyframes from all peers");
-            if let Some(mid) = own_video_mid {
-                let mut api = rtc.direct_api();
-                if let Some(rx) = api.stream_rx_by_mid(mid, None) {
-                    rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
-                }
+        // Burst keyframe requests after connection — media written before DTLS
+        // was silently discarded, so we need fresh keyframes. Request multiple
+        // times (at 0ms, 200ms, 500ms, 1s, 2s) to cover the DTLS completion window.
+        if ice_connected && media_started {
+            if connected_at.is_none() {
+                connected_at = Some(Instant::now());
             }
-            let p = peers.read().await;
-            for (id, peer) in p.iter() {
-                if *id != pid {
-                    let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+            const PLI_BURST_DELAYS_MS: [u64; 5] = [0, 200, 500, 1000, 2000];
+            if let Some(t0) = connected_at {
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let idx = post_connect_pli_count as usize;
+                if idx < PLI_BURST_DELAYS_MS.len() && elapsed_ms >= PLI_BURST_DELAYS_MS[idx] {
+                    post_connect_pli_count += 1;
+                    info!(participant = %pid, burst = idx + 1, "post-connect keyframe burst");
+                    if let Some(mid) = own_video_mid {
+                        let mut api = rtc.direct_api();
+                        if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                            rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                        }
+                    }
+                    let p = peers.read().await;
+                    for (id, peer) in p.iter() {
+                        if *id != pid {
+                            let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                        }
+                    }
                 }
             }
         }
@@ -476,7 +488,7 @@ pub async fn run_media(
             _ = tokio::time::sleep(wait) => {
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
 
-                if media_started && last_pli.elapsed() >= Duration::from_secs(5) {
+                if media_started && last_pli.elapsed() >= Duration::from_secs(2) {
                     last_pli = Instant::now();
                     if let Some(mid) = own_video_mid {
                         let mut api = rtc.direct_api();
