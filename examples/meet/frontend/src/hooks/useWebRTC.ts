@@ -3,6 +3,11 @@ import type { SignalingMessage } from '@/types'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { VideoSettings } from '@/hooks/useMediaDevices'
 
+// Pre-allocate transceiver slots to avoid renegotiation when peers join.
+// str0m's accept_offer in RTP mode does not support renegotiation reliably,
+// so the initial SDP offer includes enough audio+video pairs for future peers.
+const MAX_PEER_SLOTS = 7
+
 const BITRATE_BY_HEIGHT: Record<number, number> = {
   360: 500_000,
   480: 800_000,
@@ -14,12 +19,17 @@ function getBitrateForHeight(height: number): number {
   return BITRATE_BY_HEIGHT[height] ?? 800_000
 }
 
+interface TransceiverSlot {
+  audioTransceiver: RTCRtpTransceiver
+  videoTransceiver: RTCRtpTransceiver
+}
+
 export interface RemotePeer {
   id: string
   displayName: string
   stream: MediaStream
-  audioTransceiver: RTCRtpTransceiver
-  videoTransceiver: RTCRtpTransceiver
+  audioMid: string | null
+  videoMid: string | null
   screenTransceiver: RTCRtpTransceiver | null
   screenStream: MediaStream | null
 }
@@ -60,6 +70,9 @@ export function useWebRTC({
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
 
+  // Pool of pre-allocated transceiver pairs from the initial offer.
+  const transceiverPoolRef = useRef<TransceiverSlot[]>([])
+
   // Message queue to serialize async message processing (like browser-demo's await)
   const messageQueueRef = useRef<SignalingMessage[]>([])
   const processingRef = useRef(false)
@@ -83,41 +96,68 @@ export function useWebRTC({
   }, [])
 
   const addRemotePeer = useCallback((peerId: string, displayName?: string) => {
-    const pc = pcRef.current
-    if (!pc || remotePeersRef.current.has(peerId)) return
+    if (remotePeersRef.current.has(peerId)) return
 
-    const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' })
-    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+    const slot = transceiverPoolRef.current.shift()
+    if (!slot) {
+      console.warn(`[WebRTC] no free transceiver slots for peer ${peerId.slice(0, 8)}`)
+      return
+    }
+
     const stream = new MediaStream()
+    const audioMid = slot.audioTransceiver.mid
+    const videoMid = slot.videoTransceiver.mid
+
+    // Attach receiver tracks directly from the pre-allocated transceivers.
+    // ontrack may have already fired (during setRemoteDescription) before
+    // this peer was added, so we cannot rely on ontrack for initial routing.
+    const audioTrack = slot.audioTransceiver.receiver.track
+    const videoTrack = slot.videoTransceiver.receiver.track
+    if (audioTrack) stream.addTrack(audioTrack)
+    if (videoTrack) stream.addTrack(videoTrack)
 
     const peer: RemotePeer = {
       id: peerId,
       displayName: displayName ?? peerId.slice(0, 8),
       stream,
-      audioTransceiver,
-      videoTransceiver,
+      audioMid,
+      videoMid,
       screenTransceiver: null,
       screenStream: null,
     }
 
     remotePeersRef.current.set(peerId, peer)
     updateRemotePeersState()
-    console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, total: ${remotePeersRef.current.size}`)
+    console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [updateRemotePeersState])
 
   const removeRemotePeer = useCallback((peerId: string) => {
     const info = remotePeersRef.current.get(peerId)
     if (!info) return
 
-    try { info.audioTransceiver.direction = 'inactive' } catch { /* ignore */ }
-    try { info.videoTransceiver.direction = 'inactive' } catch { /* ignore */ }
+    // Clear stream tracks but do NOT set transceivers to inactive —
+    // the mids must stay active in str0m for reuse.
+    for (const track of info.stream.getTracks()) {
+      info.stream.removeTrack(track)
+    }
     if (info.screenTransceiver) {
       try { info.screenTransceiver.direction = 'inactive' } catch { /* ignore */ }
     }
 
+    // Find the transceiver pair by mid and return to pool.
+    const pc = pcRef.current
+    if (pc && info.audioMid && info.videoMid) {
+      const transceivers = pc.getTransceivers()
+      const audioT = transceivers.find(t => t.mid === info.audioMid)
+      const videoT = transceivers.find(t => t.mid === info.videoMid)
+      if (audioT && videoT) {
+        transceiverPoolRef.current.push({ audioTransceiver: audioT, videoTransceiver: videoT })
+      }
+    }
+
     remotePeersRef.current.delete(peerId)
     updateRemotePeersState()
-    console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}`)
+    console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}, pool: ${transceiverPoolRef.current.length}`)
   }, [updateRemotePeersState])
 
   const renegotiate = useCallback(async () => {
@@ -175,10 +215,11 @@ export function useWebRTC({
     }
 
     pc.ontrack = (evt) => {
-      console.log(`[WebRTC] ontrack: ${evt.track.kind} (mid=${evt.transceiver.mid})`)
+      const mid = evt.transceiver.mid
+      console.log(`[WebRTC] ontrack: ${evt.track.kind} (mid=${mid})`)
       for (const [peerId, info] of remotePeersRef.current) {
-        // Screen share transceiver
-        if (info.screenTransceiver && evt.transceiver === info.screenTransceiver) {
+        // Screen share transceiver — match by mid
+        if (info.screenTransceiver && mid === info.screenTransceiver.mid) {
           if (!info.screenStream) {
             info.screenStream = new MediaStream()
           }
@@ -187,9 +228,8 @@ export function useWebRTC({
           console.log(`[WebRTC] routed screen track to peer ${peerId.slice(0, 8)}`)
           return
         }
-        // Audio/video transceivers
-        if (evt.transceiver === info.audioTransceiver ||
-            evt.transceiver === info.videoTransceiver) {
+        // Audio/video — match by stored mid values
+        if (mid === info.audioMid || mid === info.videoMid) {
           const ms = info.stream
           for (const old of ms.getTracks()) {
             if (old.kind === evt.track.kind && old.id !== evt.track.id) {
@@ -202,7 +242,7 @@ export function useWebRTC({
           return
         }
       }
-      console.log(`[WebRTC] unmatched track (mid=${evt.transceiver.mid})`)
+      console.log(`[WebRTC] unmatched track (mid=${mid})`)
     }
 
     pc.onconnectionstatechange = () => {
@@ -237,14 +277,26 @@ export function useWebRTC({
       console.log('[WebRTC] no local media — added dummy transceivers')
     }
 
-    // Add transceivers for each existing peer
+    // Pre-allocate transceiver pool so we never renegotiate for new peers.
+    const totalSlots = Math.max(MAX_PEER_SLOTS, existingPeers.length)
+    const pool: TransceiverSlot[] = []
+    for (let i = 0; i < totalSlots; i++) {
+      pool.push({
+        audioTransceiver: pc.addTransceiver('audio', { direction: 'sendrecv' }),
+        videoTransceiver: pc.addTransceiver('video', { direction: 'sendrecv' }),
+      })
+    }
+    console.log(`[WebRTC] pre-allocated ${totalSlots} transceiver pairs`)
+
+    // Create offer FIRST so transceivers get mids assigned.
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+
+    // Now that mids are assigned, store pool and assign existing peers.
+    transceiverPoolRef.current = pool
     for (const peerId of existingPeers) {
       addRemotePeer(peerId, displayNames?.[peerId])
     }
-
-    // Create and send offer
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
 
     signalingRef.current.sendOffer(
       participantIdRef.current,
@@ -309,10 +361,9 @@ export function useWebRTC({
     if (data.type === 'peer_joined') {
       const peerId = data.participant
       console.log(`[WebRTC] peer_joined: ${peerId.slice(0, 8)}`)
-      const pc = pcRef.current
-      if (pc && !remotePeersRef.current.has(peerId)) {
+      if (!remotePeersRef.current.has(peerId)) {
         addRemotePeer(peerId, data.display_name)
-        await renegotiate()
+        // No renegotiation — slots are pre-allocated in the initial offer.
       }
       return
     }
