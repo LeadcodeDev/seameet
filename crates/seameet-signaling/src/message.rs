@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use seameet_core::ParticipantId;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +16,9 @@ pub enum SdpMessage {
         participant: ParticipantId,
         /// Target room identifier.
         room_id: String,
+        /// Optional human-readable name for this participant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// Notification that a participant has left a room.
     Leave {
@@ -68,6 +73,9 @@ pub enum SdpMessage {
         /// List of peers already present in the room.
         #[serde(default)]
         peers: Vec<ParticipantId>,
+        /// Display names of the existing peers, keyed by participant ID.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        display_names: HashMap<String, String>,
     },
     /// Sent by the server when a new peer joins the room.
     PeerJoined {
@@ -75,6 +83,9 @@ pub enum SdpMessage {
         participant: ParticipantId,
         /// The room identifier.
         room_id: String,
+        /// Optional human-readable name for this participant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// Sent by the server when a peer leaves the room.
     PeerLeft {
@@ -168,6 +179,7 @@ mod tests {
             SdpMessage::Join {
                 participant: id_a(),
                 room_id: "room-42".into(),
+                display_name: None,
             },
             SdpMessage::Leave {
                 participant: id_a(),
@@ -177,6 +189,7 @@ mod tests {
                 room_id: "r1".into(),
                 initiator: true,
                 peers: vec![],
+                display_names: HashMap::new(),
             },
             SdpMessage::Error {
                 code: 404,
@@ -196,6 +209,7 @@ mod tests {
         let msg = SdpMessage::Join {
             participant: id_a(),
             room_id: "test".into(),
+            display_name: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"type\":\"join\""));
@@ -206,7 +220,8 @@ mod tests {
         assert_eq!(
             SdpMessage::Join {
                 participant: id_a(),
-                room_id: "r1".into()
+                room_id: "r1".into(),
+                display_name: None,
             }
             .room_id(),
             Some("r1")
@@ -234,6 +249,7 @@ mod tests {
                 room_id: "r4".into(),
                 initiator: false,
                 peers: vec![],
+                display_names: HashMap::new(),
             }
             .room_id(),
             Some("r4")

@@ -250,6 +250,7 @@ async fn handle_ws(
                     let joined_msg = SdpMessage::PeerJoined {
                         participant,
                         room_id: "sfu".into(),
+                        display_name: None,
                     };
                     if let Ok(json) = serde_json::to_string(&joined_msg) {
                         for peer in p.values() {
@@ -262,6 +263,7 @@ async fn handle_ws(
                     room_id: "sfu".into(),
                     initiator: true,
                     peers: existing_peers.clone(),
+                    display_names: std::collections::HashMap::new(),
                 };
                 if let Ok(json) = serde_json::to_string(&ready) {
                     let _ = tx.send(json);

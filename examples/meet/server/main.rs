@@ -2,37 +2,34 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
-use seameet::{ParticipantId, SdpMessage};
+use seameet::{
+    run_connection, ParticipantId, SdpMessage, SignalingHooks, SignalingState, TransportListener,
+    WsListener,
+};
 use str0m::change::SdpOffer;
 use str0m::net::Protocol;
 use str0m::{Candidate, Output, RtcConfig};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 mod sfu;
 use sfu::*;
 
-// Per-room state: peers and display names.
-type DisplayNames = Arc<RwLock<HashMap<ParticipantId, String>>>;
-
+/// Per-room SFU state.
 struct RoomState {
     peers: Peers,
-    display_names: DisplayNames,
 }
-
-type Rooms = Arc<RwLock<HashMap<String, RoomState>>>;
 
 impl RoomState {
     fn new() -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
-            display_names: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
+
+type Rooms = Arc<RwLock<HashMap<String, RoomState>>>;
 
 #[tokio::main]
 async fn main() {
@@ -57,7 +54,6 @@ async fn main() {
 
     let rooms: Rooms = Arc::new(RwLock::new(HashMap::new()));
     let routes: RouteTable = Arc::new(RwLock::new(HashMap::new()));
-    // Global peers map for UDP routing (all rooms share the UDP socket).
     let all_peers: Peers = Arc::new(RwLock::new(HashMap::new()));
 
     // Spawn UDP reader that dispatches packets using route table.
@@ -67,203 +63,89 @@ async fn main() {
         Arc::clone(&routes),
     ));
 
-    let ws = tokio::spawn(serve_ws(
-        rooms,
-        all_peers,
-        Arc::clone(&shared_socket),
+    let state = Arc::new(RwLock::new(SignalingState::new()));
+    let hooks = Arc::new(SfuHooks {
+        rooms: Arc::clone(&rooms),
+        all_peers: Arc::clone(&all_peers),
+        socket: Arc::clone(&shared_socket),
+        routes: Arc::clone(&routes),
         udp_local_addr,
-        Arc::clone(&routes),
-    ));
+    });
+
+    let mut listener = WsListener::bind("0.0.0.0:3001").await.expect("bind WS");
 
     info!("WS    → ws://localhost:3001");
     info!("UDP   → 0.0.0.0:{udp_port}");
 
-    let _ = ws.await;
-}
-
-// ── WebSocket signaling ─────────────────────────────────────────────────
-
-async fn serve_ws(
-    rooms: Rooms,
-    all_peers: Peers,
-    socket: Arc<UdpSocket>,
-    udp_local_addr: SocketAddr,
-    routes: RouteTable,
-) {
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!("failed to bind WS on {addr}: {e}");
-            return;
-        }
-    };
-
-    loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("accept error: {e}");
-                continue;
-            }
-        };
-        let rooms = Arc::clone(&rooms);
-        let all_peers = Arc::clone(&all_peers);
-        let socket = Arc::clone(&socket);
-        let routes = Arc::clone(&routes);
-        tokio::spawn(async move {
-            let ws = match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(e) => {
-                    warn!(%peer_addr, "WS handshake failed: {e}");
-                    return;
-                }
-            };
-            info!(%peer_addr, "WS connected");
-            handle_ws(ws, rooms, all_peers, socket, udp_local_addr, routes).await;
-        });
+    while let Some(conn) = listener.accept().await {
+        let state = Arc::clone(&state);
+        let hooks = Arc::clone(&hooks);
+        tokio::spawn(run_connection(conn, state, hooks));
     }
 }
 
-async fn handle_ws(
-    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+// ── SFU hooks ──────────────────────────────────────────────────────────
+
+struct SfuHooks {
     rooms: Rooms,
     all_peers: Peers,
     socket: Arc<UdpSocket>,
-    udp_local_addr: SocketAddr,
     routes: RouteTable,
-) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    udp_local_addr: SocketAddr,
+}
 
-    let writer = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            if ws_tx.send(Message::Text(text)).await.is_err() {
-                break;
-            }
-        }
-    });
+/// Per-connection state keyed by participant ID.
+struct PeerSession {
+    has_media_task: bool,
+    current_room_id: Option<String>,
+}
 
-    let mut participant_id: Option<ParticipantId> = None;
-    let mut current_room_id: Option<String> = None;
-    let mut has_media_task = false;
+type Sessions = Arc<RwLock<HashMap<ParticipantId, PeerSession>>>;
 
-    while let Some(result) = ws_rx.next().await {
-        let msg = match result {
-            Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) => break,
-            Ok(_) => continue,
-            Err(e) => {
-                warn!("WS read error: {e}");
-                break;
-            }
-        };
+static SESSIONS: std::sync::OnceLock<Sessions> = std::sync::OnceLock::new();
 
-        // Parse as raw JSON Value first to extract display_name.
-        let raw: serde_json::Value = match serde_json::from_str(&msg) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("invalid JSON: {e}");
-                continue;
-            }
-        };
+fn sessions() -> &'static Sessions {
+    SESSIONS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
 
-        let sdp: SdpMessage = match serde_json::from_str(&msg) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("invalid message: {e}");
-                continue;
-            }
-        };
+impl SfuHooks {
+    /// Returns the shared Peers map for a participant's current room.
+    async fn room_peers_for(&self, pid: &ParticipantId) -> Option<Peers> {
+        let sess = sessions().read().await;
+        let room_id = sess.get(pid)?.current_room_id.as_ref()?.clone();
+        drop(sess);
 
+        let rooms = self.rooms.read().await;
+        rooms.get(&room_id).map(|r| Arc::clone(&r.peers))
+    }
+}
+
+impl SignalingHooks for SfuHooks {
+    async fn on_message(
+        &self,
+        sdp: &SdpMessage,
+        _raw: &str,
+        pid: ParticipantId,
+        self_tx: &mpsc::UnboundedSender<String>,
+        _state: &Arc<RwLock<SignalingState>>,
+    ) -> bool {
         match sdp {
-            SdpMessage::Join { participant, room_id, .. } => {
-                participant_id = Some(participant);
-                current_room_id = Some(room_id.clone());
-
-                // Extract and store display_name if present.
-                let display_name = raw
-                    .get("display_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                // Get or create room state.
-                let room = {
-                    let mut r = rooms.write().await;
-                    let room = r.entry(room_id.clone()).or_insert_with(RoomState::new);
-                    (Arc::clone(&room.peers), Arc::clone(&room.display_names))
-                };
-                let (room_peers, room_names) = room;
-
-                if !display_name.is_empty() {
-                    room_names.write().await.insert(participant, display_name.clone());
-                }
-
-                let existing_peers: Vec<ParticipantId>;
-                {
-                    let p = room_peers.read().await;
-                    existing_peers = p.keys().copied().collect();
-
-                    // Build PeerJoined with display_name.
-                    let joined_msg = SdpMessage::PeerJoined {
-                        participant,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&joined_msg) {
-                        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
-                        if !display_name.is_empty() {
-                            val["display_name"] = serde_json::Value::String(display_name.clone());
-                        }
-                        let json = serde_json::to_string(&val).unwrap();
-                        for peer in p.values() {
-                            let _ = peer.ws_tx.send(json.clone());
-                        }
-                    }
-                }
-
-                // Build Ready with peer display names.
-                let ready = SdpMessage::Ready {
-                    room_id: room_id.clone(),
-                    initiator: true,
-                    peers: existing_peers.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&ready) {
-                    let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
-                    let names = room_names.read().await;
-                    let mut peer_names = serde_json::Map::new();
-                    for pid in &existing_peers {
-                        if let Some(name) = names.get(pid) {
-                            peer_names.insert(pid.to_string(), serde_json::Value::String(name.clone()));
-                        }
-                    }
-                    if !peer_names.is_empty() {
-                        val["display_names"] = serde_json::Value::Object(peer_names);
-                    }
-                    let json = serde_json::to_string(&val).unwrap();
-                    let _ = tx.send(json);
-                }
-                info!(participant = %participant, existing = existing_peers.len(), "joined room {room_id}");
-            }
-
             SdpMessage::Offer { sdp, .. } => {
-                let Some(pid) = participant_id else { continue };
-                let Some(ref rid) = current_room_id else { continue };
-                info!(participant = %pid, "processing offer");
+                let sess = sessions().read().await;
+                let has_media = sess.get(&pid).map(|s| s.has_media_task).unwrap_or(false);
+                drop(sess);
 
-                // Get room peers for this participant.
-                let room_peers = {
-                    let r = rooms.read().await;
-                    r.get(rid).map(|room| Arc::clone(&room.peers))
+                let Some(room_peers) = self.room_peers_for(&pid).await else {
+                    return true;
                 };
-                let Some(room_peers) = room_peers else { continue };
 
-                if has_media_task {
+                if has_media {
+                    // Renegotiation path.
                     let p = room_peers.read().await;
                     if let Some(peer) = p.get(&pid) {
                         let (reply_tx, reply_rx) = oneshot::channel();
                         let _ = peer.cmd_tx.send(PeerCmd::RenegotiationOffer {
-                            sdp,
+                            sdp: sdp.clone(),
                             reply_tx,
                         });
                         drop(p);
@@ -277,23 +159,23 @@ async fn handle_ws(
                                     sdp: answer_sdp,
                                 };
                                 if let Ok(json) = serde_json::to_string(&answer_msg) {
-                                    let _ = tx.send(json);
+                                    let _ = self_tx.send(json);
                                 }
                             }
                             Ok(_) => {
-                                warn!(participant = %pid, "renegotiation produced empty SDP — not sending answer");
+                                warn!(participant = %pid, "renegotiation produced empty SDP");
                             }
                             Err(_) => {
                                 warn!(participant = %pid, "renegotiation reply channel closed");
                             }
                         }
                     }
-                    continue;
+                    return true;
                 }
 
                 // First offer — build Rtc with shared socket address.
                 let local_ip = local_ip().await;
-                let local_addr: SocketAddr = (local_ip, udp_local_addr.port()).into();
+                let local_addr: SocketAddr = (local_ip, self.udp_local_addr.port()).into();
 
                 let mut config = RtcConfig::new()
                     .set_rtp_mode(true)
@@ -309,10 +191,9 @@ async fn handle_ws(
                     rtc.add_local_candidate(c);
                 }
 
-                // Add public IP candidate for remote clients.
                 if let Ok(public_ip) = std::env::var("PUBLIC_IP") {
                     if let Ok(ip) = public_ip.parse::<std::net::IpAddr>() {
-                        let public_addr: SocketAddr = (ip, udp_local_addr.port()).into();
+                        let public_addr: SocketAddr = (ip, self.udp_local_addr.port()).into();
                         if let Ok(c) = Candidate::host(public_addr, Protocol::Udp) {
                             rtc.add_local_candidate(c);
                             info!(%public_addr, "added public IP candidate");
@@ -320,13 +201,13 @@ async fn handle_ws(
                     }
                 }
 
-                let sdp = patch_sdp_directions(&sdp);
+                let sdp = patch_sdp_directions(sdp);
 
                 let offer = match SdpOffer::from_sdp_string(&sdp) {
                     Ok(o) => o,
                     Err(e) => {
                         warn!("bad SDP offer: {e}");
-                        continue;
+                        return true;
                     }
                 };
 
@@ -334,7 +215,7 @@ async fn handle_ws(
                     Ok(a) => a,
                     Err(e) => {
                         warn!("accept_offer failed: {e}");
-                        continue;
+                        return true;
                     }
                 };
 
@@ -350,21 +231,17 @@ async fn handle_ws(
                     }
                 }
 
-                // Parse mids directly from the SDP answer.  str0m's MediaAdded
-                // events only fire after DTLS completes (Event::Connected), which
-                // is too late — ForwardedMedia from other peers floods the channel
-                // before that.  Parsing the SDP gives us mids immediately.
                 let initial_mids = parse_mids_from_sdp(&answer_sdp);
                 info!(participant = %pid, count = initial_mids.len(), "parsed mids from SDP answer");
                 for (mid, kind) in &initial_mids {
                     info!(participant = %pid, ?mid, ?kind, "SDP mid");
                 }
 
-                // Still drain any pending Transmit events (DTLS handshake packets).
+                // Drain pending Transmit events (DTLS handshake packets).
                 loop {
                     match rtc.poll_output() {
                         Ok(Output::Transmit(t)) => {
-                            let _ = socket.try_send_to(&t.contents, t.destination);
+                            let _ = self.socket.try_send_to(&t.contents, t.destination);
                         }
                         Ok(Output::Event(_)) => {}
                         Ok(Output::Timeout(_)) => break,
@@ -382,7 +259,7 @@ async fn handle_ws(
                     sdp: answer_sdp,
                 };
                 if let Ok(json) = serde_json::to_string(&answer_msg) {
-                    let _ = tx.send(json);
+                    let _ = self_tx.send(json);
                 }
 
                 info!(participant = %pid, %local_addr, "SDP negotiated");
@@ -390,7 +267,7 @@ async fn handle_ws(
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
                 let sfu_peer = SfuPeer {
                     cmd_tx,
-                    ws_tx: tx.clone(),
+                    ws_tx: self_tx.clone(),
                 };
                 {
                     let mut p = room_peers.write().await;
@@ -399,16 +276,21 @@ async fn handle_ws(
                         ws_tx: sfu_peer.ws_tx.clone(),
                     });
                 }
-                // Also register in all_peers for UDP routing.
                 {
-                    let mut ap = all_peers.write().await;
+                    let mut ap = self.all_peers.write().await;
                     ap.insert(pid, sfu_peer);
                 }
-                has_media_task = true;
+
+                {
+                    let mut sess = sessions().write().await;
+                    if let Some(s) = sess.get_mut(&pid) {
+                        s.has_media_task = true;
+                    }
+                }
 
                 let peers_clone = Arc::clone(&room_peers);
-                let socket_clone = Arc::clone(&socket);
-                let routes_clone = Arc::clone(&routes);
+                let socket_clone = Arc::clone(&self.socket);
+                let routes_clone = Arc::clone(&self.routes);
                 tokio::spawn(async move {
                     run_media(
                         rtc,
@@ -424,103 +306,108 @@ async fn handle_ws(
                     )
                     .await;
                 });
+
+                true
             }
 
             SdpMessage::IceCandidate { candidate, .. } => {
-                let Some(pid) = participant_id else { continue };
-                let ap = all_peers.read().await;
+                let ap = self.all_peers.read().await;
                 if let Some(peer) = ap.get(&pid) {
-                    let _ = peer.cmd_tx.send(PeerCmd::IceCandidate(candidate));
+                    let _ = peer.cmd_tx.send(PeerCmd::IceCandidate(candidate.clone()));
                 }
+                true
             }
 
             SdpMessage::ScreenShareStarted { from, room_id, track_id } => {
-                let room_peers = {
-                    let r = rooms.read().await;
-                    r.get(&room_id).map(|room| Arc::clone(&room.peers))
-                };
-                if let Some(room_peers) = room_peers {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
                     let p = room_peers.read().await;
-                    if let Some(peer) = p.get(&from) {
+                    if let Some(peer) = p.get(from) {
                         let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(true));
                     }
-                    let msg = SdpMessage::ScreenShareStarted { from, room_id, track_id };
+                    let msg = SdpMessage::ScreenShareStarted { from: *from, room_id: room_id.clone(), track_id: *track_id };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         for (id, peer) in p.iter() {
-                            if Some(*id) != participant_id {
+                            if *id != pid {
                                 let _ = peer.ws_tx.send(json.clone());
                             }
                         }
                     }
                 }
+                true
             }
 
             SdpMessage::ScreenShareStopped { from, room_id, track_id } => {
-                let room_peers = {
-                    let r = rooms.read().await;
-                    r.get(&room_id).map(|room| Arc::clone(&room.peers))
-                };
-                if let Some(room_peers) = room_peers {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
                     let p = room_peers.read().await;
-                    if let Some(peer) = p.get(&from) {
+                    if let Some(peer) = p.get(from) {
                         let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(false));
                     }
-                    let msg = SdpMessage::ScreenShareStopped { from, room_id, track_id };
+                    let msg = SdpMessage::ScreenShareStopped { from: *from, room_id: room_id.clone(), track_id: *track_id };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         for (id, peer) in p.iter() {
-                            if Some(*id) != participant_id {
+                            if *id != pid {
                                 let _ = peer.ws_tx.send(json.clone());
                             }
                         }
                     }
                 }
+                true
             }
 
-            _ => {}
+            SdpMessage::Join { room_id, .. } => {
+                // Get or create the shared room state for this room_id.
+                {
+                    let mut r = self.rooms.write().await;
+                    r.entry(room_id.clone()).or_insert_with(RoomState::new);
+                }
+
+                // Register the participant's session with their room_id.
+                {
+                    let mut sess = sessions().write().await;
+                    sess.insert(pid, PeerSession {
+                        has_media_task: false,
+                        current_room_id: Some(room_id.clone()),
+                    });
+                }
+
+                // Let the engine handle the Join (room membership + Ready/PeerJoined).
+                false
+            }
+
+            // Let the engine handle Leave, PeerLeft, etc.
+            _ => false,
         }
     }
 
-    if let Some(pid) = participant_id {
-        info!(participant = %pid, "disconnected");
-        // Clean up route table entries for this peer.
+    async fn on_disconnect(
+        &self,
+        pid: ParticipantId,
+        affected_rooms: &[(String, bool)],
+        _state: &Arc<RwLock<SignalingState>>,
+    ) {
+        // Clean up route table entries.
         {
-            let mut r = routes.write().await;
+            let mut r = self.routes.write().await;
             r.retain(|_, v| *v != pid);
         }
-        // Remove from all_peers (UDP routing).
-        all_peers.write().await.remove(&pid);
+        // Remove from all_peers.
+        self.all_peers.write().await.remove(&pid);
 
-        // Clean up room state.
-        if let Some(ref rid) = current_room_id {
-            let room = {
-                let r = rooms.read().await;
-                r.get(rid).map(|room| (Arc::clone(&room.peers), Arc::clone(&room.display_names)))
+        // Clean up per-room SFU peer state.
+        for (room_id, room_empty) in affected_rooms {
+            let room_peers = {
+                let rooms = self.rooms.read().await;
+                rooms.get(room_id).map(|r| Arc::clone(&r.peers))
             };
-            if let Some((room_peers, room_names)) = room {
-                room_names.write().await.remove(&pid);
-
-                let mut p = room_peers.write().await;
-                p.remove(&pid);
-
-                let left_msg = SdpMessage::PeerLeft {
-                    participant: pid,
-                    room_id: rid.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&left_msg) {
-                    for peer in p.values() {
-                        let _ = peer.ws_tx.send(json.clone());
-                    }
-                }
-
-                // Clean up empty rooms.
-                if p.is_empty() {
-                    drop(p);
-                    rooms.write().await.remove(rid);
-                }
+            if let Some(room_peers) = room_peers {
+                room_peers.write().await.remove(&pid);
+            }
+            if *room_empty {
+                self.rooms.write().await.remove(room_id);
             }
         }
-    }
 
-    drop(tx);
-    let _ = writer.await;
+        // Remove session.
+        sessions().write().await.remove(&pid);
+    }
 }

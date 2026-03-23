@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[features]
+default = ["ws"]
+ws = ["dep:tokio-tungstenite", "dep:futures-util"]
+
 [dependencies]
 seameet-core       = { path = "../seameet-core" }
 tokio              = { workspace = true }
@@ -11,8 +15,8 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 tracing            = { workspace = true }
-tokio-tungstenite  = "0.21"
-futures-util       = "0.3"
+tokio-tungstenite  = { version = "0.21", optional = true }
+futures-util       = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
