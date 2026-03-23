@@ -144,10 +144,6 @@ export function useWebRTC({
     for (const track of info.stream.getTracks()) {
       info.stream.removeTrack(track)
     }
-    if (info.screenTransceiver) {
-      try { info.screenTransceiver.direction = 'inactive' } catch { /* ignore */ }
-    }
-
     // Find the transceiver pair by mid and return to pool.
     const pc = pcRef.current
     if (pc && info.audioMid && info.videoMid) {
@@ -423,12 +419,43 @@ export function useWebRTC({
       const info = remotePeersRef.current.get(peerId)
       if (!info) return
       console.log(`[WebRTC] screen_share_started from ${peerId.slice(0, 8)}`)
-      // Add a transceiver to receive the screen share
-      const screenTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' })
+
+      // The SFU routes screen share RTP to the first free video mid in its
+      // slot for this source peer.  That mid corresponds to a pre-allocated
+      // pool transceiver on this browser — find it by looking for the first
+      // video transceiver whose mid isn't already assigned to any peer or
+      // used for our own local tracks.
+      const usedMids = new Set<string | null>()
+      for (const [, peer] of remotePeersRef.current) {
+        usedMids.add(peer.audioMid)
+        usedMids.add(peer.videoMid)
+        if (peer.screenTransceiver) usedMids.add(peer.screenTransceiver.mid)
+      }
+
+      let screenTransceiver: RTCRtpTransceiver | null = null
+      for (const t of pc.getTransceivers()) {
+        if (t.mid === null) continue
+        if (t.receiver.track.kind !== 'video') continue
+        if (usedMids.has(t.mid)) continue
+        // Skip own transceivers (they have a local send track attached)
+        if (t.sender.track !== null) continue
+        screenTransceiver = t
+        break
+      }
+
+      if (!screenTransceiver) {
+        console.warn(`[WebRTC] no free video transceiver for screen share from ${peerId.slice(0, 8)}`)
+        return
+      }
+
+      const screenStream = new MediaStream()
+      const videoTrack = screenTransceiver.receiver.track
+      if (videoTrack) screenStream.addTrack(videoTrack)
+
       info.screenTransceiver = screenTransceiver
-      info.screenStream = new MediaStream()
+      info.screenStream = screenStream
       updateRemotePeersState()
-      await renegotiate()
+      console.log(`[WebRTC] screen share routed via mid=${screenTransceiver.mid}`)
       return
     }
 
@@ -437,9 +464,8 @@ export function useWebRTC({
       const info = remotePeersRef.current.get(peerId)
       if (!info) return
       console.log(`[WebRTC] screen_share_stopped from ${peerId.slice(0, 8)}`)
-      if (info.screenTransceiver) {
-        try { info.screenTransceiver.direction = 'inactive' } catch { /* ignore */ }
-      }
+      // Don't set direction='inactive' — it's a pool transceiver that may be
+      // reused for future screen shares.
       info.screenTransceiver = null
       info.screenStream = null
       updateRemotePeersState()

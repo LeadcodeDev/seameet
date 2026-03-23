@@ -292,8 +292,13 @@ pub async fn run_media(
                         if m.is_audio && muted_peers.contains(&m.source_pid) {
                             continue;
                         }
+                        // Capture whether slot existed BEFORE potential creation.
+                        let had_slot = source_slots.contains_key(&m.source_pid);
+                        let had_screen_mid = source_slots.get(&m.source_pid)
+                            .and_then(|s| s.screen_mid).is_some();
+
                         // Check if slot exists or can be created.
-                        let has_slot = source_slots.contains_key(&m.source_pid)
+                        let has_slot = had_slot
                             || get_or_create_slot(
                                 m.source_pid, &mut source_slots,
                                 &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
@@ -308,19 +313,16 @@ pub async fn run_media(
                             continue;
                         }
 
-                        let created_new = !source_slots.contains_key(&m.source_pid);
-                        let had_screen_mid = source_slots.get(&m.source_pid)
-                            .and_then(|s| s.screen_mid).is_some();
                         write_forwarded_rtp(
                             &mut rtc, &m, &mut source_slots, &mut rtp_tx_count,
                             &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
                         );
                         // Request keyframe when we first create a slot OR
                         // when screen_mid was just set (initial keyframe was likely missed).
-                        let needs_keyframe = (created_new && source_slots.contains_key(&m.source_pid))
-                            || (!had_screen_mid && source_slots.get(&m.source_pid)
-                                .and_then(|s| s.screen_mid).is_some());
-                        if needs_keyframe {
+                        let created_new = !had_slot && source_slots.contains_key(&m.source_pid);
+                        let gained_screen_mid = !had_screen_mid && source_slots.get(&m.source_pid)
+                            .and_then(|s| s.screen_mid).is_some();
+                        if created_new || gained_screen_mid {
                             let p = peers.read().await;
                             if let Some(peer) = p.get(&m.source_pid) {
                                 let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
@@ -826,15 +828,10 @@ fn get_or_create_slot<'a>(
     let a_mid = *a_mid;
     let v_mid = *v_mid;
 
-    // Also try to find a free video mid for screen share.
-    let free_screen = all_mids.iter().find(|(mid, kind)| {
-        matches!(kind, MediaKind::Video)
-            && Some(*mid) != own_video_mid
-            && Some(*mid) != own_screen_mid
-            && *mid != v_mid
-            && !used_mids.contains(mid)
-    });
-    let screen_mid = free_screen.map(|(mid, _)| *mid);
+    // Don't pre-allocate screen_mid — assign lazily when screen share media
+    // actually arrives. Pre-allocating steals video mids from the pool,
+    // causing mid ordering to diverge from the frontend's pool assignment.
+    let screen_mid: Option<Mid> = None;
 
     info!(
         source = %source_pid,
@@ -1159,7 +1156,7 @@ a=recvonly\r\n";
     }
 
     #[test]
-    fn test_slot_screen_mid_assigned() {
+    fn test_slot_screen_mid_not_preassigned() {
         let all_mids = make_mids();
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
         let own_audio = Some(mid("0"));
@@ -1169,7 +1166,16 @@ a=recvonly\r\n";
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
         ).unwrap();
-        // Should have a screen mid from one of the free video mids
+        // Screen mid is NOT pre-assigned — it's assigned lazily when screen
+        // share media actually arrives.
+        assert!(slot.screen_mid.is_none());
+
+        // Calling get_or_create_slot again triggers the lazy upgrade path,
+        // which finds a free video mid and assigns it as screen_mid.
+        let slot = get_or_create_slot(
+            pid(1), &mut slots, &all_mids,
+            own_audio, own_video, None, 111, 96,
+        ).unwrap();
         assert!(slot.screen_mid.is_some());
     }
 
@@ -1193,18 +1199,16 @@ a=recvonly\r\n";
 
     #[test]
     fn test_slot_exhaustion_third_peer() {
-        // Peer 1 takes audio+video+screen, Peer 2 takes audio+video.
-        // Need enough mids so Peer 2 can get a slot but Peer 3 cannot.
-        // own(a,v) + peer1(a,v,screen_v) + peer2(a,v) = 7 mids needed.
-        // With only 7 mids, peer 3 has no audio left.
+        // Without screen_mid pre-allocation, peer 1 takes audio+video only.
+        // own(a,v) + peer1(a,v) + peer2(a,v) = 6 mids.
+        // With only 6 mids, peer 3 has no free audio/video.
         let all_mids = vec![
             (mid("0"), MediaKind::Audio),  // own audio
             (mid("1"), MediaKind::Video),  // own video
             (mid("2"), MediaKind::Audio),  // peer 1 audio
             (mid("3"), MediaKind::Video),  // peer 1 video
-            (mid("4"), MediaKind::Video),  // peer 1 screen
-            (mid("5"), MediaKind::Audio),  // peer 2 audio
-            (mid("6"), MediaKind::Video),  // peer 2 video
+            (mid("4"), MediaKind::Audio),  // peer 2 audio
+            (mid("5"), MediaKind::Video),  // peer 2 video
         ];
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
         let own_a = Some(mid("0"));
@@ -1212,7 +1216,7 @@ a=recvonly\r\n";
 
         assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_some());
         assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_some());
-        // Peer 3 — no free audio mid
+        // Peer 3 — no free audio/video mid
         assert!(get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_none());
     }
 
@@ -1291,19 +1295,27 @@ a=recvonly\r\n";
     // ── Multiple peers with screen mids ─────────────────────────────
 
     #[test]
-    fn test_two_peers_both_get_screen_mids() {
-        let all_mids = make_mids(); // 8 mids: own(a,v) + peer1(a,v,screen) + peer2(a,v,screen)
+    fn test_two_peers_get_screen_mids_lazily() {
+        let all_mids = make_mids(); // 8 mids: own(a,v) + 3 peer pairs
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
+        // Initial creation — screen_mid is None (lazy).
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+
+        assert!(slots.get(&pid(1)).unwrap().screen_mid.is_none());
+        assert!(slots.get(&pid(2)).unwrap().screen_mid.is_none());
+
+        // Second access triggers lazy screen_mid upgrade.
         get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
         get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
 
         let s1 = slots.get(&pid(1)).unwrap();
         let s2 = slots.get(&pid(2)).unwrap();
 
-        // Both should have screen mids
+        // Both should now have screen mids
         assert!(s1.screen_mid.is_some());
         assert!(s2.screen_mid.is_some());
         // Screen mids should be different
@@ -1479,9 +1491,9 @@ a=mid:3\r\n";
     // ── Concurrent slots with screen mid contention ─────────────────
 
     #[test]
-    fn test_three_peers_limited_screen_mids() {
-        // 3 peer slots: each needs audio+video. Extra video mids go to screen.
-        // Peer 1 gets screen greedily from the extra video mids available at creation time.
+    fn test_three_peers_get_screen_mids_lazily() {
+        // 3 peer slots: each needs audio+video. Extra video mids are available
+        // for screen but are NOT pre-assigned — only assigned on second access.
         let all_mids = vec![
             (mid("0"), MediaKind::Audio),   // own audio
             (mid("1"), MediaKind::Video),   // own video
@@ -1499,14 +1511,20 @@ a=mid:3\r\n";
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
+        // First creation — no screen_mid.
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        assert_eq!(slots.len(), 3, "all 3 peers should get slots");
+        assert!(slots.values().all(|s| s.screen_mid.is_none()), "no screen mids pre-assigned");
+
+        // Second access triggers lazy screen_mid upgrade.
         get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
         get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
         get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
 
-        assert_eq!(slots.len(), 3, "all 3 peers should get slots");
-        // All peers should get screen mids (one each from the 3 extra video mids)
         let screens: Vec<_> = slots.values().filter(|s| s.screen_mid.is_some()).collect();
-        assert_eq!(screens.len(), 3, "each peer should get a screen mid");
+        assert_eq!(screens.len(), 3, "each peer should get a screen mid after lazy upgrade");
     }
 
     // ── needs_renegotiation ───────────────────────────────────────────
