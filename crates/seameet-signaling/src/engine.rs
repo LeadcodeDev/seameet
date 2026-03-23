@@ -411,7 +411,10 @@ pub async fn dispatch(
             }
         }
         SdpMessage::ScreenShareStarted { room_id, .. }
-        | SdpMessage::ScreenShareStopped { room_id, .. } => {
+        | SdpMessage::ScreenShareStopped { room_id, .. }
+        | SdpMessage::MuteAudio { room_id, .. }
+        | SdpMessage::UnmuteAudio { room_id, .. }
+        | SdpMessage::VideoConfigChanged { room_id, .. } => {
             let st = state.read().await;
             let peers = st.peers(room_id, &pid);
             drop(st);

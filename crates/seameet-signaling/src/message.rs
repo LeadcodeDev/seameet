@@ -112,6 +112,33 @@ pub enum SdpMessage {
         /// Track identifier that was stopped.
         track_id: u32,
     },
+    /// Emitted by the client when they mute their microphone.
+    MuteAudio {
+        /// The participant muting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they unmute their microphone.
+    UnmuteAudio {
+        /// The participant unmuting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they change video settings.
+    VideoConfigChanged {
+        /// The participant changing config.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+        /// Video width in pixels.
+        width: u32,
+        /// Video height in pixels.
+        height: u32,
+        /// Frames per second.
+        fps: u32,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -134,7 +161,10 @@ impl SdpMessage {
             | Self::PeerJoined { room_id, .. }
             | Self::PeerLeft { room_id, .. }
             | Self::ScreenShareStarted { room_id, .. }
-            | Self::ScreenShareStopped { room_id, .. } => Some(room_id),
+            | Self::ScreenShareStopped { room_id, .. }
+            | Self::MuteAudio { room_id, .. }
+            | Self::UnmuteAudio { room_id, .. }
+            | Self::VideoConfigChanged { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -293,5 +323,47 @@ mod tests {
         let json2 = serde_json::to_string(&msg2).expect("ser");
         let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
         assert_eq!(back2, msg2);
+    }
+
+    #[test]
+    fn test_mute_audio_serde() {
+        let msg = SdpMessage::MuteAudio {
+            from: id_a(),
+            room_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"mute_audio\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+
+        let msg2 = SdpMessage::UnmuteAudio {
+            from: id_a(),
+            room_id: "r1".into(),
+        };
+        let json2 = serde_json::to_string(&msg2).expect("ser");
+        assert!(json2.contains("\"type\":\"unmute_audio\""));
+        let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
+        assert_eq!(back2, msg2);
+        assert_eq!(msg2.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_video_config_changed_serde() {
+        let msg = SdpMessage::VideoConfigChanged {
+            from: id_a(),
+            room_id: "r1".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"video_config_changed\""));
+        assert!(json.contains("\"width\":1920"));
+        assert!(json.contains("\"height\":1080"));
+        assert!(json.contains("\"fps\":30"));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
     }
 }
