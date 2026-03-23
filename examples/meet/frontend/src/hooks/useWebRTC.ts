@@ -139,7 +139,12 @@ export function useWebRTC({
   const createOfferToServer = useCallback(async (existingPeers: string[], displayNames?: Record<string, string>) => {
     console.log(`[WebRTC] createOfferToServer, existingPeers: ${existingPeers.length}, localStream: ${!!localStreamRef.current}`)
 
-    const pc = new RTCPeerConnection({ iceServers: [] })
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ],
+    })
     pcRef.current = pc
 
     pc.onicecandidate = (evt) => {
@@ -338,24 +343,34 @@ export function useWebRTC({
     const track = screenStream.getVideoTracks()[0]
     if (!track) return
     // Use addTransceiver (NOT addTrack) to guarantee a NEW transceiver.
-    // addTrack can reuse existing transceivers created for remote peers,
-    // which would send screen data on the wrong mid.
     const transceiver = pc.addTransceiver(track, { direction: 'sendrecv' })
     screenTransceiverRef.current = transceiver
     setLocalScreenStream(screenStream)
-    await renegotiate()
+    // Send signal BEFORE renegotiation so the SFU sets screen_share_active
+    // before processing the renegotiation that adds the screen mid.
+    // WS messages are ordered, so ScreenShareActive arrives at run_media
+    // before RenegotiationOffer — the new video mid is then correctly
+    // identified as own_screen_mid.
     signalingRef.current.send({
       type: 'screen_share_started',
       from: participantIdRef.current,
       room_id: roomIdRef.current,
       track_id: 0,
     })
+    await renegotiate()
     console.log('[WebRTC] screen share started')
   }, [renegotiate])
 
   const stopScreenShare = useCallback(async () => {
     const pc = pcRef.current
     if (!pc) return
+    // Send signal BEFORE renegotiation for same ordering reason.
+    signalingRef.current.send({
+      type: 'screen_share_stopped',
+      from: participantIdRef.current,
+      room_id: roomIdRef.current,
+      track_id: 0,
+    })
     const transceiver = screenTransceiverRef.current
     if (transceiver) {
       transceiver.sender.track?.stop()
@@ -367,12 +382,6 @@ export function useWebRTC({
     screenTransceiverRef.current = null
     setLocalScreenStream(null)
     await renegotiate()
-    signalingRef.current.send({
-      type: 'screen_share_stopped',
-      from: participantIdRef.current,
-      room_id: roomIdRef.current,
-      track_id: 0,
-    })
     console.log('[WebRTC] screen share stopped')
   }, [renegotiate])
 

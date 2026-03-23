@@ -15,7 +15,7 @@ export interface UseSignalingReturn {
   sendIceCandidate: (from: string, to: string, roomId: string, candidate: RTCIceCandidate) => void
 }
 
-const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001'
+const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.hostname}:3001`
 
 export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignalingReturn {
   const wsUrl = url ?? DEFAULT_WS_URL

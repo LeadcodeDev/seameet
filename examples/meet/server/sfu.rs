@@ -506,18 +506,37 @@ async fn drain_outputs(
                     *rtp_rx_count += 1;
                     let is_audio_pt = *pkt.header.payload_type == own_audio_pt;
 
-                    // Identify screen share by SSRC, not by mid lookup.
-                    // stream_rx(&ssrc) can return wrong mid after renegotiation,
-                    // so we track the camera SSRC instead: the first video SSRC
-                    // is always camera; any different video SSRC when screen share
-                    // is active must be the screen track.
+                    // Identify screen share by SSRC: first video SSRC = camera,
+                    // any different video SSRC (when screen mid set) = screen.
                     let ssrc_raw: u32 = (*pkt.header.ssrc).into();
                     if !is_audio_pt && camera_video_ssrc.is_none() {
                         *camera_video_ssrc = Some(ssrc_raw);
+                        info!(participant = %pid, ssrc_raw, "camera video SSRC recorded");
                     }
                     let is_screen = !is_audio_pt
                         && own_screen_mid.is_some()
                         && camera_video_ssrc.map_or(false, |cam| ssrc_raw != cam);
+                    // Log screen detection for first occurrences
+                    if is_screen && *rtp_rx_count <= 5000 {
+                        info!(
+                            participant = %pid,
+                            ssrc_raw,
+                            camera_ssrc = ?camera_video_ssrc,
+                            ?own_screen_mid,
+                            "SCREEN RTP detected"
+                        );
+                    }
+                    if !is_audio_pt && !is_screen && own_screen_mid.is_some() {
+                        if *rtp_rx_count % 200 == 0 {
+                            info!(
+                                participant = %pid,
+                                ssrc_raw,
+                                camera_ssrc = ?camera_video_ssrc,
+                                ?own_screen_mid,
+                                "video RTP but NOT screen (same SSRC as camera)"
+                            );
+                        }
+                    }
 
                     if *rtp_rx_count <= 5 || *rtp_rx_count % 500 == 0 {
                         info!(
@@ -575,7 +594,14 @@ async fn drain_outputs(
                         *ice_connected = false;
                     }
                 }
-                Event::RawPacket(_) => {}
+                Event::RawPacket(_) => {
+                    // Log raw packets — if screen RTP ends up here instead of
+                    // Event::RtpPacket, it means str0m doesn't recognise the SSRC.
+                    *rtp_rx_count += 1;
+                    if *rtp_rx_count <= 20 || *rtp_rx_count % 1000 == 0 {
+                        info!(participant = %pid, total = *rtp_rx_count, "RawPacket (unknown SSRC?)");
+                    }
+                }
                 _ => {}
             },
             Ok(Output::Timeout(t)) => return Some(t),
