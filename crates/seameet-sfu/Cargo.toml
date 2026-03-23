@@ -1,0 +1,19 @@
+[package]
+name = "seameet-sfu"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+seameet-core      = { path = "../seameet-core" }
+seameet-signaling = { path = "../seameet-signaling", default-features = false }
+tokio             = { workspace = true }
+str0m             = { workspace = true }
+serde_json        = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tokio             = { workspace = true }
+uuid              = { workspace = true }
+serde             = { workspace = true }
+seameet-signaling = { path = "../seameet-signaling", features = ["tungstenite"] }

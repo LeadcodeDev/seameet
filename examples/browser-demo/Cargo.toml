@@ -8,7 +8,7 @@ name = "browser-demo"
 path = "src/main.rs"
 
 [dependencies]
-seameet             = { path = "../../crates/seameet" }
+seameet             = { path = "../../crates/seameet", features = ["tungstenite"] }
 tokio               = { workspace = true }
 tokio-tungstenite   = "0.21"
 tracing             = { workspace = true }

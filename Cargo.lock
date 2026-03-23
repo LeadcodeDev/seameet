@@ -745,16 +745,10 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 name = "meet"
 version = "0.1.0"
 dependencies = [
- "futures-util",
  "seameet",
- "serde",
- "serde_json",
- "str0m",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1131,6 +1125,7 @@ dependencies = [
  "seameet-core",
  "seameet-pipeline",
  "seameet-rtp",
+ "seameet-sfu",
  "seameet-signaling",
  "tokio",
  "tokio-stream",
@@ -1188,6 +1183,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "seameet-sfu"
+version = "0.1.0"
+dependencies = [
+ "seameet-core",
+ "seameet-signaling",
+ "serde",
+ "serde_json",
+ "str0m",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

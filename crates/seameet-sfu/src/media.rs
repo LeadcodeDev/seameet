@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use seameet::{ParticipantId, SdpMessage};
+use seameet_core::ParticipantId;
+use seameet_signaling::SdpMessage;
 use str0m::change::SdpOffer;
 use str0m::media::{MediaKind, Mid};
 use str0m::net::Protocol;
@@ -980,7 +981,7 @@ pub async fn local_ip() -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seameet::ParticipantId;
+    use seameet_core::ParticipantId;
     use str0m::media::{MediaKind, Mid};
 
     fn pid(n: u128) -> ParticipantId {
