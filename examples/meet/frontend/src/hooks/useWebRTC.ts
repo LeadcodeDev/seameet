@@ -30,6 +30,8 @@ export interface RemotePeer {
   stream: MediaStream
   audioMid: string | null
   videoMid: string | null
+  audioMuted: boolean
+  videoMuted: boolean
   screenTransceiver: RTCRtpTransceiver | null
   screenStream: MediaStream | null
 }
@@ -122,6 +124,8 @@ export function useWebRTC({
       stream,
       audioMid,
       videoMid,
+      audioMuted: false,
+      videoMuted: false,
       screenTransceiver: null,
       screenStream: null,
     }
@@ -371,6 +375,44 @@ export function useWebRTC({
     if (data.type === 'peer_left') {
       console.log(`[WebRTC] peer_left: ${data.participant.slice(0, 8)}`)
       removeRemotePeer(data.participant)
+      return
+    }
+
+    if (data.type === 'mute_audio') {
+      const info = remotePeersRef.current.get(data.from)
+      if (info) { info.audioMuted = true; updateRemotePeersState() }
+      return
+    }
+
+    if (data.type === 'unmute_audio') {
+      const info = remotePeersRef.current.get(data.from)
+      if (info) { info.audioMuted = false; updateRemotePeersState() }
+      return
+    }
+
+    if (data.type === 'mute_video') {
+      const info = remotePeersRef.current.get(data.from)
+      if (info) { info.videoMuted = true; updateRemotePeersState() }
+      return
+    }
+
+    if (data.type === 'unmute_video') {
+      const info = remotePeersRef.current.get(data.from)
+      if (info) { info.videoMuted = false; updateRemotePeersState() }
+      return
+    }
+
+    if (data.type === 'request_renegotiation') {
+      const pc = pcRef.current
+      if (!pc) return
+      const slots = data.needed_slots
+      for (let i = 0; i < slots; i++) {
+        transceiverPoolRef.current.push({
+          audioTransceiver: pc.addTransceiver('audio', { direction: 'sendrecv' }),
+          videoTransceiver: pc.addTransceiver('video', { direction: 'sendrecv' }),
+        })
+      }
+      await renegotiate()
       return
     }
 

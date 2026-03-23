@@ -87,6 +87,38 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     }
   }, [signaling.state])
 
+  const handleToggleAudio = useCallback(() => {
+    const willBeMuted = media.audioEnabled
+    media.toggleAudio()
+    if (willBeMuted) {
+      signaling.send({ type: 'mute_audio', from: participantId, room_id: roomId })
+    } else {
+      signaling.send({ type: 'unmute_audio', from: participantId, room_id: roomId })
+    }
+  }, [media, signaling, participantId, roomId])
+
+  const handleToggleVideo = useCallback(() => {
+    const willBeMuted = media.videoEnabled
+    media.toggleVideo()
+    if (willBeMuted) {
+      signaling.send({ type: 'mute_video', from: participantId, room_id: roomId })
+    } else {
+      signaling.send({ type: 'unmute_video', from: participantId, room_id: roomId })
+    }
+  }, [media, signaling, participantId, roomId])
+
+  const handleUpdateVideoSettings = useCallback((settings: VideoSettings) => {
+    media.updateVideoSettings(settings)
+    signaling.send({
+      type: 'video_config_changed',
+      from: participantId,
+      room_id: roomId,
+      width: settings.width,
+      height: settings.height,
+      fps: settings.frameRate,
+    })
+  }, [media, signaling, participantId, roomId])
+
   const handleStartScreenShare = useCallback(async () => {
     const stream = await media.startScreenShare()
     await webrtc.startScreenShare(stream)
@@ -126,9 +158,9 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     audioEnabled: media.audioEnabled,
     videoEnabled: media.videoEnabled,
     videoSettings: media.videoSettings,
-    toggleAudio: media.toggleAudio,
-    toggleVideo: media.toggleVideo,
-    updateVideoSettings: media.updateVideoSettings,
+    toggleAudio: handleToggleAudio,
+    toggleVideo: handleToggleVideo,
+    updateVideoSettings: handleUpdateVideoSettings,
     startScreenShare: handleStartScreenShare,
     stopScreenShare: handleStopScreenShare,
     localScreenStream: webrtc.localScreenStream,

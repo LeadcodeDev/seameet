@@ -126,6 +126,20 @@ pub enum SdpMessage {
         /// The room this applies to.
         room_id: String,
     },
+    /// Emitted by the client when they mute their camera.
+    MuteVideo {
+        /// The participant muting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they unmute their camera.
+    UnmuteVideo {
+        /// The participant unmuting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
     /// Emitted by the client when they change video settings.
     VideoConfigChanged {
         /// The participant changing config.
@@ -171,6 +185,8 @@ impl SdpMessage {
             | Self::ScreenShareStopped { room_id, .. }
             | Self::MuteAudio { room_id, .. }
             | Self::UnmuteAudio { room_id, .. }
+            | Self::MuteVideo { room_id, .. }
+            | Self::UnmuteVideo { room_id, .. }
             | Self::VideoConfigChanged { room_id, .. }
             | Self::RequestRenegotiation { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,

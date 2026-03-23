@@ -416,6 +416,8 @@ pub async fn dispatch(
         | SdpMessage::ScreenShareStopped { room_id, .. }
         | SdpMessage::MuteAudio { room_id, .. }
         | SdpMessage::UnmuteAudio { room_id, .. }
+        | SdpMessage::MuteVideo { room_id, .. }
+        | SdpMessage::UnmuteVideo { room_id, .. }
         | SdpMessage::VideoConfigChanged { room_id, .. } => {
             let st = state.read().await;
             let peers = st.peers(room_id, &pid);

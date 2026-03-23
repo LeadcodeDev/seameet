@@ -13,6 +13,9 @@ export interface UseSignalingReturn {
   sendOffer: (from: string, roomId: string, sdp: string) => void
   sendAnswer: (from: string, to: string, roomId: string, sdp: string) => void
   sendIceCandidate: (from: string, to: string, roomId: string, candidate: RTCIceCandidate) => void
+  sendMuteAudio: (from: string, roomId: string) => void
+  sendUnmuteAudio: (from: string, roomId: string) => void
+  sendVideoConfig: (from: string, roomId: string, width: number, height: number, fps: number) => void
 }
 
 const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.hostname}:3001`
@@ -129,5 +132,17 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     })
   }, [send])
 
-  return { send, state, join, sendOffer, sendAnswer, sendIceCandidate }
+  const sendMuteAudio = useCallback((from: string, roomId: string) => {
+    send({ type: 'mute_audio', from, room_id: roomId })
+  }, [send])
+
+  const sendUnmuteAudio = useCallback((from: string, roomId: string) => {
+    send({ type: 'unmute_audio', from, room_id: roomId })
+  }, [send])
+
+  const sendVideoConfig = useCallback((from: string, roomId: string, width: number, height: number, fps: number) => {
+    send({ type: 'video_config_changed', from, room_id: roomId, width, height, fps })
+  }, [send])
+
+  return { send, state, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig }
 }
