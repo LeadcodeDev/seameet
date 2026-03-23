@@ -1,5 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 
+export interface VideoSettings {
+  width: number
+  height: number
+  frameRate: number
+}
+
+const DEFAULT_VIDEO_SETTINGS: VideoSettings = { width: 640, height: 480, frameRate: 24 }
+
 export interface UseMediaDevicesOptions {
   onScreenShareEnded?: () => void
 }
@@ -8,8 +16,10 @@ export interface UseMediaDevicesReturn {
   localStream: MediaStream | null
   audioEnabled: boolean
   videoEnabled: boolean
+  videoSettings: VideoSettings
   toggleAudio: () => void
   toggleVideo: () => void
+  updateVideoSettings: (settings: VideoSettings) => void
   startScreenShare: () => Promise<MediaStream>
   stopScreenShare: () => void
   screenStream: MediaStream | null
@@ -20,6 +30,7 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
+  const [videoSettings, setVideoSettings] = useState<VideoSettings>(DEFAULT_VIDEO_SETTINGS)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
   const [error, setError] = useState<string | null>(null)
   const mountedRef = useRef(true)
@@ -34,7 +45,11 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
-          video: true,
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 24, max: 30 },
+          },
         })
         if (mountedRef.current) {
           setLocalStream(stream)
@@ -72,6 +87,20 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
     setVideoEnabled(enabled)
   }, [localStream, videoEnabled])
 
+  const updateVideoSettings = useCallback((settings: VideoSettings) => {
+    setVideoSettings(settings)
+    if (localStream) {
+      const videoTrack = localStream.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.applyConstraints({
+          width: { ideal: settings.width },
+          height: { ideal: settings.height },
+          frameRate: { ideal: settings.frameRate },
+        })
+      }
+    }
+  }, [localStream])
+
   const startScreenShare = useCallback(async () => {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: true })
     setScreenStream(stream)
@@ -94,8 +123,10 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
     localStream,
     audioEnabled,
     videoEnabled,
+    videoSettings,
     toggleAudio,
     toggleVideo,
+    updateVideoSettings,
     startScreenShare,
     stopScreenShare,
     screenStream,

@@ -1,6 +1,18 @@
 import { useRef, useState, useEffect, useCallback } from 'react'
 import type { SignalingMessage } from '@/types'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
+import type { VideoSettings } from '@/hooks/useMediaDevices'
+
+const BITRATE_BY_HEIGHT: Record<number, number> = {
+  360: 500_000,
+  480: 800_000,
+  720: 1_500_000,
+  1080: 3_000_000,
+}
+
+function getBitrateForHeight(height: number): number {
+  return BITRATE_BY_HEIGHT[height] ?? 800_000
+}
 
 export interface RemotePeer {
   id: string
@@ -17,6 +29,7 @@ export interface UseWebRTCOptions {
   roomId: string
   localStream: MediaStream | null
   signaling: UseSignalingReturn
+  videoSettings: VideoSettings
 }
 
 export interface UseWebRTCReturn {
@@ -33,6 +46,7 @@ export function useWebRTC({
   roomId,
   localStream,
   signaling,
+  videoSettings,
 }: UseWebRTCOptions): UseWebRTCReturn {
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const remotePeersRef = useRef<Map<string, RemotePeer>>(new Map())
@@ -56,10 +70,13 @@ export function useWebRTC({
   const localStreamRef = useRef(localStream)
   const signalingRef = useRef(signaling)
 
+  const videoSettingsRef = useRef(videoSettings)
+
   participantIdRef.current = participantId
   roomIdRef.current = roomId
   localStreamRef.current = localStream
   signalingRef.current = signaling
+  videoSettingsRef.current = videoSettings
 
   const updateRemotePeersState = useCallback(() => {
     setRemotePeers(new Map(remotePeersRef.current))
@@ -403,6 +420,25 @@ export function useWebRTC({
     messageQueueRef.current.push(msg)
     drainQueue()
   }, [drainQueue])
+
+  // Apply sender encoding parameters on connection and when videoSettings change
+  useEffect(() => {
+    if (connectionState !== 'connected') return
+    const pc = pcRef.current
+    if (!pc) return
+    try {
+      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video')
+      if (!videoSender) return
+      const params = videoSender.getParameters()
+      if (params.encodings.length > 0) {
+        params.encodings[0].maxBitrate = getBitrateForHeight(videoSettings.height)
+        params.encodings[0].maxFramerate = videoSettings.frameRate
+        videoSender.setParameters(params)
+      }
+    } catch (e) {
+      console.warn('[WebRTC] setParameters failed:', e)
+    }
+  }, [videoSettings, connectionState])
 
   // Cleanup on unmount
   useEffect(() => {

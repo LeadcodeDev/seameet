@@ -34,6 +34,7 @@ pub struct ForwardedMedia {
     pub is_audio: bool,
     pub is_screen: bool,
     pub source_pid: ParticipantId,
+    pub wallclock: Instant,
 }
 
 pub struct SourceSlot {
@@ -377,7 +378,7 @@ pub async fn run_media(
             _ = tokio::time::sleep(wait) => {
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
 
-                if media_started && last_pli.elapsed() >= Duration::from_secs(2) {
+                if media_started && last_pli.elapsed() >= Duration::from_secs(5) {
                     last_pli = Instant::now();
                     if let Some(mid) = own_video_mid {
                         let mut api = rtc.direct_api();
@@ -551,6 +552,7 @@ async fn drain_outputs(
                         );
                     }
 
+                    let now = Instant::now();
                     let forward = ForwardedMedia {
                         pt: *pkt.header.payload_type,
                         seq_no: (*pkt.seq_no).into(),
@@ -560,6 +562,7 @@ async fn drain_outputs(
                         is_audio: is_audio_pt,
                         is_screen,
                         source_pid: *pid,
+                        wallclock: now,
                     };
 
                     let p = peers.read().await;
@@ -574,9 +577,13 @@ async fn drain_outputs(
                                 is_audio: forward.is_audio,
                                 is_screen: forward.is_screen,
                                 source_pid: forward.source_pid,
+                                wallclock: forward.wallclock,
                             }));
                         }
                     }
+                }
+                Event::EgressBitrateEstimate(bwe) => {
+                    info!(participant = %pid, bitrate = ?bwe, "BWE estimate");
                 }
                 Event::KeyframeRequest(_) => {
                     let p = peers.read().await;
@@ -764,7 +771,7 @@ fn write_forwarded_rtp(
         pt.into(),
         current_seq.into(),
         media.time,
-        Instant::now(),
+        media.wallclock,
         media.marker,
         ExtensionValues::default(),
         false,

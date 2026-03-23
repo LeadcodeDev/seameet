@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSignaling } from '@/hooks/useSignaling'
-import { useMediaDevices } from '@/hooks/useMediaDevices'
+import { useMediaDevices, type VideoSettings } from '@/hooks/useMediaDevices'
 import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
 import type { SignalingMessage } from '@/types'
 
@@ -13,8 +13,10 @@ interface CallContextValue {
   remotePeers: Map<string, RemotePeer>
   audioEnabled: boolean
   videoEnabled: boolean
+  videoSettings: VideoSettings
   toggleAudio: () => void
   toggleVideo: () => void
+  updateVideoSettings: (settings: VideoSettings) => void
   startScreenShare: () => Promise<void>
   stopScreenShare: () => Promise<void>
   localScreenStream: MediaStream | null
@@ -59,6 +61,7 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     roomId,
     localStream: media.localStream,
     signaling,
+    videoSettings: media.videoSettings,
   })
 
   // Wire WebRTC handler — updated every render (safe, no side effects)
@@ -122,8 +125,10 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     remotePeers: webrtc.remotePeers,
     audioEnabled: media.audioEnabled,
     videoEnabled: media.videoEnabled,
+    videoSettings: media.videoSettings,
     toggleAudio: media.toggleAudio,
     toggleVideo: media.toggleVideo,
+    updateVideoSettings: media.updateVideoSettings,
     startScreenShare: handleStartScreenShare,
     stopScreenShare: handleStopScreenShare,
     localScreenStream: webrtc.localScreenStream,

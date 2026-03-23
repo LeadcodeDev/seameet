@@ -8,6 +8,7 @@ use seameet::{
 };
 use str0m::change::SdpOffer;
 use str0m::net::Protocol;
+use str0m::bwe::Bitrate;
 use str0m::{Candidate, Output, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -179,7 +180,8 @@ impl SignalingHooks for SfuHooks {
 
                 let mut config = RtcConfig::new()
                     .set_rtp_mode(true)
-                    .enable_raw_packets(true);
+                    .enable_raw_packets(true)
+                    .enable_bwe(Some(Bitrate::kbps(800)));
                 {
                     let cc = config.codec_config();
                     cc.enable_h264(false);
