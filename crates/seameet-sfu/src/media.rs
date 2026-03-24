@@ -35,6 +35,11 @@ pub enum PeerCmd {
     PeerCountChanged {
         remote_peer_count: usize,
     },
+    /// A remote peer left — clear its stale source slot so a reconnect
+    /// gets a fresh slot with correct MIDs.
+    PeerLeft {
+        pid: ParticipantId,
+    },
 }
 
 pub struct ForwardedMedia {
@@ -64,6 +69,9 @@ pub struct SourceSlot {
 pub struct SfuPeer {
     pub cmd_tx: mpsc::UnboundedSender<PeerCmd>,
     pub ws_tx: mpsc::UnboundedSender<String>,
+    /// Monotonic generation set when the media task is spawned.
+    /// Used to avoid removing a replacement entry on task exit.
+    pub gen: u64,
 }
 
 pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
@@ -127,6 +135,7 @@ pub async fn run_media(
     initial_mids: Vec<(Mid, MediaKind)>,
     ws_tx: mpsc::UnboundedSender<String>,
     room_id: String,
+    my_gen: u64,
 ) {
     let mut own_audio_mid: Option<Mid> = None;
     let mut own_video_mid: Option<Mid> = None;
@@ -148,6 +157,10 @@ pub async fn run_media(
     let mut rtp_rx_count: u64 = 0;
     let mut rtp_tx_count: u64 = 0;
     let mut pending_media: HashMap<ParticipantId, Vec<ForwardedMedia>> = HashMap::new();
+    let mut source_keyframe_pending: HashMap<ParticipantId, Instant> = HashMap::new();
+    // Track the high-water-mark sequence per mid so that when a source leaves
+    // and another reuses the same mid, sequences continue monotonically.
+    let mut mid_seq_watermark: HashMap<Mid, u64> = HashMap::new();
 
     // Process mids collected right after accept_offer (before ICE/DTLS).
     for (mid, kind) in &initial_mids {
@@ -302,6 +315,7 @@ pub async fn run_media(
                             || get_or_create_slot(
                                 m.source_pid, &mut source_slots,
                                 &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+                                &mid_seq_watermark,
                             ).is_some();
 
                         if !has_slot {
@@ -316,6 +330,7 @@ pub async fn run_media(
                         write_forwarded_rtp(
                             &mut rtc, &m, &mut source_slots, &mut rtp_tx_count,
                             &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+                            &mid_seq_watermark,
                         );
                         // Request keyframe when we first create a slot OR
                         // when screen_mid was just set (initial keyframe was likely missed).
@@ -323,10 +338,18 @@ pub async fn run_media(
                         let gained_screen_mid = !had_screen_mid && source_slots.get(&m.source_pid)
                             .and_then(|s| s.screen_mid).is_some();
                         if created_new || gained_screen_mid {
+                            info!(
+                                participant = %pid,
+                                source = %m.source_pid,
+                                created_new, gained_screen_mid,
+                                "requesting keyframe for new source"
+                            );
                             let p = peers.read().await;
                             if let Some(peer) = p.get(&m.source_pid) {
                                 let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
                             }
+                            // Track per-source keyframe burst
+                            source_keyframe_pending.insert(m.source_pid, Instant::now());
                         }
                     }
                     Some(PeerCmd::RequestKeyframe) => {
@@ -386,6 +409,7 @@ pub async fn run_media(
                                         write_forwarded_rtp(
                                             &mut rtc, m, &mut source_slots, &mut rtp_tx_count,
                                             &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+                                            &mid_seq_watermark,
                                         );
                                         flushed_count += 1;
                                     }
@@ -463,6 +487,28 @@ pub async fn run_media(
                         }
                         info!(participant = %pid, peer = %peer_pid, muted = is_muted, "peer mute state updated");
                     }
+                    Some(PeerCmd::PeerLeft { pid: left_pid }) => {
+                        if let Some(slot) = source_slots.remove(&left_pid) {
+                            // Preserve sequence watermarks so a new source reusing
+                            // the same mid continues with monotonic seq numbers.
+                            mid_seq_watermark.insert(slot.audio_mid, slot.audio_tx_seq);
+                            mid_seq_watermark.insert(slot.video_mid, slot.video_tx_seq);
+                            if let Some(sm) = slot.screen_mid {
+                                mid_seq_watermark.insert(sm, slot.screen_tx_seq);
+                            }
+                            info!(
+                                participant = %pid,
+                                left = %left_pid,
+                                ?slot.audio_mid, ?slot.video_mid,
+                                audio_seq = slot.audio_tx_seq,
+                                video_seq = slot.video_tx_seq,
+                                "cleared source slot, saved seq watermarks"
+                            );
+                        }
+                        pending_media.remove(&left_pid);
+                        muted_peers.remove(&left_pid);
+                        source_keyframe_pending.remove(&left_pid);
+                    }
                     Some(PeerCmd::PeerCountChanged { remote_peer_count }) => {
                         let own_count = 2 + if own_screen_mid.is_some() { 1 } else { 0 };
                         if let Some(deficit) = needs_renegotiation(
@@ -511,11 +557,37 @@ pub async fn run_media(
                         }
                     }
                 }
+
+                // Burst keyframes for newly discovered sources (retry for 3s)
+                if !source_keyframe_pending.is_empty() {
+                    let p = peers.read().await;
+                    source_keyframe_pending.retain(|source_pid, since| {
+                        if since.elapsed() < Duration::from_secs(3) {
+                            if let Some(peer) = p.get(source_pid) {
+                                let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
             }
         }
     }
 
-    peers.write().await.remove(&pid);
+    // Only remove from the peers map if the entry still belongs to this
+    // media task (same generation).  When a participant reconnects, the
+    // HashMap is updated with a new SfuPeer that has a higher generation;
+    // removing it here would destroy the replacement session.
+    {
+        let mut p = peers.write().await;
+        if let Some(peer) = p.get(&pid) {
+            if peer.gen == my_gen {
+                p.remove(&pid);
+            }
+        }
+    }
     info!(participant = %pid, "media task ended");
 }
 
@@ -769,6 +841,7 @@ fn get_or_create_slot<'a>(
     own_screen_mid: Option<Mid>,
     own_audio_pt: u8,
     own_video_pt: u8,
+    mid_seq_watermark: &HashMap<Mid, u64>,
 ) -> Option<&'a mut SourceSlot> {
     if source_slots.contains_key(&source_pid) {
         // Update screen_mid if it was previously None and a free video mid is now available.
@@ -839,14 +912,19 @@ fn get_or_create_slot<'a>(
         "lazy-created source slot"
     );
 
+    // Seed sequence counters from watermarks to maintain monotonicity
+    // when a new source reuses a mid previously used by a departed peer.
+    let audio_seq = mid_seq_watermark.get(&a_mid).copied().unwrap_or(0);
+    let video_seq = mid_seq_watermark.get(&v_mid).copied().unwrap_or(0);
+
     source_slots.insert(
         source_pid,
         SourceSlot {
             audio_mid: a_mid,
             video_mid: v_mid,
             screen_mid,
-            audio_tx_seq: 0,
-            video_tx_seq: 0,
+            audio_tx_seq: audio_seq,
+            video_tx_seq: video_seq,
             screen_tx_seq: 0,
             audio_pt: own_audio_pt,
             video_pt: own_video_pt,
@@ -866,11 +944,14 @@ fn write_forwarded_rtp(
     own_screen_mid: Option<Mid>,
     own_audio_pt: u8,
     own_video_pt: u8,
+    mid_seq_watermark: &HashMap<Mid, u64>,
 ) {
     let Some(slot) = get_or_create_slot(
         media.source_pid, source_slots,
         all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
+        mid_seq_watermark,
     ) else {
+        warn!(source = %media.source_pid, "write_forwarded_rtp: no slot");
         return;
     };
 
@@ -888,16 +969,34 @@ fn write_forwarded_rtp(
 
     let mut api = rtc.direct_api();
     let Some(stream_tx) = api.stream_tx_by_mid(mid, None) else {
-        warn!(?mid, "TX stream not found for mid");
+        // Log all known mids and which ones have TX streams
+        drop(api);
+        let mut has_tx = Vec::new();
+        let mut no_tx = Vec::new();
+        let mut api2 = rtc.direct_api();
+        for (m, _) in all_mids.iter() {
+            if api2.stream_tx_by_mid(*m, None).is_some() {
+                has_tx.push(*m);
+            } else {
+                no_tx.push(*m);
+            }
+        }
+        warn!(
+            ?mid, source = %media.source_pid,
+            ?has_tx, ?no_tx,
+            "TX stream not found for mid — RTP dropped"
+        );
         return;
     };
 
     *rtp_tx_count += 1;
-    if *rtp_tx_count <= 5 || *rtp_tx_count % 500 == 0 {
+    if *rtp_tx_count <= 20 || *rtp_tx_count % 500 == 0 {
         info!(
             source = %media.source_pid,
             ?mid, pt, seq = current_seq,
             total = *rtp_tx_count,
+            is_audio = media.is_audio,
+            is_screen = media.is_screen,
             "forwarding RTP"
         );
     }
@@ -999,6 +1098,10 @@ mod tests {
 
     fn mid(s: &str) -> Mid {
         Mid::from(s)
+    }
+
+    fn no_watermarks() -> HashMap<Mid, u64> {
+        HashMap::new()
     }
 
     // ── parse_mids_from_sdp ─────────────────────────────────────────
@@ -1113,6 +1216,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
+            &no_watermarks(),
         );
         assert!(slot.is_some());
         let slot = slot.unwrap();
@@ -1130,9 +1234,9 @@ a=recvonly\r\n";
         let own_video = Some(mid("1"));
 
         // Create slot
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
         // Get same slot again
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96);
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
         assert!(slot.is_some());
         assert_eq!(slot.unwrap().audio_mid, mid("2")); // same mid
         assert_eq!(slots.len(), 1); // still just one slot
@@ -1145,8 +1249,8 @@ a=recvonly\r\n";
         let own_audio = Some(mid("0"));
         let own_video = Some(mid("1"));
 
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96);
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_audio, own_video, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
 
         assert_eq!(slots.len(), 2);
         let s1 = slots.get(&pid(1)).unwrap();
@@ -1165,6 +1269,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
+            &no_watermarks(),
         ).unwrap();
         // Screen mid is NOT pre-assigned — it's assigned lazily when screen
         // share media actually arrives.
@@ -1175,6 +1280,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
+            &no_watermarks(),
         ).unwrap();
         assert!(slot.screen_mid.is_some());
     }
@@ -1191,6 +1297,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
+            &no_watermarks(),
         );
         assert!(slot.is_none());
     }
@@ -1214,10 +1321,10 @@ a=recvonly\r\n";
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
-        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_some());
-        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_some());
+        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
+        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
         // Peer 3 — no free audio/video mid
-        assert!(get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_none());
+        assert!(get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_none());
     }
 
     // ── Slot reuse after peer removal ───────────────────────────────
@@ -1235,15 +1342,15 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
 
         // Peer 1 takes the only available slot
-        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_some());
+        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
         // No room for peer 2
-        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96).is_none());
+        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_none());
 
         // Remove peer 1 → frees mid("2") and mid("3")
         slots.remove(&pid(1));
 
         // Now peer 2 can get a slot
-        let slot = get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        let slot = get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
         assert!(slot.is_some());
         let slot = slot.unwrap();
         assert_eq!(slot.audio_mid, mid("2"));
@@ -1265,14 +1372,14 @@ a=recvonly\r\n";
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).unwrap();
         assert!(slot.screen_mid.is_none()); // no free video mid for screen
 
         // A new video mid becomes available (renegotiation added it)
         all_mids.push((mid("4"), MediaKind::Video));
 
         // Re-access the slot — should pick up screen mid
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).unwrap();
         assert_eq!(slot.screen_mid, Some(mid("4")));
     }
 
@@ -1286,7 +1393,7 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
         let own_s = Some(mid("6")); // reserve mid("6") as own screen
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, own_s, 111, 96).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, own_s, 111, 96, &no_watermarks()).unwrap();
         // Slot should NOT use mid("6") for its video or screen
         assert_ne!(slot.video_mid, mid("6"));
         assert_ne!(slot.screen_mid, Some(mid("6")));
@@ -1302,15 +1409,15 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
 
         // Initial creation — screen_mid is None (lazy).
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
 
         assert!(slots.get(&pid(1)).unwrap().screen_mid.is_none());
         assert!(slots.get(&pid(2)).unwrap().screen_mid.is_none());
 
         // Second access triggers lazy screen_mid upgrade.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
 
         let s1 = slots.get(&pid(1)).unwrap();
         let s2 = slots.get(&pid(2)).unwrap();
@@ -1336,7 +1443,7 @@ a=recvonly\r\n";
         let all_mids = make_mids();
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks()).unwrap();
         assert_eq!(slot.audio_tx_seq, 0);
         assert_eq!(slot.video_tx_seq, 0);
         assert_eq!(slot.screen_tx_seq, 0);
@@ -1349,13 +1456,13 @@ a=recvonly\r\n";
         let all_mids = make_mids();
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks()).unwrap();
         assert_eq!(slot.audio_pt, 111);
         assert_eq!(slot.video_pt, 96);
 
         // Different PTs
         slots.clear();
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 109, 100).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 109, 100, &no_watermarks()).unwrap();
         assert_eq!(slot.audio_pt, 109);
         assert_eq!(slot.video_pt, 100);
     }
@@ -1443,6 +1550,7 @@ a=mid:3\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
+            &no_watermarks(),
         );
         assert!(slot.is_none(), "should fail: free audio but no free video");
     }
@@ -1459,6 +1567,7 @@ a=mid:3\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
+            &no_watermarks(),
         );
         assert!(slot.is_none(), "should fail: free video but no free audio");
     }
@@ -1480,7 +1589,7 @@ a=mid:3\r\n";
         // Cycle: create → remove → create different peer → remove → create first again
         for round in 0..3 {
             let peer = pid(round as u128 + 1);
-            let slot = get_or_create_slot(peer, &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+            let slot = get_or_create_slot(peer, &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
             assert!(slot.is_some(), "round {round}: should get slot");
             assert_eq!(slots.len(), 1);
             slots.remove(&peer);
@@ -1512,16 +1621,16 @@ a=mid:3\r\n";
         let own_v = Some(mid("1"));
 
         // First creation — no screen_mid.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
         assert_eq!(slots.len(), 3, "all 3 peers should get slots");
         assert!(slots.values().all(|s| s.screen_mid.is_none()), "no screen mids pre-assigned");
 
         // Second access triggers lazy screen_mid upgrade.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
-        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
 
         let screens: Vec<_> = slots.values().filter(|s| s.screen_mid.is_some()).collect();
         assert_eq!(screens.len(), 3, "each peer should get a screen mid after lazy upgrade");
@@ -1536,7 +1645,7 @@ a=mid:3\r\n";
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96);
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
 
         // 2 remote peers, 1 slot used, 1 free pair available → no deficit
         assert_eq!(needs_renegotiation(&all_mids, 2, &slots, 2), None);
@@ -1570,5 +1679,520 @@ a=mid:3\r\n";
     fn test_media_buffer_cap() {
         // Verify the buffer cap constant is what we expect.
         assert_eq!(MEDIA_BUFFER_CAP, 500);
+    }
+
+    // ── E2E: write_forwarded_rtp with real Rtc ──────────────────────
+
+    use str0m::media::Direction;
+    use str0m::{RtcConfig};
+
+    /// Build a "browser" Rtc and a "server" Rtc, exchange SDP, and return
+    /// the server Rtc + parsed mids + negotiated PTs.
+    fn setup_server_rtc(
+        audio_count: usize,
+        video_count: usize,
+    ) -> (str0m::Rtc, Vec<(Mid, MediaKind)>, u8, u8) {
+        // Browser side: create offer with N audio + M video transceivers.
+        let mut browser = str0m::Rtc::builder()
+            .set_rtp_mode(true)
+            .enable_raw_packets(true)
+            .build();
+
+        let mut changes = browser.sdp_api();
+        for _ in 0..audio_count {
+            changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+        }
+        for _ in 0..video_count {
+            changes.add_media(MediaKind::Video, Direction::SendRecv, None, None);
+        }
+        let (offer, _pending) = changes.apply().unwrap();
+
+        // Patch the offer SDP directions (like the SFU does).
+        let offer_sdp = offer.to_sdp_string();
+        let patched_sdp = patch_sdp_directions(&offer_sdp);
+
+        // Server side: accept the offer.
+        let mut server = RtcConfig::new()
+            .set_rtp_mode(true)
+            .enable_raw_packets(true)
+            .build();
+
+        let offer = str0m::change::SdpOffer::from_sdp_string(&patched_sdp).unwrap();
+        let answer = server.sdp_api().accept_offer(offer).unwrap();
+        let answer_sdp = answer.to_sdp_string();
+
+        let mids = parse_mids_from_sdp(&answer_sdp);
+        let (audio_pt, video_pt) = parse_pts_from_sdp(&answer_sdp);
+
+        (server, mids, audio_pt.unwrap_or(111), video_pt.unwrap_or(96))
+    }
+
+    #[test]
+    fn test_stream_tx_available_for_all_pool_mids() {
+        // Simulate 2 audio + 3 video (own + 1 peer slot).
+        let (mut server, mids, _audio_pt, _video_pt) = setup_server_rtc(2, 3);
+
+        assert_eq!(mids.len(), 5, "expected 2 audio + 3 video mids");
+        assert_eq!(mids[0].1, MediaKind::Audio);
+        assert_eq!(mids[1].1, MediaKind::Audio);
+        assert_eq!(mids[2].1, MediaKind::Video);
+        assert_eq!(mids[3].1, MediaKind::Video);
+        assert_eq!(mids[4].1, MediaKind::Video);
+
+        // Verify that stream_tx_by_mid works for ALL mids (not just own).
+        let mut api = server.direct_api();
+        for (mid, _kind) in &mids {
+            assert!(
+                api.stream_tx_by_mid(*mid, None).is_some(),
+                "stream_tx_by_mid returned None for mid {mid:?} — \
+                 RTP forwarding would silently fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stream_tx_available_for_large_pool() {
+        // Simulate a 5-peer call: 5 audio + 5 video mids.
+        let (mut server, mids, _audio_pt, _video_pt) = setup_server_rtc(5, 5);
+
+        assert_eq!(mids.len(), 10);
+
+        let mut api = server.direct_api();
+        for (mid, _kind) in &mids {
+            assert!(
+                api.stream_tx_by_mid(*mid, None).is_some(),
+                "stream_tx_by_mid returned None for mid {mid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_forwarded_rtp_succeeds_for_pool_mid() {
+        // Set up server with 2 audio + 3 video (own + 1 pool slot).
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(2, 3);
+
+        let own_audio_mid = Some(mids[0].0);
+        let own_video_mid = Some(mids[2].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let source = pid(42);
+        let media = ForwardedMedia {
+            pt: video_pt,
+            seq_no: 1,
+            time: 90000,
+            marker: true,
+            payload: vec![0u8; 100],
+            is_audio: false,
+            is_screen: false,
+            source_pid: source,
+            wallclock: Instant::now(),
+        };
+
+        // This should create a slot and successfully write RTP.
+        write_forwarded_rtp(
+            &mut server,
+            &media,
+            &mut source_slots,
+            &mut rtp_tx_count,
+            &mids,
+            own_audio_mid,
+            own_video_mid,
+            None,
+            audio_pt,
+            video_pt,
+            &no_watermarks(),
+        );
+
+        assert_eq!(source_slots.len(), 1, "slot should have been created");
+        assert_eq!(rtp_tx_count, 1, "RTP packet should have been forwarded");
+    }
+
+    #[test]
+    fn test_write_forwarded_rtp_audio_and_video() {
+        // 2 audio + 3 video: own = audio[0]+video[0], pool = audio[1]+video[1,2]
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(2, 3);
+
+        let own_audio_mid = Some(mids[0].0);
+        let own_video_mid = Some(mids[2].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+        let source = pid(42);
+
+        // Send audio packet.
+        let audio_media = ForwardedMedia {
+            pt: audio_pt,
+            seq_no: 1,
+            time: 48000,
+            marker: false,
+            payload: vec![0u8; 50],
+            is_audio: true,
+            is_screen: false,
+            source_pid: source,
+            wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &audio_media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+        assert_eq!(rtp_tx_count, 1, "audio RTP should be forwarded");
+
+        // Send video packet.
+        let video_media = ForwardedMedia {
+            pt: video_pt,
+            seq_no: 1,
+            time: 90000,
+            marker: true,
+            payload: vec![0u8; 100],
+            is_audio: false,
+            is_screen: false,
+            source_pid: source,
+            wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &video_media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+        assert_eq!(rtp_tx_count, 2, "video RTP should be forwarded");
+    }
+
+    #[test]
+    fn test_write_forwarded_rtp_two_sources() {
+        // Verify two different sources get different mids and both forward OK.
+        // 3 audio + 4 video: own = audio[0]+video[0], pool = 2 pairs for 2 sources.
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(3, 4);
+
+        let own_audio_mid = Some(mids[0].0);
+        // First video mid
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let source1 = pid(1);
+        let source2 = pid(2);
+
+        // Source 1 sends video.
+        let m1 = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: source1, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &m1, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+        assert_eq!(rtp_tx_count, 1);
+
+        // Source 2 sends video.
+        let m2 = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: source2, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &m2, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+        assert_eq!(rtp_tx_count, 2, "second source RTP should be forwarded");
+
+        // Verify they got different mids.
+        let s1 = source_slots.get(&source1).unwrap();
+        let s2 = source_slots.get(&source2).unwrap();
+        assert_ne!(s1.video_mid, s2.video_mid, "sources must use different video mids");
+        assert_ne!(s1.audio_mid, s2.audio_mid, "sources must use different audio mids");
+    }
+
+    #[test]
+    fn test_write_forwarded_rtp_sequence_increments() {
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(2, 3);
+
+        let own_audio_mid = Some(mids[0].0);
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+        let source = pid(42);
+
+        for i in 0..5 {
+            let media = ForwardedMedia {
+                pt: video_pt, seq_no: i, time: 90000 + i as u32 * 3000,
+                marker: false, payload: vec![0u8; 100],
+                is_audio: false, is_screen: false,
+                source_pid: source, wallclock: Instant::now(),
+            };
+            write_forwarded_rtp(
+                &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+                &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+                &no_watermarks(),
+            );
+        }
+
+        assert_eq!(rtp_tx_count, 5, "all 5 packets should be forwarded");
+        let slot = source_slots.get(&source).unwrap();
+        assert_eq!(slot.video_tx_seq, 5, "sequence counter should track packet count");
+    }
+
+    #[test]
+    fn test_write_forwarded_rtp_no_slot_when_pool_exhausted() {
+        // Only 1 audio + 1 video = own mids only, no pool for forwarding.
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(1, 1);
+
+        let own_audio_mid = Some(mids[0].0);
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let media = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: pid(42), wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+
+        assert_eq!(rtp_tx_count, 0, "no RTP forwarded when pool exhausted");
+        assert!(source_slots.is_empty(), "no slot created when no free mids");
+    }
+
+    #[tokio::test]
+    async fn test_renegotiation_adds_pool_mids() {
+        // Start with 1 audio + 1 video (no pool).
+        let (mut server, initial_mids, _audio_pt, _video_pt) = setup_server_rtc(1, 1);
+        assert_eq!(initial_mids.len(), 2);
+
+        // Simulate renegotiation: browser adds more transceivers.
+        let mut browser = str0m::Rtc::builder()
+            .set_rtp_mode(true)
+            .enable_raw_packets(true)
+            .build();
+        let mut changes = browser.sdp_api();
+        // 2 audio + 4 video (original + pool for 1 peer).
+        for _ in 0..2 {
+            changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
+        }
+        for _ in 0..4 {
+            changes.add_media(MediaKind::Video, Direction::SendRecv, None, None);
+        }
+        let (offer, _) = changes.apply().unwrap();
+        let offer_sdp = offer.to_sdp_string();
+        let patched = patch_sdp_directions(&offer_sdp);
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let test_pid = pid(99);
+        let mut all_mids = initial_mids;
+        let new_mids = handle_renegotiation(
+            &mut server,
+            &socket,
+            &test_pid,
+            patched,
+            reply_tx,
+            &mut all_mids,
+        );
+
+        assert!(!new_mids.is_empty(), "renegotiation should produce new mids");
+        assert!(
+            all_mids.len() > 2,
+            "all_mids should grow after renegotiation: got {}",
+            all_mids.len()
+        );
+
+        // Verify reply was sent.
+        let answer_sdp = reply_rx.await.unwrap();
+        assert!(!answer_sdp.is_empty(), "renegotiation should produce an SDP answer");
+
+        // Verify TX streams exist for ALL mids (including new ones).
+        let mut api = server.direct_api();
+        for (mid, _kind) in &all_mids {
+            assert!(
+                api.stream_tx_by_mid(*mid, None).is_some(),
+                "stream_tx_by_mid returned None for mid {mid:?} after renegotiation"
+            );
+        }
+    }
+
+    // ── Reconnection: stale slot cleanup ────────────────────────────
+
+    #[test]
+    fn test_stale_slot_cleared_allows_fresh_forwarding_on_reconnect() {
+        // Simulate: User1 (receiver) has a slot for User2 (source).
+        // User2 disconnects → slot must be cleared with watermarks saved.
+        // User2 reconnects → fresh slot created with seq continuing from watermark.
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(3, 5);
+
+        let own_audio_mid = Some(mids[0].0);
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut mid_seq_watermark: HashMap<Mid, u64> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let user2 = pid(2);
+
+        // User2 sends video → slot created.
+        let media = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: user2, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &mid_seq_watermark,
+        );
+        assert_eq!(rtp_tx_count, 1);
+        assert!(source_slots.contains_key(&user2));
+        let old_video_mid = source_slots.get(&user2).unwrap().video_mid;
+
+        // User2 disconnects → save watermarks, then remove slot.
+        let slot = source_slots.remove(&user2).unwrap();
+        mid_seq_watermark.insert(slot.audio_mid, slot.audio_tx_seq);
+        mid_seq_watermark.insert(slot.video_mid, slot.video_tx_seq);
+
+        // User2 reconnects → sends video again.
+        let media2 = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: user2, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &media2, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &mid_seq_watermark,
+        );
+        assert_eq!(rtp_tx_count, 2, "RTP should be forwarded after reconnect");
+
+        // The new slot reuses the same mid.
+        let new_video_mid = source_slots.get(&user2).unwrap().video_mid;
+        assert_eq!(old_video_mid, new_video_mid, "reconnected peer reuses freed mid");
+        // Seq counter should continue from watermark (1), not restart at 0.
+        assert_eq!(source_slots.get(&user2).unwrap().video_tx_seq, 2,
+            "seq should continue from watermark after reconnect");
+    }
+
+    #[test]
+    fn test_sequence_continuity_after_reconnect() {
+        // Verify that sequence numbers continue monotonically across
+        // disconnect/reconnect, preventing SRTP anti-replay rejection.
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(3, 5);
+
+        let own_audio_mid = Some(mids[0].0);
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut mid_seq_watermark: HashMap<Mid, u64> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let user2 = pid(2);
+
+        // User2 sends 10 video packets.
+        for i in 0..10 {
+            let media = ForwardedMedia {
+                pt: video_pt, seq_no: i, time: 90000 + i as u32 * 3000,
+                marker: false, payload: vec![0u8; 100],
+                is_audio: false, is_screen: false,
+                source_pid: user2, wallclock: Instant::now(),
+            };
+            write_forwarded_rtp(
+                &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+                &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+                &mid_seq_watermark,
+            );
+        }
+        assert_eq!(rtp_tx_count, 10);
+        assert_eq!(source_slots.get(&user2).unwrap().video_tx_seq, 10);
+
+        // Simulate PeerLeft: save watermarks, remove slot.
+        let slot = source_slots.remove(&user2).unwrap();
+        mid_seq_watermark.insert(slot.audio_mid, slot.audio_tx_seq);
+        mid_seq_watermark.insert(slot.video_mid, slot.video_tx_seq);
+
+        // User2 reconnects and sends 1 packet.
+        let media = ForwardedMedia {
+            pt: video_pt, seq_no: 1, time: 90000, marker: true,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: user2, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &mid_seq_watermark,
+        );
+        assert_eq!(rtp_tx_count, 11);
+        // Sequence must continue from 10 (the watermark), now at 11.
+        assert_eq!(
+            source_slots.get(&user2).unwrap().video_tx_seq, 11,
+            "sequence should continue from watermark, not restart at 0"
+        );
+    }
+
+    #[test]
+    fn test_two_sources_one_leaves_other_unaffected() {
+        // User2 and User3 both have slots. User2 leaves.
+        // User3's slot must be unaffected.
+        let (mut server, mids, audio_pt, video_pt) = setup_server_rtc(3, 5);
+
+        let own_audio_mid = Some(mids[0].0);
+        let first_video_idx = mids.iter().position(|(_, k)| matches!(k, MediaKind::Video)).unwrap();
+        let own_video_mid = Some(mids[first_video_idx].0);
+
+        let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let mut rtp_tx_count: u64 = 0;
+
+        let user2 = pid(2);
+        let user3 = pid(3);
+
+        // Both sources send video.
+        for source in [user2, user3] {
+            let media = ForwardedMedia {
+                pt: video_pt, seq_no: 1, time: 90000, marker: true,
+                payload: vec![0u8; 100], is_audio: false, is_screen: false,
+                source_pid: source, wallclock: Instant::now(),
+            };
+            write_forwarded_rtp(
+                &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+                &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+                &no_watermarks(),
+            );
+        }
+        assert_eq!(source_slots.len(), 2);
+        let user3_video_mid = source_slots.get(&user3).unwrap().video_mid;
+
+        // User2 leaves.
+        source_slots.remove(&user2);
+        assert_eq!(source_slots.len(), 1);
+
+        // User3 still forwards fine.
+        let media = ForwardedMedia {
+            pt: video_pt, seq_no: 2, time: 93000, marker: false,
+            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            source_pid: user3, wallclock: Instant::now(),
+        };
+        write_forwarded_rtp(
+            &mut server, &media, &mut source_slots, &mut rtp_tx_count,
+            &mids, own_audio_mid, own_video_mid, None, audio_pt, video_pt,
+            &no_watermarks(),
+        );
+        assert_eq!(rtp_tx_count, 3, "user3 RTP should still forward");
+        assert_eq!(
+            source_slots.get(&user3).unwrap().video_mid, user3_video_mid,
+            "user3 slot unchanged after user2 left"
+        );
     }
 }

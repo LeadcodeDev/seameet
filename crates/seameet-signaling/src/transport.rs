@@ -22,6 +22,10 @@ pub struct IncomingConnection {
     pub reader: Box<dyn ConnectionReader>,
     /// Sender for outbound text messages.
     pub writer: mpsc::UnboundedSender<String>,
+    /// Handle to the writer task.  Aborting this when the read half
+    /// closes ensures the channel receiver is dropped promptly, making
+    /// `prune_stale` (which checks `sink.is_closed()`) reliable.
+    pub writer_handle: Option<tokio::task::AbortHandle>,
 }
 
 /// Accepts incoming connections from a specific transport.

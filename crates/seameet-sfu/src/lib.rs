@@ -16,7 +16,7 @@ use str0m::net::Protocol;
 use str0m::{Candidate, Output, RtcConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -69,6 +69,8 @@ pub struct SfuServer {
     routes: RouteTable,
     udp_local_addr: SocketAddr,
     sessions: Sessions,
+    /// Monotonic counter for SfuPeer generations (reconnection detection).
+    next_peer_gen: std::sync::atomic::AtomicU64,
 }
 
 impl SfuServer {
@@ -95,6 +97,7 @@ impl SfuServer {
             routes,
             udp_local_addr,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            next_peer_gen: std::sync::atomic::AtomicU64::new(1),
         }))
     }
 
@@ -124,7 +127,7 @@ impl SignalingHooks for SfuServer {
         _raw: &str,
         pid: ParticipantId,
         self_tx: &mpsc::UnboundedSender<String>,
-        _state: &Arc<RwLock<SignalingState>>,
+        state: &Arc<RwLock<SignalingState>>,
     ) -> bool {
         match sdp {
             SdpMessage::Offer { sdp, .. } => {
@@ -226,9 +229,9 @@ impl SignalingHooks for SfuServer {
                         || line.starts_with("a=sendrecv")
                         || line.starts_with("a=recvonly")
                         || line.starts_with("a=sendonly")
-                        || line.starts_with("a=rtpmap")
+                        || line.starts_with("a=inactive")
                     {
-                        debug!("SDP answer: {line}");
+                        info!(participant = %pid, "SDP answer direction: {line}");
                     }
                 }
 
@@ -237,6 +240,7 @@ impl SignalingHooks for SfuServer {
                 for (mid, kind) in &initial_mids {
                     info!(participant = %pid, ?mid, ?kind, "SDP mid");
                 }
+
 
                 // Drain pending Transmit events (DTLS handshake packets).
                 loop {
@@ -265,16 +269,19 @@ impl SignalingHooks for SfuServer {
 
                 info!(participant = %pid, %local_addr, "SDP negotiated");
 
+                let peer_gen = self.next_peer_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
                 let sfu_peer = SfuPeer {
                     cmd_tx,
                     ws_tx: self_tx.clone(),
+                    gen: peer_gen,
                 };
                 {
                     let mut p = room_peers.write().await;
                     p.insert(pid, SfuPeer {
                         cmd_tx: sfu_peer.cmd_tx.clone(),
                         ws_tx: sfu_peer.ws_tx.clone(),
+                        gen: peer_gen,
                     });
                 }
                 {
@@ -313,6 +320,7 @@ impl SignalingHooks for SfuServer {
                         initial_mids,
                         ws_tx_clone,
                         media_room_id,
+                        peer_gen,
                     )
                     .await;
                 });
@@ -466,6 +474,53 @@ impl SignalingHooks for SfuServer {
             }
 
             SdpMessage::Join { room_id, .. } => {
+                // Prune stale members from signaling state and notify BOTH
+                // frontends (WS PeerLeft) and media tasks (PeerCmd::PeerLeft)
+                // BEFORE the default dispatch creates the new peer.
+                // The WS PeerLeft must arrive at frontends before PeerJoined
+                // so the LIFO transceiver pool recycles the correct MID slot.
+                {
+                    let mut st = state.write().await;
+                    let pruned = st
+                        .room_mut(room_id)
+                        .map(|r| r.prune_stale())
+                        .unwrap_or_default();
+
+                    // Send WS PeerLeft to remaining frontends while we still
+                    // hold the signaling state (ensures ordering before PeerJoined).
+                    if !pruned.is_empty() {
+                        if let Some(room) = st.room(room_id) {
+                            for stale_pid in &pruned {
+                                let peer_left = SdpMessage::PeerLeft {
+                                    participant: *stale_pid,
+                                    room_id: room_id.clone(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&peer_left) {
+                                    room.broadcast(&json, stale_pid);
+                                }
+                            }
+                        }
+                    }
+                    drop(st);
+
+                    // Notify media tasks so stale source_slots are cleaned up
+                    // and MIDs are correctly reassigned on reconnect.
+                    if !pruned.is_empty() {
+                        let rooms = self.rooms.read().await;
+                        if let Some(room) = rooms.get(room_id) {
+                            let p = room.peers.read().await;
+                            for stale_pid in &pruned {
+                                info!(participant = %stale_pid, room = room_id, "SFU: pruned stale member on join, sending PeerLeft to media tasks");
+                                for (id, peer) in p.iter() {
+                                    if id != stale_pid {
+                                        let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid: *stale_pid });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 {
                     let mut r = self.rooms.write().await;
                     r.entry(room_id.clone()).or_insert_with(RoomState::new);
@@ -530,6 +585,8 @@ impl SignalingHooks for SfuServer {
                     for (id, peer) in p.iter() {
                         if *id != pid {
                             let _ = peer.ws_tx.send(json.clone());
+                            // Clear stale source slot so a reconnect gets fresh MIDs.
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid });
                         }
                     }
                 }
@@ -655,6 +712,7 @@ mod tests {
                 routes: Arc::new(RwLock::new(HashMap::new())),
                 udp_local_addr: addr,
                 sessions: Arc::new(RwLock::new(HashMap::new())),
+                next_peer_gen: std::sync::atomic::AtomicU64::new(1),
             });
 
             Self {
@@ -671,6 +729,7 @@ mod tests {
             let conn = IncomingConnection {
                 reader: Box::new(MockReader { rx: in_rx }),
                 writer: out_tx,
+                writer_handle: None,
             };
 
             let state = Arc::clone(&self.state);
@@ -692,6 +751,7 @@ mod tests {
             let sfu_peer = SfuPeer {
                 cmd_tx,
                 ws_tx: peer.out_tx.clone(),
+                gen: 0,
             };
 
             let rooms = self.hooks.rooms.read().await;
@@ -2055,5 +2115,137 @@ mod tests {
             screen_stop_count >= 1,
             "should have at least 1 screen_stop"
         );
+    }
+
+    // ── Reconnect ghost tile tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_reconnect_new_uuid_does_not_see_ghost_tile() {
+        // Simulate: user "bb" (pid=2) is in a room with "aaa" (pid=1).
+        // "bb" refreshes → old WS drops, new WS connects with pid=3 (new UUID).
+        // Before old disconnect handler runs, new pid=3 joins.
+        // The Ready message for pid=3 must NOT include pid=2 (stale).
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b_old, _hb) = ctx.connect_peer();
+
+        // Both join room.
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b_old, pid(2), "room1").await;
+        a.drain().await; // clear peer_joined etc.
+
+        // "bb" drops old WS (simulates tab close/refresh).
+        b_old.disconnect();
+        // Small yield so the channel close propagates.
+        tokio::task::yield_now().await;
+
+        // New "bb" connects with a new UUID before old disconnect handler runs.
+        let (mut b_new, _hb2) = ctx.connect_peer();
+        b_new.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("bb".into()),
+        });
+        let ready = b_new.recv().await;
+        match ready {
+            SdpMessage::Ready { peers, .. } => {
+                // pid=2 (old "bb") must NOT be in the peers list.
+                assert!(
+                    !peers.contains(&pid(2)),
+                    "stale peer pid=2 should have been pruned, but peers = {:?}",
+                    peers
+                );
+                // pid=1 ("aaa") should be present.
+                assert!(
+                    peers.contains(&pid(1)),
+                    "active peer pid=1 should be in peers list"
+                );
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_peer_left_arrives_before_peer_joined() {
+        // When "bb" refreshes (UUID-2 → UUID-3), "aaa" (pid=1) must receive
+        // peer_left(UUID-2) BEFORE peer_joined(UUID-3) so the frontend
+        // frees the transceiver slot before allocating a new one.
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b_old, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b_old, pid(2), "room1").await;
+        a.drain().await;
+
+        // "bb" drops old WS.
+        b_old.disconnect();
+        tokio::task::yield_now().await;
+
+        // New "bb" joins with a new UUID.
+        let (mut b_new, _hb2) = ctx.connect_peer();
+        b_new.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("bb".into()),
+        });
+        // Wait for b_new's Ready.
+        b_new.recv().await;
+
+        // Collect all messages "aaa" received.
+        let msgs = a.drain().await;
+        let types: Vec<&str> = msgs.iter().map(|m| match m {
+            SdpMessage::PeerLeft { .. } => "peer_left",
+            SdpMessage::PeerJoined { .. } => "peer_joined",
+            SdpMessage::ScreenShareStopped { .. } => "screen_stop",
+            _ => "other",
+        }).collect();
+
+        // Must have peer_left before peer_joined.
+        let left_idx = types.iter().position(|&t| t == "peer_left");
+        let joined_idx = types.iter().position(|&t| t == "peer_joined");
+        assert!(
+            left_idx.is_some(),
+            "aaa should receive peer_left for old bb, got: {:?}", types
+        );
+        assert!(
+            joined_idx.is_some(),
+            "aaa should receive peer_joined for new bb, got: {:?}", types
+        );
+        assert!(
+            left_idx.unwrap() < joined_idx.unwrap(),
+            "peer_left must arrive BEFORE peer_joined, got: {:?}", types
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_stale_does_not_remove_active_peers() {
+        // Verify that prune_stale only removes closed connections,
+        // not active ones.
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b, pid(2), "room1").await;
+        a.drain().await;
+        b.drain().await;
+
+        // Third peer joins — both pid=1 and pid=2 should appear (neither is stale).
+        let (mut c, _hc) = ctx.connect_peer();
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("cc".into()),
+        });
+        let ready = c.recv().await;
+        match ready {
+            SdpMessage::Ready { peers, .. } => {
+                assert!(peers.contains(&pid(1)), "pid=1 should be present");
+                assert!(peers.contains(&pid(2)), "pid=2 should be present");
+                assert_eq!(peers.len(), 2);
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
     }
 }

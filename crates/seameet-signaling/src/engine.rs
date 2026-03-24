@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use seameet_core::ParticipantId;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
@@ -108,6 +109,21 @@ impl Room {
         }
     }
 
+    /// Removes members whose WebSocket channel is closed (receiver dropped).
+    /// Returns the IDs of pruned members.
+    pub fn prune_stale(&mut self) -> Vec<ParticipantId> {
+        let stale: Vec<ParticipantId> = self
+            .members
+            .values()
+            .filter(|m| m.sink.is_closed())
+            .map(|m| m.id)
+            .collect();
+        for id in &stale {
+            self.members.remove(id);
+        }
+        stale
+    }
+
     /// Returns the IDs of all members except `exclude`.
     pub fn peer_ids(&self, exclude: &ParticipantId) -> Vec<ParticipantId> {
         self.members
@@ -155,6 +171,11 @@ pub struct SignalingState {
     rooms: HashMap<String, Room>,
     /// Participant → (sink, list of room names they belong to).
     connections: HashMap<ParticipantId, (WsSink, Vec<String>)>,
+    /// Per-participant connection generation set by `run_connection`.
+    /// Each WebSocket connection gets a unique generation from a static
+    /// atomic counter; a stale disconnect can detect that a newer
+    /// connection replaced it and skip cleanup.
+    connection_gens: HashMap<ParticipantId, u64>,
 }
 
 impl SignalingState {
@@ -163,6 +184,7 @@ impl SignalingState {
         Self {
             rooms: HashMap::new(),
             connections: HashMap::new(),
+            connection_gens: HashMap::new(),
         }
     }
 
@@ -181,7 +203,10 @@ impl SignalingState {
         let conn = self
             .connections
             .entry(id)
-            .or_insert_with(|| (sink, Vec::new()));
+            .or_insert_with(|| (sink.clone(), Vec::new()));
+        // Always update the sink to the latest connection so that a stale
+        // disconnect cannot remove the new member from rooms.
+        conn.0 = sink;
         if !conn.1.contains(&room_id.to_owned()) {
             conn.1.push(room_id.to_owned());
         }
@@ -228,12 +253,28 @@ impl SignalingState {
         }
 
         self.connections.remove(id);
+        self.connection_gens.remove(id);
         affected
+    }
+
+    /// Stores the connection generation for a participant.
+    pub fn set_connection_gen(&mut self, id: ParticipantId, gen: u64) {
+        self.connection_gens.insert(id, gen);
+    }
+
+    /// Returns the current connection generation for a participant.
+    pub fn connection_gen(&self, id: &ParticipantId) -> Option<u64> {
+        self.connection_gens.get(id).copied()
     }
 
     /// Returns the room with the given name, if it exists.
     pub fn room(&self, room_id: &str) -> Option<&Room> {
         self.rooms.get(room_id)
+    }
+
+    /// Returns a mutable reference to the room, if it exists.
+    pub fn room_mut(&mut self, room_id: &str) -> Option<&mut Room> {
+        self.rooms.get_mut(room_id)
     }
 
     /// Returns the sink of a specific participant (for unicast routing).
@@ -328,6 +369,52 @@ pub async fn dispatch(
             display_name,
         } => {
             let mut st = state.write().await;
+
+            // Prune zombie members whose WS connection closed but whose
+            // disconnect handler hasn't run yet (race on tab refresh).
+            let pruned_pids: Vec<ParticipantId> = if let Some(room) = st.room_mut(room_id) {
+                let pruned = room.prune_stale();
+                for stale_pid in &pruned {
+                    info!(participant = %stale_pid, room = room_id, "pruned stale member on join");
+                }
+                pruned
+            } else {
+                vec![]
+            };
+
+            // Broadcast PeerLeft for pruned zombies BEFORE PeerJoined, so that
+            // existing peers free their transceiver slots before allocating new ones.
+            if !pruned_pids.is_empty() {
+                let active_sinks = st.room(room_id)
+                    .map(|r| r.peer_sinks(participant))
+                    .unwrap_or_default();
+                for stale_pid in &pruned_pids {
+                    let peer_left = SdpMessage::PeerLeft {
+                        participant: *stale_pid,
+                        room_id: room_id.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&peer_left) {
+                        for sink in &active_sinks {
+                            let _ = sink.send(json.clone());
+                        }
+                    }
+                }
+            }
+
+            // If this participant is already in the room (rapid reconnect),
+            // broadcast PeerLeft so other peers clean up the stale entry.
+            if let Some(room) = st.room(room_id) {
+                if room.get(participant).is_some() {
+                    tracing::warn!(%participant, %room_id, "re-join detected, broadcasting PeerLeft for stale entry");
+                    let peer_left = SdpMessage::PeerLeft {
+                        participant: *participant,
+                        room_id: room_id.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&peer_left) {
+                        room.broadcast(&json, participant);
+                    }
+                }
+            }
 
             // Collect existing peer IDs and display names *before* joining.
             let existing_peers: Vec<ParticipantId> = st
@@ -445,9 +532,16 @@ pub async fn run_connection<H: SignalingHooks>(
     let IncomingConnection {
         mut reader,
         writer: tx,
+        writer_handle,
     } = conn;
 
     let mut participant_id: Option<ParticipantId> = None;
+
+    // Each connection gets a unique generation from a process-wide counter.
+    // When the same participant reconnects, the new connection overwrites
+    // the generation; the old connection's cleanup detects this and skips.
+    static NEXT_CONN_GEN: AtomicU64 = AtomicU64::new(1);
+    let my_gen = NEXT_CONN_GEN.fetch_add(1, Ordering::Relaxed);
 
     while let Some(msg) = reader.recv().await {
         let sdp: SdpMessage = match serde_json::from_str(&msg) {
@@ -461,6 +555,10 @@ pub async fn run_connection<H: SignalingHooks>(
         if participant_id.is_none() {
             if let SdpMessage::Join { participant, .. } = &sdp {
                 participant_id = Some(*participant);
+                // Register our generation before hooks/dispatch process the Join.
+                let mut st = state.write().await;
+                st.set_connection_gen(*participant, my_gen);
+                drop(st);
             } else {
                 continue;
             }
@@ -475,13 +573,37 @@ pub async fn run_connection<H: SignalingHooks>(
         }
     }
 
+    // Abort the writer task so its channel receiver is dropped immediately.
+    // This makes `sink.is_closed()` return true for any clone of our WsSink,
+    // allowing `prune_stale` to detect the dead connection reliably.
+    if let Some(handle) = writer_handle {
+        handle.abort();
+    }
+
     // Connection closed — clean up all rooms.
     if let Some(pid) = participant_id {
         info!(participant = %pid, "disconnected");
+
+        // If a newer connection already replaced ours, skip cleanup entirely
+        // to avoid destroying the new session's state.
+        let is_stale = {
+            let st = state.read().await;
+            st.connection_gen(&pid) != Some(my_gen)
+        };
+
+        if is_stale {
+            info!(participant = %pid, gen = my_gen, "skipping stale disconnect (peer reconnected)");
+            return;
+        }
+
         let affected = {
             let mut st = state.write().await;
             st.disconnect(&pid)
         };
+
+        if affected.is_empty() {
+            warn!(participant = %pid, "disconnect: no affected rooms");
+        }
 
         // Broadcast PeerLeft to remaining peers.
         for (room_id, _) in &affected {
@@ -493,6 +615,12 @@ pub async fn run_connection<H: SignalingHooks>(
                 let st = state.read().await;
                 let peers = st.peers(room_id, &pid);
                 drop(st);
+                info!(
+                    participant = %pid,
+                    room = %room_id,
+                    peer_count = peers.len(),
+                    "broadcasting PeerLeft"
+                );
                 for peer_tx in peers {
                     let _ = peer_tx.send(json.clone());
                 }

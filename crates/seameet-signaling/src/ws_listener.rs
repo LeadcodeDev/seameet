@@ -75,7 +75,7 @@ impl TransportListener for WsListener {
 
             // Spawn writer task: pumps from mpsc channel into the WS sink.
             let mut sink = ws_sink;
-            tokio::spawn(async move {
+            let writer_task = tokio::spawn(async move {
                 while let Some(text) = rx.recv().await {
                     if sink.send(Message::Text(text)).await.is_err() {
                         break;
@@ -86,6 +86,7 @@ impl TransportListener for WsListener {
             return Some(IncomingConnection {
                 reader: Box::new(WsReader { stream: ws_stream }),
                 writer: tx,
+                writer_handle: Some(writer_task.abort_handle()),
             });
         }
     }

@@ -8,7 +8,6 @@ members = [
     "crates/seameet-pipeline",
     "crates/seameet-sfu",
     "crates/seameet",
-    "examples/browser-demo",
     "examples/meet",
 ]
 

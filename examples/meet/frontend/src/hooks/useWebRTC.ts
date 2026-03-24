@@ -97,8 +97,36 @@ export function useWebRTC({
     setRemotePeers(new Map(remotePeersRef.current))
   }, [])
 
+  const removeRemotePeer = useCallback((peerId: string) => {
+    const info = remotePeersRef.current.get(peerId)
+    if (!info) return
+
+    // Clear stream tracks but do NOT set transceivers to inactive —
+    // the mids must stay active in str0m for reuse.
+    for (const track of info.stream.getTracks()) {
+      info.stream.removeTrack(track)
+    }
+    // Find the transceiver pair by mid and return to pool.
+    const pc = pcRef.current
+    if (pc && info.audioMid && info.videoMid) {
+      const transceivers = pc.getTransceivers()
+      const audioT = transceivers.find(t => t.mid === info.audioMid)
+      const videoT = transceivers.find(t => t.mid === info.videoMid)
+      if (audioT && videoT) {
+        transceiverPoolRef.current.unshift({ audioTransceiver: audioT, videoTransceiver: videoT })
+      }
+    }
+
+    remotePeersRef.current.delete(peerId)
+    updateRemotePeersState()
+    console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}, pool: ${transceiverPoolRef.current.length}`)
+  }, [updateRemotePeersState])
+
   const addRemotePeer = useCallback((peerId: string, displayName?: string) => {
-    if (remotePeersRef.current.has(peerId)) return
+    if (remotePeersRef.current.has(peerId)) {
+      // Peer reconnected — recycle old entry so the new slot gets fresh media.
+      removeRemotePeer(peerId)
+    }
 
     const slot = transceiverPoolRef.current.shift()
     if (!slot) {
@@ -133,32 +161,7 @@ export function useWebRTC({
     remotePeersRef.current.set(peerId, peer)
     updateRemotePeersState()
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
-  }, [updateRemotePeersState])
-
-  const removeRemotePeer = useCallback((peerId: string) => {
-    const info = remotePeersRef.current.get(peerId)
-    if (!info) return
-
-    // Clear stream tracks but do NOT set transceivers to inactive —
-    // the mids must stay active in str0m for reuse.
-    for (const track of info.stream.getTracks()) {
-      info.stream.removeTrack(track)
-    }
-    // Find the transceiver pair by mid and return to pool.
-    const pc = pcRef.current
-    if (pc && info.audioMid && info.videoMid) {
-      const transceivers = pc.getTransceivers()
-      const audioT = transceivers.find(t => t.mid === info.audioMid)
-      const videoT = transceivers.find(t => t.mid === info.videoMid)
-      if (audioT && videoT) {
-        transceiverPoolRef.current.push({ audioTransceiver: audioT, videoTransceiver: videoT })
-      }
-    }
-
-    remotePeersRef.current.delete(peerId)
-    updateRemotePeersState()
-    console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}, pool: ${transceiverPoolRef.current.length}`)
-  }, [updateRemotePeersState])
+  }, [removeRemotePeer, updateRemotePeersState])
 
   const renegotiate = useCallback(async () => {
     const pc = pcRef.current
@@ -195,6 +198,15 @@ export function useWebRTC({
 
   const createOfferToServer = useCallback(async (existingPeers: string[], displayNames?: Record<string, string>) => {
     console.log(`[WebRTC] createOfferToServer, existingPeers: ${existingPeers.length}, localStream: ${!!localStreamRef.current}`)
+
+    // Close previous PC and clear stale remote peers (signaling reconnect).
+    if (pcRef.current) {
+      pcRef.current.close()
+      pcRef.current = null
+    }
+    remotePeersRef.current.clear()
+    transceiverPoolRef.current = []
+    updateRemotePeersState()
 
     const pc = new RTCPeerConnection({
       iceServers: [
@@ -361,10 +373,7 @@ export function useWebRTC({
     if (data.type === 'peer_joined') {
       const peerId = data.participant
       console.log(`[WebRTC] peer_joined: ${peerId.slice(0, 8)}`)
-      if (!remotePeersRef.current.has(peerId)) {
-        addRemotePeer(peerId, data.display_name)
-        // No renegotiation — slots are pre-allocated in the initial offer.
-      }
+      addRemotePeer(peerId, data.display_name)
       return
     }
 
@@ -525,13 +534,22 @@ export function useWebRTC({
   const drainQueue = useCallback(async () => {
     if (processingRef.current) return
     processingRef.current = true
-
-    while (messageQueueRef.current.length > 0) {
-      const msg = messageQueueRef.current.shift()!
-      await processMessage(msg)
+    try {
+      while (messageQueueRef.current.length > 0) {
+        const msg = messageQueueRef.current.shift()!
+        try {
+          await processMessage(msg)
+        } catch (e) {
+          console.error('[WebRTC] processMessage error:', e)
+        }
+      }
+    } finally {
+      processingRef.current = false
+      // Re-drain if messages arrived between the last while check and finally.
+      if (messageQueueRef.current.length > 0) {
+        queueMicrotask(() => drainQueue())
+      }
     }
-
-    processingRef.current = false
   }, [processMessage])
 
   // Public handler: enqueue message and drain
