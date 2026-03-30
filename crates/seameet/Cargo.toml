@@ -11,19 +11,22 @@ categories  = ["multimedia", "network-programming", "asynchronous"]
 
 [dependencies]
 seameet-core      = { path = "../seameet-core" }
-seameet-signaling = { path = "../seameet-signaling" }
+seameet-signaling = { path = "../seameet-signaling", default-features = false }
 seameet-rtp       = { path = "../seameet-rtp" }
 seameet-codec     = { path = "../seameet-codec" }
 seameet-pipeline  = { path = "../seameet-pipeline" }
+seameet-sfu       = { path = "../seameet-sfu", optional = true }
 tokio             = { workspace = true }
 tokio-stream      = { workspace = true }
 tracing           = { workspace = true }
 uuid              = { workspace = true }
 
 [features]
-default  = []
-opus-ffi = ["seameet-codec/opus-ffi"]
-vp8-ffi  = ["seameet-codec/vp8-ffi"]
+default     = ["tungstenite"]
+tungstenite = ["seameet-signaling/tungstenite"]
+sfu         = ["dep:seameet-sfu"]
+opus-ffi    = ["seameet-codec/opus-ffi"]
+vp8-ffi     = ["seameet-codec/vp8-ffi"]
 
 [dev-dependencies]
 tokio         = { workspace = true }

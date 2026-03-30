@@ -1,0 +1,2271 @@
+pub mod media;
+
+pub use media::{ForwardedMedia, PeerCmd, Peers, RouteTable, SfuPeer};
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use media::*;
+use seameet_core::ParticipantId;
+use seameet_signaling::engine::{SignalingHooks, SignalingState};
+use seameet_signaling::SdpMessage;
+use str0m::bwe::Bitrate;
+use str0m::change::SdpOffer;
+use str0m::net::Protocol;
+use str0m::{Candidate, Output, RtcConfig};
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tracing::{info, warn};
+
+// ── Configuration ─────────────────────────────────────────────────────
+
+pub struct SfuConfig {
+    pub udp_port: u16,
+    pub public_ip: Option<std::net::IpAddr>,
+    pub bwe_kbps: Option<u32>,
+}
+
+impl Default for SfuConfig {
+    fn default() -> Self {
+        Self {
+            udp_port: 10000,
+            public_ip: None,
+            bwe_kbps: None,
+        }
+    }
+}
+
+// ── Internal types ────────────────────────────────────────────────────
+
+struct RoomState {
+    peers: Peers,
+}
+
+impl RoomState {
+    fn new() -> Self {
+        Self {
+            peers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+type Rooms = Arc<RwLock<HashMap<String, RoomState>>>;
+
+/// Per-connection state keyed by participant ID.
+struct PeerSession {
+    has_media_task: bool,
+    current_room_id: Option<String>,
+}
+
+type Sessions = Arc<RwLock<HashMap<ParticipantId, PeerSession>>>;
+
+// ── SfuServer ─────────────────────────────────────────────────────────
+
+pub struct SfuServer {
+    rooms: Rooms,
+    all_peers: Peers,
+    socket: Arc<UdpSocket>,
+    routes: RouteTable,
+    udp_local_addr: SocketAddr,
+    sessions: Sessions,
+    /// Monotonic counter for SfuPeer generations (reconnection detection).
+    next_peer_gen: std::sync::atomic::AtomicU64,
+}
+
+impl SfuServer {
+    pub async fn new(config: SfuConfig) -> Result<Arc<Self>, std::io::Error> {
+        let shared_socket = Arc::new(
+            UdpSocket::bind(format!("0.0.0.0:{}", config.udp_port)).await?,
+        );
+        let udp_local_addr = shared_socket.local_addr()?;
+
+        let all_peers: Peers = Arc::new(RwLock::new(HashMap::new()));
+        let routes: RouteTable = Arc::new(RwLock::new(HashMap::new()));
+
+        // Spawn UDP reader.
+        tokio::spawn(udp_reader(
+            Arc::clone(&shared_socket),
+            Arc::clone(&all_peers),
+            Arc::clone(&routes),
+        ));
+
+        Ok(Arc::new(Self {
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+            all_peers,
+            socket: shared_socket,
+            routes,
+            udp_local_addr,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            next_peer_gen: std::sync::atomic::AtomicU64::new(1),
+        }))
+    }
+
+    pub fn signaling_state(&self) -> Arc<RwLock<SignalingState>> {
+        Arc::new(RwLock::new(SignalingState::new()))
+    }
+
+    pub fn udp_local_addr(&self) -> SocketAddr {
+        self.udp_local_addr
+    }
+
+    /// Returns the shared Peers map for a participant's current room.
+    async fn room_peers_for(&self, pid: &ParticipantId) -> Option<Peers> {
+        let sess = self.sessions.read().await;
+        let room_id = sess.get(pid)?.current_room_id.as_ref()?.clone();
+        drop(sess);
+
+        let rooms = self.rooms.read().await;
+        rooms.get(&room_id).map(|r| Arc::clone(&r.peers))
+    }
+}
+
+impl SignalingHooks for SfuServer {
+    async fn on_message(
+        &self,
+        sdp: &SdpMessage,
+        _raw: &str,
+        pid: ParticipantId,
+        self_tx: &mpsc::UnboundedSender<String>,
+        state: &Arc<RwLock<SignalingState>>,
+    ) -> bool {
+        match sdp {
+            SdpMessage::Offer { sdp, .. } => {
+                let sess = self.sessions.read().await;
+                let has_media = sess.get(&pid).map(|s| s.has_media_task).unwrap_or(false);
+                drop(sess);
+
+                let Some(room_peers) = self.room_peers_for(&pid).await else {
+                    return true;
+                };
+
+                if has_media {
+                    // Renegotiation path.
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(&pid) {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let _ = peer.cmd_tx.send(PeerCmd::RenegotiationOffer {
+                            sdp: sdp.clone(),
+                            reply_tx,
+                        });
+                        drop(p);
+
+                        match reply_rx.await {
+                            Ok(answer_sdp) if !answer_sdp.is_empty() => {
+                                let answer_msg = SdpMessage::Answer {
+                                    from: pid,
+                                    to: pid,
+                                    room_id: "sfu".into(),
+                                    sdp: answer_sdp,
+                                };
+                                if let Ok(json) = serde_json::to_string(&answer_msg) {
+                                    let _ = self_tx.send(json);
+                                }
+                            }
+                            Ok(_) => {
+                                warn!(participant = %pid, "renegotiation produced empty SDP");
+                            }
+                            Err(_) => {
+                                warn!(participant = %pid, "renegotiation reply channel closed");
+                            }
+                        }
+                    }
+                    return true;
+                }
+
+                // First offer — build Rtc with shared socket address.
+                let local_ip = local_ip().await;
+                let local_addr: SocketAddr = (local_ip, self.udp_local_addr.port()).into();
+
+                let bwe = self
+                    .config_bwe_kbps()
+                    .map(Bitrate::kbps)
+                    .unwrap_or(Bitrate::kbps(800));
+
+                let mut config = RtcConfig::new()
+                    .set_rtp_mode(true)
+                    .enable_raw_packets(true)
+                    .enable_bwe(Some(bwe));
+                {
+                    let cc = config.codec_config();
+                    cc.enable_h264(false);
+                    cc.enable_vp9(false);
+                }
+                let mut rtc = config.build();
+
+                if let Ok(c) = Candidate::host(local_addr, Protocol::Udp) {
+                    rtc.add_local_candidate(c);
+                }
+
+                if let Some(public_ip) = self.public_ip() {
+                    let public_addr: SocketAddr = (public_ip, self.udp_local_addr.port()).into();
+                    if let Ok(c) = Candidate::host(public_addr, Protocol::Udp) {
+                        rtc.add_local_candidate(c);
+                        info!(%public_addr, "added public IP candidate");
+                    }
+                }
+
+                let sdp = patch_sdp_directions(sdp);
+
+                let offer = match SdpOffer::from_sdp_string(&sdp) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        warn!("bad SDP offer: {e}");
+                        return true;
+                    }
+                };
+
+                let answer = match rtc.sdp_api().accept_offer(offer) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("accept_offer failed: {e}");
+                        return true;
+                    }
+                };
+
+                let answer_sdp = answer.to_sdp_string();
+                for line in answer_sdp.lines() {
+                    if line.starts_with("m=")
+                        || line.starts_with("a=sendrecv")
+                        || line.starts_with("a=recvonly")
+                        || line.starts_with("a=sendonly")
+                        || line.starts_with("a=inactive")
+                    {
+                        info!(participant = %pid, "SDP answer direction: {line}");
+                    }
+                }
+
+                let initial_mids = parse_mids_from_sdp(&answer_sdp);
+                info!(participant = %pid, count = initial_mids.len(), "parsed mids from SDP answer");
+                for (mid, kind) in &initial_mids {
+                    info!(participant = %pid, ?mid, ?kind, "SDP mid");
+                }
+
+
+                // Drain pending Transmit events (DTLS handshake packets).
+                loop {
+                    match rtc.poll_output() {
+                        Ok(Output::Transmit(t)) => {
+                            let _ = self.socket.try_send_to(&t.contents, t.destination);
+                        }
+                        Ok(Output::Event(_)) => {}
+                        Ok(Output::Timeout(_)) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                let (own_audio_pt, own_video_pt) = parse_pts_from_sdp(&answer_sdp);
+                info!(participant = %pid, ?own_audio_pt, ?own_video_pt, "negotiated PTs");
+
+                let answer_msg = SdpMessage::Answer {
+                    from: pid,
+                    to: pid,
+                    room_id: "sfu".into(),
+                    sdp: answer_sdp,
+                };
+                if let Ok(json) = serde_json::to_string(&answer_msg) {
+                    let _ = self_tx.send(json);
+                }
+
+                info!(participant = %pid, %local_addr, "SDP negotiated");
+
+                let peer_gen = self.next_peer_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let sfu_peer = SfuPeer {
+                    cmd_tx,
+                    ws_tx: self_tx.clone(),
+                    gen: peer_gen,
+                };
+                {
+                    let mut p = room_peers.write().await;
+                    p.insert(pid, SfuPeer {
+                        cmd_tx: sfu_peer.cmd_tx.clone(),
+                        ws_tx: sfu_peer.ws_tx.clone(),
+                        gen: peer_gen,
+                    });
+                }
+                {
+                    let mut ap = self.all_peers.write().await;
+                    ap.insert(pid, sfu_peer);
+                }
+
+                {
+                    let mut sess = self.sessions.write().await;
+                    if let Some(s) = sess.get_mut(&pid) {
+                        s.has_media_task = true;
+                    }
+                }
+
+                let peers_clone = Arc::clone(&room_peers);
+                let socket_clone = Arc::clone(&self.socket);
+                let routes_clone = Arc::clone(&self.routes);
+                let ws_tx_clone = self_tx.clone();
+                let sess = self.sessions.read().await;
+                let media_room_id = sess
+                    .get(&pid)
+                    .and_then(|s| s.current_room_id.clone())
+                    .unwrap_or_default();
+                drop(sess);
+                tokio::spawn(async move {
+                    run_media(
+                        rtc,
+                        socket_clone,
+                        local_addr,
+                        pid,
+                        cmd_rx,
+                        peers_clone,
+                        routes_clone,
+                        own_audio_pt.unwrap_or(111),
+                        own_video_pt.unwrap_or(96),
+                        initial_mids,
+                        ws_tx_clone,
+                        media_room_id,
+                        peer_gen,
+                    )
+                    .await;
+                });
+
+                true
+            }
+
+            SdpMessage::IceCandidate { candidate, .. } => {
+                let ap = self.all_peers.read().await;
+                if let Some(peer) = ap.get(&pid) {
+                    let _ = peer.cmd_tx.send(PeerCmd::IceCandidate(candidate.clone()));
+                }
+                true
+            }
+
+            SdpMessage::ScreenShareStarted {
+                from,
+                room_id,
+                track_id,
+            } => {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(from) {
+                        let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(true));
+                    }
+                    let msg = SdpMessage::ScreenShareStarted {
+                        from: *from,
+                        room_id: room_id.clone(),
+                        track_id: *track_id,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        for (id, peer) in p.iter() {
+                            if *id != pid {
+                                let _ = peer.ws_tx.send(json.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            SdpMessage::ScreenShareStopped {
+                from,
+                room_id,
+                track_id,
+            } => {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(from) {
+                        let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(false));
+                    }
+                    let msg = SdpMessage::ScreenShareStopped {
+                        from: *from,
+                        room_id: room_id.clone(),
+                        track_id: *track_id,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        for (id, peer) in p.iter() {
+                            if *id != pid {
+                                let _ = peer.ws_tx.send(json.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            SdpMessage::MuteAudio { from, room_id } => {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(from) {
+                        let _ = peer.cmd_tx.send(PeerCmd::SetMuted(true));
+                    }
+                    for (id, peer) in p.iter() {
+                        if *id != *from {
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerMuteChanged {
+                                pid: *from,
+                                muted: true,
+                            });
+                        }
+                    }
+                    let msg = SdpMessage::MuteAudio {
+                        from: *from,
+                        room_id: room_id.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        for (id, peer) in p.iter() {
+                            if *id != pid {
+                                let _ = peer.ws_tx.send(json.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            SdpMessage::UnmuteAudio { from, room_id } => {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(from) {
+                        let _ = peer.cmd_tx.send(PeerCmd::SetMuted(false));
+                    }
+                    for (id, peer) in p.iter() {
+                        if *id != *from {
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerMuteChanged {
+                                pid: *from,
+                                muted: false,
+                            });
+                        }
+                    }
+                    let msg = SdpMessage::UnmuteAudio {
+                        from: *from,
+                        room_id: room_id.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        for (id, peer) in p.iter() {
+                            if *id != pid {
+                                let _ = peer.ws_tx.send(json.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            SdpMessage::VideoConfigChanged {
+                from,
+                room_id,
+                width,
+                height,
+                fps,
+            } => {
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    let msg = SdpMessage::VideoConfigChanged {
+                        from: *from,
+                        room_id: room_id.clone(),
+                        width: *width,
+                        height: *height,
+                        fps: *fps,
+                    };
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        for (id, peer) in p.iter() {
+                            if *id != pid {
+                                let _ = peer.ws_tx.send(json.clone());
+                            }
+                        }
+                    }
+                }
+                true
+            }
+
+            SdpMessage::Join { room_id, .. } => {
+                // Prune stale members from signaling state and notify BOTH
+                // frontends (WS PeerLeft) and media tasks (PeerCmd::PeerLeft)
+                // BEFORE the default dispatch creates the new peer.
+                // The WS PeerLeft must arrive at frontends before PeerJoined
+                // so the LIFO transceiver pool recycles the correct MID slot.
+                {
+                    let mut st = state.write().await;
+                    let pruned = st
+                        .room_mut(room_id)
+                        .map(|r| r.prune_stale())
+                        .unwrap_or_default();
+
+                    // Send WS PeerLeft to remaining frontends while we still
+                    // hold the signaling state (ensures ordering before PeerJoined).
+                    if !pruned.is_empty() {
+                        if let Some(room) = st.room(room_id) {
+                            for stale_pid in &pruned {
+                                let peer_left = SdpMessage::PeerLeft {
+                                    participant: *stale_pid,
+                                    room_id: room_id.clone(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&peer_left) {
+                                    room.broadcast(&json, stale_pid);
+                                }
+                            }
+                        }
+                    }
+                    drop(st);
+
+                    // Notify media tasks so stale source_slots are cleaned up
+                    // and MIDs are correctly reassigned on reconnect.
+                    if !pruned.is_empty() {
+                        let rooms = self.rooms.read().await;
+                        if let Some(room) = rooms.get(room_id) {
+                            let p = room.peers.read().await;
+                            for stale_pid in &pruned {
+                                info!(participant = %stale_pid, room = room_id, "SFU: pruned stale member on join, sending PeerLeft to media tasks");
+                                for (id, peer) in p.iter() {
+                                    if id != stale_pid {
+                                        let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid: *stale_pid });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Rapid reconnect: if the joining participant is already in
+                    // room_peers but was NOT caught by prune_stale, notify other
+                    // media tasks so they clear the stale source_slot.  Without
+                    // this, the old slot is silently reused and no keyframe is
+                    // requested for the new media stream → frozen video.
+                    if !pruned.contains(&pid) {
+                        let rooms = self.rooms.read().await;
+                        if let Some(room) = rooms.get(room_id) {
+                            let p = room.peers.read().await;
+                            if p.contains_key(&pid) {
+                                info!(participant = %pid, room = room_id, "SFU: re-join detected (not pruned), sending PeerLeft to media tasks");
+                                for (id, peer) in p.iter() {
+                                    if *id != pid {
+                                        let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                {
+                    let mut r = self.rooms.write().await;
+                    r.entry(room_id.clone()).or_insert_with(RoomState::new);
+                }
+
+                {
+                    let mut sess = self.sessions.write().await;
+                    sess.insert(
+                        pid,
+                        PeerSession {
+                            has_media_task: false,
+                            current_room_id: Some(room_id.clone()),
+                        },
+                    );
+                }
+
+                {
+                    let rooms = self.rooms.read().await;
+                    if let Some(room) = rooms.get(room_id) {
+                        let p = room.peers.read().await;
+                        let remote_count = p.len();
+                        for (_id, peer) in p.iter() {
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerCountChanged {
+                                remote_peer_count: remote_count,
+                            });
+                        }
+                    }
+                }
+
+                false
+            }
+
+            _ => false,
+        }
+    }
+
+    async fn on_disconnect(
+        &self,
+        pid: ParticipantId,
+        affected_rooms: &[(String, bool)],
+        _state: &Arc<RwLock<SignalingState>>,
+    ) {
+        {
+            let mut r = self.routes.write().await;
+            r.retain(|_, v| *v != pid);
+        }
+        self.all_peers.write().await.remove(&pid);
+
+        for (room_id, room_empty) in affected_rooms {
+            let room_peers = {
+                let rooms = self.rooms.read().await;
+                rooms.get(room_id).map(|r| Arc::clone(&r.peers))
+            };
+            if let Some(room_peers) = room_peers {
+                let screen_stopped = SdpMessage::ScreenShareStopped {
+                    from: pid,
+                    room_id: room_id.clone(),
+                    track_id: 0,
+                };
+                if let Ok(json) = serde_json::to_string(&screen_stopped) {
+                    let p = room_peers.read().await;
+                    for (id, peer) in p.iter() {
+                        if *id != pid {
+                            let _ = peer.ws_tx.send(json.clone());
+                            // Clear stale source slot so a reconnect gets fresh MIDs.
+                            let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid });
+                        }
+                    }
+                }
+                room_peers.write().await.remove(&pid);
+            }
+            if *room_empty {
+                self.rooms.write().await.remove(room_id);
+            }
+        }
+
+        self.sessions.write().await.remove(&pid);
+    }
+}
+
+// Private helpers for SfuServer config access.
+impl SfuServer {
+    fn config_bwe_kbps(&self) -> Option<u64> {
+        // BWE is configured at construction time via SfuConfig.
+        // For now we use a default; in the future this could be stored.
+        None
+    }
+
+    fn public_ip(&self) -> Option<std::net::IpAddr> {
+        // Check PUBLIC_IP env var at runtime.
+        std::env::var("PUBLIC_IP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+}
+
+// ── Integration tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seameet_signaling::engine::{run_connection, SignalingState};
+    use seameet_signaling::transport::{ConnectionReader, IncomingConnection};
+    use seameet_signaling::SdpMessage;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::sync::mpsc;
+
+    fn pid(n: u128) -> ParticipantId {
+        ParticipantId::new(uuid::Uuid::from_u128(n))
+    }
+
+    /// Mock ConnectionReader backed by an mpsc channel.
+    struct MockReader {
+        rx: mpsc::UnboundedReceiver<String>,
+    }
+
+    impl ConnectionReader for MockReader {
+        fn recv(&mut self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+            Box::pin(async { self.rx.recv().await })
+        }
+    }
+
+    /// A test peer: send messages via `tx`, receive server responses via `out_rx`.
+    struct TestPeer {
+        tx: mpsc::UnboundedSender<String>,
+        out_rx: mpsc::UnboundedReceiver<String>,
+        out_tx: mpsc::UnboundedSender<String>,
+    }
+
+    impl TestPeer {
+        fn send(&self, msg: &SdpMessage) {
+            let json = serde_json::to_string(msg).unwrap();
+            self.tx.send(json).unwrap();
+        }
+
+        async fn recv(&mut self) -> SdpMessage {
+            let json = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.out_rx.recv(),
+            )
+            .await
+            .expect("timeout waiting for message")
+            .expect("channel closed");
+            serde_json::from_str(&json).unwrap()
+        }
+
+        async fn try_recv(&mut self) -> Option<SdpMessage> {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                self.out_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(json)) => serde_json::from_str(&json).ok(),
+                _ => None,
+            }
+        }
+
+        async fn drain(&mut self) -> Vec<SdpMessage> {
+            let mut msgs = Vec::new();
+            while let Some(msg) = self.try_recv().await {
+                msgs.push(msg);
+            }
+            msgs
+        }
+
+        fn disconnect(self) {
+            drop(self.tx);
+        }
+    }
+
+    struct TestCtx {
+        state: Arc<RwLock<SignalingState>>,
+        hooks: Arc<SfuServer>,
+    }
+
+    impl TestCtx {
+        async fn new() -> Self {
+            let socket = Arc::new(
+                tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            );
+            let addr = socket.local_addr().unwrap();
+
+            let hooks = Arc::new(SfuServer {
+                rooms: Arc::new(RwLock::new(HashMap::new())),
+                all_peers: Arc::new(RwLock::new(HashMap::new())),
+                socket,
+                routes: Arc::new(RwLock::new(HashMap::new())),
+                udp_local_addr: addr,
+                sessions: Arc::new(RwLock::new(HashMap::new())),
+                next_peer_gen: std::sync::atomic::AtomicU64::new(1),
+            });
+
+            Self {
+                state: Arc::new(RwLock::new(SignalingState::new())),
+                hooks,
+            }
+        }
+
+        fn connect_peer(&self) -> (TestPeer, tokio::task::JoinHandle<()>) {
+            let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+            let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+
+            let out_tx_clone = out_tx.clone();
+            let conn = IncomingConnection {
+                reader: Box::new(MockReader { rx: in_rx }),
+                writer: out_tx,
+                writer_handle: None,
+            };
+
+            let state = Arc::clone(&self.state);
+            let hooks = Arc::clone(&self.hooks);
+            let handle = tokio::spawn(run_connection(conn, state, hooks));
+
+            (
+                TestPeer {
+                    tx: in_tx,
+                    out_rx,
+                    out_tx: out_tx_clone,
+                },
+                handle,
+            )
+        }
+
+        async fn register_sfu_peer(&self, peer: &TestPeer, id: ParticipantId, room_id: &str) {
+            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+            let sfu_peer = SfuPeer {
+                cmd_tx,
+                ws_tx: peer.out_tx.clone(),
+                gen: 0,
+            };
+
+            let rooms = self.hooks.rooms.read().await;
+            if let Some(room) = rooms.get(room_id) {
+                room.peers.write().await.insert(id, sfu_peer.clone());
+            }
+            drop(rooms);
+
+            self.hooks.all_peers.write().await.insert(id, sfu_peer);
+
+            let mut sess = self.hooks.sessions.write().await;
+            if let Some(s) = sess.get_mut(&id) {
+                s.has_media_task = true;
+            }
+        }
+    }
+
+    async fn join_and_register(
+        ctx: &TestCtx,
+        peer: &mut TestPeer,
+        id: ParticipantId,
+        room_id: &str,
+    ) {
+        peer.send(&SdpMessage::Join {
+            participant: id,
+            room_id: room_id.into(),
+            display_name: None,
+        });
+        peer.recv().await; // Ready
+        ctx.register_sfu_peer(peer, id, room_id).await;
+    }
+
+    // ── Signaling tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_two_peers_join_room() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "room1".into(),
+            display_name: Some("Alice".into()),
+        });
+        let ready = a.recv().await;
+        assert!(matches!(
+            ready,
+            SdpMessage::Ready {
+                initiator: true,
+                ..
+            }
+        ));
+
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "room1".into(),
+            display_name: Some("Bob".into()),
+        });
+        let ready_b = b.recv().await;
+        match &ready_b {
+            SdpMessage::Ready {
+                peers, initiator, ..
+            } => {
+                assert!(!initiator);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0], pid(1));
+            }
+            _ => panic!("expected Ready, got {:?}", ready_b),
+        }
+
+        let peer_joined = a.recv().await;
+        match &peer_joined {
+            SdpMessage::PeerJoined {
+                participant,
+                display_name,
+                ..
+            } => {
+                assert_eq!(*participant, pid(2));
+                assert_eq!(display_name.as_deref(), Some("Bob"));
+            }
+            _ => panic!("expected PeerJoined, got {:?}", peer_joined),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_third_peer_joins_sees_both() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        let ready_c = c.recv().await;
+        match &ready_c {
+            SdpMessage::Ready { peers, .. } => {
+                assert_eq!(peers.len(), 2);
+                assert!(peers.contains(&pid(1)));
+                assert!(peers.contains(&pid(2)));
+            }
+            _ => panic!("expected Ready, got {:?}", ready_c),
+        }
+
+        let a_msg = a.recv().await;
+        assert!(
+            matches!(a_msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
+        );
+        let b_msg = b.recv().await;
+        assert!(
+            matches!(b_msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_leave_notifies_others() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = a.drain().await;
+        let has_peer_left = msgs.iter().any(|m| {
+            matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
+        });
+        assert!(has_peer_left, "expected PeerLeft for B, got: {:?}", msgs);
+    }
+
+    #[tokio::test]
+    async fn test_mute_broadcast() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r").await;
+        a.recv().await;
+        b.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        let has_mute = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { from, .. } if *from == pid(1)));
+        assert!(has_mute, "B should receive MuteAudio, got: {:?}", b_msgs);
+
+        let c_msgs = c.drain().await;
+        let has_mute = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { from, .. } if *from == pid(1)));
+        assert!(has_mute, "C should receive MuteAudio, got: {:?}", c_msgs);
+    }
+
+    #[tokio::test]
+    async fn test_unmute_broadcast() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.drain().await;
+
+        a.send(&SdpMessage::UnmuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        let has_unmute = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::UnmuteAudio { from, .. } if *from == pid(1)));
+        assert!(
+            has_unmute,
+            "B should receive UnmuteAudio, got: {:?}",
+            b_msgs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_screen_share_broadcast() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        let has_screen = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(1)));
+        assert!(
+            has_screen,
+            "B should receive ScreenShareStarted, got: {:?}",
+            b_msgs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_screen_share_stop_broadcast() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.drain().await;
+
+        a.send(&SdpMessage::ScreenShareStopped {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        let has_stop = b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
+        );
+        assert!(
+            has_stop,
+            "B should receive ScreenShareStopped, got: {:?}",
+            b_msgs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_broadcasts_screen_share_stopped() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.drain().await;
+
+        a.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let b_msgs = b.drain().await;
+        let has_screen_stop = b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
+        );
+        let has_peer_left = b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
+        );
+        assert!(
+            has_screen_stop,
+            "B should receive ScreenShareStopped on disconnect, got: {:?}",
+            b_msgs
+        );
+        assert!(
+            has_peer_left,
+            "B should receive PeerLeft on disconnect, got: {:?}",
+            b_msgs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_video_config_broadcast() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r").await;
+        a.recv().await;
+        b.recv().await;
+
+        a.send(&SdpMessage::VideoConfigChanged {
+            from: pid(1),
+            room_id: "r".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        let has_config = b_msgs.iter().any(|m| {
+            matches!(m,
+            SdpMessage::VideoConfigChanged { from, width, height, fps, .. }
+            if *from == pid(1) && *width == 1920 && *height == 1080 && *fps == 30)
+        });
+        assert!(
+            has_config,
+            "B should receive VideoConfigChanged, got: {:?}",
+            b_msgs
+        );
+
+        let c_msgs = c.drain().await;
+        let has_config = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(1)));
+        assert!(
+            has_config,
+            "C should receive VideoConfigChanged, got: {:?}",
+            c_msgs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_unmute_cycle() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = b.drain().await;
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+
+        a.send(&SdpMessage::UnmuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = b.drain().await;
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::UnmuteAudio { .. })));
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = b.drain().await;
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_cleanup_state() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sess = ctx.hooks.sessions.read().await;
+        assert!(
+            !sess.contains_key(&pid(2)),
+            "B's session should be cleaned up"
+        );
+        drop(sess);
+
+        let rooms = ctx.hooks.rooms.read().await;
+        assert!(rooms.contains_key("r"), "room should still exist");
+    }
+
+    #[tokio::test]
+    async fn test_last_peer_leaves_room_cleaned_up() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+
+        a.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rooms = ctx.hooks.rooms.read().await;
+        assert!(
+            !rooms.contains_key("r"),
+            "room should be cleaned up when last peer leaves"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_five_peers_join_and_see_each_other() {
+        let ctx = TestCtx::new().await;
+        let mut peers = Vec::new();
+        let mut handles = Vec::new();
+
+        for i in 1..=5u128 {
+            let (mut p, h) = ctx.connect_peer();
+            p.send(&SdpMessage::Join {
+                participant: pid(i),
+                room_id: "big".into(),
+                display_name: Some(format!("P{i}")),
+            });
+            let ready = p.recv().await;
+            match &ready {
+                SdpMessage::Ready {
+                    peers: existing, ..
+                } => {
+                    assert_eq!(
+                        existing.len(),
+                        (i - 1) as usize,
+                        "peer {i} should see {prev} existing",
+                        prev = i - 1
+                    );
+                }
+                _ => panic!("expected Ready for peer {i}"),
+            }
+            for earlier in peers.iter_mut() {
+                let earlier: &mut TestPeer = earlier;
+                earlier.drain().await;
+            }
+            peers.push(p);
+            handles.push(h);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sequential_join_leave_join() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        a.drain().await;
+
+        let (mut c, _hc) = ctx.connect_peer();
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        let ready = c.recv().await;
+        match &ready {
+            SdpMessage::Ready { peers, .. } => {
+                assert_eq!(peers.len(), 1);
+                assert!(peers.contains(&pid(1)), "C should see A");
+                assert!(!peers.contains(&pid(2)), "C should NOT see disconnected B");
+            }
+            _ => panic!("expected Ready"),
+        }
+
+        let msg = a.recv().await;
+        assert!(
+            matches!(msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rapid_connect_disconnect_cycle() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+
+        for i in 2..=6u128 {
+            let (mut p, _h) = ctx.connect_peer();
+            p.send(&SdpMessage::Join {
+                participant: pid(i),
+                room_id: "r".into(),
+                display_name: None,
+            });
+            p.recv().await;
+            p.disconnect();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let msgs = a.drain().await;
+
+        for i in 2..=6u128 {
+            let has_joined = msgs.iter().any(
+                |m| matches!(m, SdpMessage::PeerJoined { participant, .. } if *participant == pid(i)),
+            );
+            let has_left = msgs.iter().any(
+                |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(i)),
+            );
+            assert!(has_joined, "missing PeerJoined for pid({i})");
+            assert!(has_left, "missing PeerLeft for pid({i})");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_muted_peer_disconnects() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        b.send(&SdpMessage::MuteAudio {
+            from: pid(2),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        a.drain().await;
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let msgs = a.drain().await;
+        let has_left = msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2)),
+        );
+        assert!(
+            has_left,
+            "A should receive PeerLeft even though B was muted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_then_screen_share() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = b.drain().await;
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = b.drain().await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, SdpMessage::ScreenShareStarted { .. })),
+            "B should receive ScreenShareStarted even though A is muted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_screen_share_then_mute_then_unmute() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::UnmuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::ScreenShareStopped {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = b.drain().await;
+        let types: Vec<&str> = msgs
+            .iter()
+            .map(|m| match m {
+                SdpMessage::ScreenShareStarted { .. } => "screen_start",
+                SdpMessage::MuteAudio { .. } => "mute",
+                SdpMessage::UnmuteAudio { .. } => "unmute",
+                SdpMessage::ScreenShareStopped { .. } => "screen_stop",
+                _ => "other",
+            })
+            .collect();
+
+        assert!(
+            types.contains(&"screen_start"),
+            "missing screen_start in {:?}",
+            types
+        );
+        assert!(types.contains(&"mute"), "missing mute in {:?}", types);
+        assert!(types.contains(&"unmute"), "missing unmute in {:?}", types);
+        assert!(
+            types.contains(&"screen_stop"),
+            "missing screen_stop in {:?}",
+            types
+        );
+    }
+
+    #[tokio::test]
+    async fn test_video_config_then_disconnect() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        b.send(&SdpMessage::VideoConfigChanged {
+            from: pid(2),
+            room_id: "r".into(),
+            width: 640,
+            height: 480,
+            fps: 15,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = a.drain().await;
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::VideoConfigChanged { width: 640, .. })));
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let msgs = a.drain().await;
+        assert!(msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_video_config_change_multiple_times() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        for (w, h, f) in [(640, 480, 15), (1280, 720, 30), (1920, 1080, 60)] {
+            a.send(&SdpMessage::VideoConfigChanged {
+                from: pid(1),
+                room_id: "r".into(),
+                width: w,
+                height: h,
+                fps: f,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let msgs = b.drain().await;
+        let configs: Vec<(u32, u32, u32)> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                SdpMessage::VideoConfigChanged {
+                    width, height, fps, ..
+                } => Some((*width, *height, *fps)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(configs.len(), 3, "B should receive all 3 config changes");
+        assert_eq!(configs[2], (1920, 1080, 60), "last config should be 1080p60");
+    }
+
+    #[tokio::test]
+    async fn test_different_rooms_isolated() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b, pid(2), "room1").await;
+        a.recv().await;
+
+        join_and_register(&ctx, &mut c, pid(3), "room2").await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "room1".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        assert!(
+            b_msgs
+                .iter()
+                .any(|m| matches!(m, SdpMessage::MuteAudio { .. })),
+            "B should get mute"
+        );
+
+        let c_msgs = c.drain().await;
+        let c_has_mute = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { .. }));
+        assert!(
+            !c_has_mute,
+            "C (different room) should NOT receive MuteAudio"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_screen_share_different_rooms_isolated() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r1").await;
+        join_and_register(&ctx, &mut b, pid(2), "r1").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r2").await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r1".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let b_msgs = b.drain().await;
+        assert!(b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStarted { .. })));
+
+        let c_msgs = c.drain().await;
+        assert!(
+            !c_msgs
+                .iter()
+                .any(|m| matches!(m, SdpMessage::ScreenShareStarted { .. })),
+            "C (different room) should NOT get screen share"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_joiner_gets_display_names() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: Some("Alice".into()),
+        });
+        a.recv().await;
+
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: Some("Bob".into()),
+        });
+        let ready = b.recv().await;
+        match &ready {
+            SdpMessage::Ready {
+                display_names,
+                peers,
+                ..
+            } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(
+                    display_names.get(&pid(1).to_string()),
+                    Some(&"Alice".to_string())
+                );
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_while_sharing_and_muted() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r").await;
+        a.recv().await;
+        b.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.drain().await;
+        c.drain().await;
+
+        a.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let b_msgs = b.drain().await;
+        let has_screen_stop = b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
+        );
+        let has_left = b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
+        );
+        assert!(
+            has_screen_stop,
+            "B should get ScreenShareStopped, got: {:?}",
+            b_msgs
+        );
+        assert!(has_left, "B should get PeerLeft, got: {:?}", b_msgs);
+
+        let c_msgs = c.drain().await;
+        let has_screen_stop = c_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
+        );
+        let has_left = c_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
+        );
+        assert!(
+            has_screen_stop,
+            "C should get ScreenShareStopped, got: {:?}",
+            c_msgs
+        );
+        assert!(has_left, "C should get PeerLeft, got: {:?}", c_msgs);
+    }
+
+    #[tokio::test]
+    async fn test_all_peers_disconnect_one_by_one() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        c.recv().await;
+        a.recv().await;
+        b.recv().await;
+
+        c.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let a_msgs = a.drain().await;
+        assert!(a_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3))
+        ));
+        let b_msgs = b.drain().await;
+        assert!(b_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3))
+        ));
+
+        b.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let a_msgs = a.drain().await;
+        assert!(a_msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
+        ));
+
+        a.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let rooms = ctx.hooks.rooms.read().await;
+        assert!(!rooms.contains_key("r"));
+    }
+
+    #[tokio::test]
+    async fn test_simultaneous_disconnect_two_peers() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b.recv().await;
+        a.recv().await;
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        c.recv().await;
+        a.recv().await;
+        b.recv().await;
+
+        b.disconnect();
+        c.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let msgs = a.drain().await;
+        let left_b = msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2)),
+        );
+        let left_c = msgs.iter().any(
+            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3)),
+        );
+        assert!(left_b, "A should get PeerLeft for B");
+        assert!(left_c, "A should get PeerLeft for C");
+    }
+
+    #[tokio::test]
+    async fn test_mute_only_affects_muter() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r").await;
+        a.recv().await;
+        b.recv().await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        b.drain().await;
+        c.drain().await;
+
+        b.send(&SdpMessage::VideoConfigChanged {
+            from: pid(2),
+            room_id: "r".into(),
+            width: 1280,
+            height: 720,
+            fps: 30,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let a_msgs = a.drain().await;
+        assert!(
+            a_msgs
+                .iter()
+                .any(|m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))),
+            "A should still receive messages from non-muted B"
+        );
+
+        let c_msgs = c.drain().await;
+        assert!(
+            c_msgs
+                .iter()
+                .any(|m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))),
+            "C should still receive messages from non-muted B"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_peers_screen_share_simultaneously() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+        let (mut c, _hc) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+        join_and_register(&ctx, &mut c, pid(3), "r").await;
+        a.recv().await;
+        b.recv().await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        b.send(&SdpMessage::ScreenShareStarted {
+            from: pid(2),
+            room_id: "r".into(),
+            track_id: 2,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let c_msgs = c.drain().await;
+        let from_a = c_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(1)),
+        );
+        let from_b = c_msgs.iter().any(
+            |m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(2)),
+        );
+        assert!(from_a, "C should see A's screen share");
+        assert!(from_b, "C should see B's screen share");
+    }
+
+    #[tokio::test]
+    async fn test_peer_reconnects_after_disconnect() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b1, _hb1) = ctx.connect_peer();
+
+        a.send(&SdpMessage::Join {
+            participant: pid(1),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        a.recv().await;
+        b1.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: None,
+        });
+        b1.recv().await;
+        a.recv().await;
+
+        b1.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        a.drain().await;
+
+        let (mut b2, _hb2) = ctx.connect_peer();
+        b2.send(&SdpMessage::Join {
+            participant: pid(2),
+            room_id: "r".into(),
+            display_name: Some("Bob v2".into()),
+        });
+        let ready = b2.recv().await;
+        match &ready {
+            SdpMessage::Ready { peers, .. } => {
+                assert_eq!(peers.len(), 1);
+                assert!(peers.contains(&pid(1)));
+            }
+            _ => panic!("expected Ready"),
+        }
+
+        let msg = a.recv().await;
+        match &msg {
+            SdpMessage::PeerJoined {
+                participant,
+                display_name,
+                ..
+            } => {
+                assert_eq!(*participant, pid(2));
+                assert_eq!(display_name.as_deref(), Some("Bob v2"));
+            }
+            _ => panic!("expected PeerJoined, got {:?}", msg),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rapid_mute_unmute_10_times() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        for _ in 0..10 {
+            a.send(&SdpMessage::MuteAudio {
+                from: pid(1),
+                room_id: "r".into(),
+            });
+            a.send(&SdpMessage::UnmuteAudio {
+                from: pid(1),
+                room_id: "r".into(),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let msgs = b.drain().await;
+        let mutes = msgs
+            .iter()
+            .filter(|m| matches!(m, SdpMessage::MuteAudio { .. }))
+            .count();
+        let unmutes = msgs
+            .iter()
+            .filter(|m| matches!(m, SdpMessage::UnmuteAudio { .. }))
+            .count();
+        assert_eq!(mutes, 10, "should receive 10 mute events");
+        assert_eq!(unmutes, 10, "should receive 10 unmute events");
+    }
+
+    #[tokio::test]
+    async fn test_mute_in_room_alone() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = a.drain().await;
+        assert!(!msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_screen_share_in_room_alone() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = a.drain().await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, SdpMessage::ScreenShareStarted { .. })),
+            "A should NOT receive its own screen share"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_lifecycle_all_features() {
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "r").await;
+        join_and_register(&ctx, &mut b, pid(2), "r").await;
+        a.recv().await;
+
+        a.send(&SdpMessage::VideoConfigChanged {
+            from: pid(1),
+            room_id: "r".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::ScreenShareStarted {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::MuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::UnmuteAudio {
+            from: pid(1),
+            room_id: "r".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::VideoConfigChanged {
+            from: pid(1),
+            room_id: "r".into(),
+            width: 1280,
+            height: 720,
+            fps: 60,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.send(&SdpMessage::ScreenShareStopped {
+            from: pid(1),
+            room_id: "r".into(),
+            track_id: 1,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        a.disconnect();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let msgs = b.drain().await;
+        let types: Vec<&str> = msgs
+            .iter()
+            .map(|m| match m {
+                SdpMessage::VideoConfigChanged { .. } => "config",
+                SdpMessage::ScreenShareStarted { .. } => "screen_start",
+                SdpMessage::MuteAudio { .. } => "mute",
+                SdpMessage::UnmuteAudio { .. } => "unmute",
+                SdpMessage::ScreenShareStopped { .. } => "screen_stop",
+                SdpMessage::PeerLeft { .. } => "left",
+                _ => "other",
+            })
+            .collect();
+
+        assert!(
+            types.contains(&"config"),
+            "missing config in {:?}",
+            types
+        );
+        assert!(
+            types.contains(&"screen_start"),
+            "missing screen_start in {:?}",
+            types
+        );
+        assert!(types.contains(&"mute"), "missing mute in {:?}", types);
+        assert!(types.contains(&"unmute"), "missing unmute in {:?}", types);
+        assert!(
+            types.contains(&"screen_stop"),
+            "missing screen_stop in {:?}",
+            types
+        );
+        assert!(types.contains(&"left"), "missing left in {:?}", types);
+
+        let config_count = types.iter().filter(|&&t| t == "config").count();
+        assert_eq!(config_count, 2, "should have 2 config changes");
+
+        let screen_stop_count = types.iter().filter(|&&t| t == "screen_stop").count();
+        assert!(
+            screen_stop_count >= 1,
+            "should have at least 1 screen_stop"
+        );
+    }
+
+    // ── Reconnect ghost tile tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_reconnect_new_uuid_does_not_see_ghost_tile() {
+        // Simulate: user "bb" (pid=2) is in a room with "aaa" (pid=1).
+        // "bb" refreshes → old WS drops, new WS connects with pid=3 (new UUID).
+        // Before old disconnect handler runs, new pid=3 joins.
+        // The Ready message for pid=3 must NOT include pid=2 (stale).
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b_old, _hb) = ctx.connect_peer();
+
+        // Both join room.
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b_old, pid(2), "room1").await;
+        a.drain().await; // clear peer_joined etc.
+
+        // "bb" drops old WS (simulates tab close/refresh).
+        b_old.disconnect();
+        // Small yield so the channel close propagates.
+        tokio::task::yield_now().await;
+
+        // New "bb" connects with a new UUID before old disconnect handler runs.
+        let (mut b_new, _hb2) = ctx.connect_peer();
+        b_new.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("bb".into()),
+        });
+        let ready = b_new.recv().await;
+        match ready {
+            SdpMessage::Ready { peers, .. } => {
+                // pid=2 (old "bb") must NOT be in the peers list.
+                assert!(
+                    !peers.contains(&pid(2)),
+                    "stale peer pid=2 should have been pruned, but peers = {:?}",
+                    peers
+                );
+                // pid=1 ("aaa") should be present.
+                assert!(
+                    peers.contains(&pid(1)),
+                    "active peer pid=1 should be in peers list"
+                );
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_peer_left_arrives_before_peer_joined() {
+        // When "bb" refreshes (UUID-2 → UUID-3), "aaa" (pid=1) must receive
+        // peer_left(UUID-2) BEFORE peer_joined(UUID-3) so the frontend
+        // frees the transceiver slot before allocating a new one.
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b_old, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b_old, pid(2), "room1").await;
+        a.drain().await;
+
+        // "bb" drops old WS.
+        b_old.disconnect();
+        tokio::task::yield_now().await;
+
+        // New "bb" joins with a new UUID.
+        let (mut b_new, _hb2) = ctx.connect_peer();
+        b_new.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("bb".into()),
+        });
+        // Wait for b_new's Ready.
+        b_new.recv().await;
+
+        // Collect all messages "aaa" received.
+        let msgs = a.drain().await;
+        let types: Vec<&str> = msgs.iter().map(|m| match m {
+            SdpMessage::PeerLeft { .. } => "peer_left",
+            SdpMessage::PeerJoined { .. } => "peer_joined",
+            SdpMessage::ScreenShareStopped { .. } => "screen_stop",
+            _ => "other",
+        }).collect();
+
+        // Must have peer_left before peer_joined.
+        let left_idx = types.iter().position(|&t| t == "peer_left");
+        let joined_idx = types.iter().position(|&t| t == "peer_joined");
+        assert!(
+            left_idx.is_some(),
+            "aaa should receive peer_left for old bb, got: {:?}", types
+        );
+        assert!(
+            joined_idx.is_some(),
+            "aaa should receive peer_joined for new bb, got: {:?}", types
+        );
+        assert!(
+            left_idx.unwrap() < joined_idx.unwrap(),
+            "peer_left must arrive BEFORE peer_joined, got: {:?}", types
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_stale_does_not_remove_active_peers() {
+        // Verify that prune_stale only removes closed connections,
+        // not active ones.
+        let ctx = TestCtx::new().await;
+        let (mut a, _ha) = ctx.connect_peer();
+        let (mut b, _hb) = ctx.connect_peer();
+
+        join_and_register(&ctx, &mut a, pid(1), "room1").await;
+        join_and_register(&ctx, &mut b, pid(2), "room1").await;
+        a.drain().await;
+        b.drain().await;
+
+        // Third peer joins — both pid=1 and pid=2 should appear (neither is stale).
+        let (mut c, _hc) = ctx.connect_peer();
+        c.send(&SdpMessage::Join {
+            participant: pid(3),
+            room_id: "room1".into(),
+            display_name: Some("cc".into()),
+        });
+        let ready = c.recv().await;
+        match ready {
+            SdpMessage::Ready { peers, .. } => {
+                assert!(peers.contains(&pid(1)), "pid=1 should be present");
+                assert!(peers.contains(&pid(2)), "pid=2 should be present");
+                assert_eq!(peers.len(), 2);
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+}

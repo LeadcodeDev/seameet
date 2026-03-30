@@ -1,25 +1,45 @@
 //! Signaling layer for the SeaMeet real-time communication framework.
 //!
-//! Provides WebSocket-based signaling for SDP offer/answer exchange,
+//! Provides transport-agnostic signaling for SDP offer/answer exchange,
 //! ICE candidate forwarding, and room management.
+//!
+//! The core types ([`engine`], [`transport`], [`message`]) are always
+//! available. WebSocket adapters are gated behind the `tungstenite` feature flag
+//! (enabled by default).
 
+pub mod engine;
 pub mod message;
-pub mod room_server;
 pub mod traits;
+pub mod transport;
+
+#[cfg(feature = "tungstenite")]
 pub mod ws;
+#[cfg(feature = "tungstenite")]
+pub mod ws_listener;
+#[cfg(feature = "tungstenite")]
+pub mod room_server;
 
 pub use message::SdpMessage;
 pub use traits::SignalingBackend;
+
+#[cfg(feature = "tungstenite")]
 pub use ws::{WsSignaling, WsSignalingConfig};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use room_server::RoomServer;
+    use engine::SignalingState;
     use seameet_core::ParticipantId;
+    use std::collections::HashSet;
     use std::time::Duration;
 
+    #[cfg(feature = "tungstenite")]
+    use room_server::RoomServer;
+    #[cfg(feature = "tungstenite")]
+    use ws::WsSignaling;
+
     /// Starts a local room server and returns the `ws://` URL.
+    #[cfg(feature = "tungstenite")]
     async fn start_server() -> String {
         let server = RoomServer::bind("127.0.0.1:0").await.expect("bind");
         let addr = server.local_addr().expect("local_addr");
@@ -28,6 +48,7 @@ mod tests {
     }
 
     /// Helper: receive the next SdpMessage, skipping Ready and Join control messages.
+    #[cfg(feature = "tungstenite")]
     async fn recv_skip_control(ws: &mut WsSignaling) -> SdpMessage {
         loop {
             let msg = ws.recv().await.expect("recv");
@@ -38,6 +59,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_ws_connect() {
         let url = start_server().await;
@@ -45,6 +67,7 @@ mod tests {
         assert!(ws.is_ok());
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_offer_answer_exchange() {
         let url = start_server().await;
@@ -57,6 +80,7 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "room-1".into(),
+            display_name: None,
         })
         .await
         .expect("A join");
@@ -64,6 +88,7 @@ mod tests {
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "room-1".into(),
+            display_name: None,
         })
         .await
         .expect("B join");
@@ -107,6 +132,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_ice_candidate_forward() {
         let url = start_server().await;
@@ -119,12 +145,14 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "room-ice".into(),
+            display_name: None,
         })
         .await
         .expect("A join");
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "room-ice".into(),
+            display_name: None,
         })
         .await
         .expect("B join");
@@ -154,6 +182,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_auto_leave_on_disconnect() {
         let url = start_server().await;
@@ -166,12 +195,14 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "room-leave".into(),
+            display_name: None,
         })
         .await
         .expect("A join");
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "room-leave".into(),
+            display_name: None,
         })
         .await
         .expect("B join");
@@ -199,9 +230,11 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_reconnection_backoff() {
         use std::time::Instant;
+        use ws::WsSignalingConfig;
 
         let config = WsSignalingConfig {
             recv_timeout: Duration::from_secs(5),
@@ -225,6 +258,7 @@ mod tests {
 
     // ── New multi-room tests ────────────────────────────────────────────
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_single_ws_two_rooms() {
         let url = start_server().await;
@@ -238,12 +272,14 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "alpha".into(),
+            display_name: None,
         })
         .await
         .expect("A join alpha");
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "beta".into(),
+            display_name: None,
         })
         .await
         .expect("A join beta");
@@ -252,6 +288,7 @@ mod tests {
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "alpha".into(),
+            display_name: None,
         })
         .await
         .expect("B join alpha");
@@ -285,6 +322,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_disconnect_leaves_all_rooms() {
         let url = start_server().await;
@@ -299,6 +337,7 @@ mod tests {
             b.send(SdpMessage::Join {
                 participant: id_b,
                 room_id: room.into(),
+                display_name: None,
             })
             .await
             .expect("B join");
@@ -309,6 +348,7 @@ mod tests {
             a.send(SdpMessage::Join {
                 participant: id_a,
                 room_id: room.into(),
+                display_name: None,
             })
             .await
             .expect("A join");
@@ -353,6 +393,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_initiator_flag() {
         let url = start_server().await;
@@ -366,6 +407,7 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "init-room".into(),
+            display_name: None,
         })
         .await
         .expect("A join");
@@ -387,6 +429,7 @@ mod tests {
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "init-room".into(),
+            display_name: None,
         })
         .await
         .expect("B join");
@@ -405,6 +448,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_room_id_routing() {
         let url = start_server().await;
@@ -420,24 +464,28 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "alpha".into(),
+            display_name: None,
         })
         .await
         .expect("A join alpha");
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "beta".into(),
+            display_name: None,
         })
         .await
         .expect("A join beta");
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "alpha".into(),
+            display_name: None,
         })
         .await
         .expect("B join alpha");
         c.send(SdpMessage::Join {
             participant: id_c,
             room_id: "beta".into(),
+            display_name: None,
         })
         .await
         .expect("C join beta");
@@ -480,6 +528,7 @@ mod tests {
         assert!(!saw_offer, "C should not receive offers from room alpha");
     }
 
+    #[cfg(feature = "tungstenite")]
     #[tokio::test]
     async fn test_screen_share_routing() {
         let url = start_server().await;
@@ -492,12 +541,14 @@ mod tests {
         a.send(SdpMessage::Join {
             participant: id_a,
             room_id: "screen-room".into(),
+            display_name: None,
         })
         .await
         .expect("A join");
         b.send(SdpMessage::Join {
             participant: id_b,
             room_id: "screen-room".into(),
+            display_name: None,
         })
         .await
         .expect("B join");
@@ -523,6 +574,4 @@ mod tests {
             other => panic!("expected ScreenShareStarted, got {other:?}"),
         }
     }
-
-    use std::collections::HashSet;
 }

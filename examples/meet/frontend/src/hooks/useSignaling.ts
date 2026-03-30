@@ -9,13 +9,17 @@ export interface UseSignalingOptions {
 export interface UseSignalingReturn {
   send: (msg: SignalingMessage) => void
   state: 'connecting' | 'open' | 'closed'
+  close: () => void
   join: (participantId: string, roomId: string, displayName?: string) => void
   sendOffer: (from: string, roomId: string, sdp: string) => void
   sendAnswer: (from: string, to: string, roomId: string, sdp: string) => void
   sendIceCandidate: (from: string, to: string, roomId: string, candidate: RTCIceCandidate) => void
+  sendMuteAudio: (from: string, roomId: string) => void
+  sendUnmuteAudio: (from: string, roomId: string) => void
+  sendVideoConfig: (from: string, roomId: string, width: number, height: number, fps: number) => void
 }
 
-const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:3001'
+const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.hostname}:3001`
 
 export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignalingReturn {
   const wsUrl = url ?? DEFAULT_WS_URL
@@ -45,6 +49,9 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     ws.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as SignalingMessage
+        if (data.type === 'peer_left' || data.type === 'peer_joined') {
+          console.log(`[Signaling] ${data.type}: ${data.participant.slice(0, 8)}`)
+        }
         onMessageRef.current(data)
       } catch {
         // ignore malformed messages
@@ -129,5 +136,29 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     })
   }, [send])
 
-  return { send, state, join, sendOffer, sendAnswer, sendIceCandidate }
+  const sendMuteAudio = useCallback((from: string, roomId: string) => {
+    send({ type: 'mute_audio', from, room_id: roomId })
+  }, [send])
+
+  const sendUnmuteAudio = useCallback((from: string, roomId: string) => {
+    send({ type: 'unmute_audio', from, room_id: roomId })
+  }, [send])
+
+  const sendVideoConfig = useCallback((from: string, roomId: string, width: number, height: number, fps: number) => {
+    send({ type: 'video_config_changed', from, room_id: roomId, width, height, fps })
+  }, [send])
+
+  const close = useCallback(() => {
+    mountedRef.current = false
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+  }, [])
+
+  return { send, state, close, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig }
 }

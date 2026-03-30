@@ -3,6 +3,7 @@ import { Mic, MicOff, Video, VideoOff, Monitor, Phone, Copy, Check } from 'lucid
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useCall } from '@/context/CallContext'
+import { VideoSettingsPopover } from '@/components/VideoSettingsPopover'
 
 export function ControlBar() {
   const {
@@ -84,6 +85,9 @@ export function ControlBar() {
         </TooltipTrigger>
         <TooltipContent>{localScreenStream ? 'Stop sharing' : 'Share screen'}</TooltipContent>
       </Tooltip>
+
+      {/* Video settings */}
+      <VideoSettingsPopover />
 
       {/* Copy room link */}
       <Tooltip>

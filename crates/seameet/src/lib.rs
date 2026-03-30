@@ -77,8 +77,16 @@ pub use seameet_core::Passthrough;
 
 // ── Signaling ───────────────────────────────────────────────────────────
 
-pub use seameet_signaling::room_server::{dispatch as signaling_dispatch, SignalingState};
-pub use seameet_signaling::{SdpMessage, SignalingBackend, WsSignaling, WsSignalingConfig};
+pub use seameet_signaling::engine::{
+    dispatch as signaling_dispatch, run_connection, NoopHooks, SignalingHooks, SignalingState,
+};
+pub use seameet_signaling::transport::{ConnectionReader, IncomingConnection, TransportListener};
+pub use seameet_signaling::{SdpMessage, SignalingBackend};
+
+#[cfg(feature = "tungstenite")]
+pub use seameet_signaling::{WsSignaling, WsSignalingConfig};
+#[cfg(feature = "tungstenite")]
+pub use seameet_signaling::ws_listener::WsListener;
 
 // ── Pipeline (low-level escape hatch) ───────────────────────────────────
 
@@ -86,6 +94,11 @@ pub use seameet_pipeline::{
     InboundPipeline, MediaKind, Mid, OutboundPipeline, PeerCmd, PeerConnection, PeerEvent,
     ProcessorChain,
 };
+
+// ── SFU ───────────────────────────────────────────────────────────────
+
+#[cfg(feature = "sfu")]
+pub use seameet_sfu as sfu;
 
 // ── High-level facade ───────────────────────────────────────────────────
 

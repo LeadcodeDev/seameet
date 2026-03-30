@@ -8,13 +8,7 @@ name = "meet"
 path = "server/main.rs"
 
 [dependencies]
-seameet             = { path = "../../crates/seameet" }
+seameet             = { path = "../../crates/seameet", features = ["tungstenite", "sfu"] }
 tokio               = { workspace = true }
-tokio-tungstenite   = "0.21"
 tracing             = { workspace = true }
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
-serde_json          = { workspace = true }
-serde               = { workspace = true }
-futures-util        = "0.3"
-str0m               = { workspace = true }
-uuid                = { workspace = true }

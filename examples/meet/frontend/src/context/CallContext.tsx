@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSignaling } from '@/hooks/useSignaling'
-import { useMediaDevices } from '@/hooks/useMediaDevices'
+import { useMediaDevices, type VideoSettings } from '@/hooks/useMediaDevices'
 import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
 import type { SignalingMessage } from '@/types'
 
@@ -13,8 +13,10 @@ interface CallContextValue {
   remotePeers: Map<string, RemotePeer>
   audioEnabled: boolean
   videoEnabled: boolean
+  videoSettings: VideoSettings
   toggleAudio: () => void
   toggleVideo: () => void
+  updateVideoSettings: (settings: VideoSettings) => void
   startScreenShare: () => Promise<void>
   stopScreenShare: () => Promise<void>
   localScreenStream: MediaStream | null
@@ -59,6 +61,7 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     roomId,
     localStream: media.localStream,
     signaling,
+    videoSettings: media.videoSettings,
   })
 
   // Wire WebRTC handler — updated every render (safe, no side effects)
@@ -84,6 +87,38 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     }
   }, [signaling.state])
 
+  const handleToggleAudio = useCallback(() => {
+    const willBeMuted = media.audioEnabled
+    media.toggleAudio()
+    if (willBeMuted) {
+      signaling.send({ type: 'mute_audio', from: participantId, room_id: roomId })
+    } else {
+      signaling.send({ type: 'unmute_audio', from: participantId, room_id: roomId })
+    }
+  }, [media, signaling, participantId, roomId])
+
+  const handleToggleVideo = useCallback(() => {
+    const willBeMuted = media.videoEnabled
+    media.toggleVideo()
+    if (willBeMuted) {
+      signaling.send({ type: 'mute_video', from: participantId, room_id: roomId })
+    } else {
+      signaling.send({ type: 'unmute_video', from: participantId, room_id: roomId })
+    }
+  }, [media, signaling, participantId, roomId])
+
+  const handleUpdateVideoSettings = useCallback((settings: VideoSettings) => {
+    media.updateVideoSettings(settings)
+    signaling.send({
+      type: 'video_config_changed',
+      from: participantId,
+      room_id: roomId,
+      width: settings.width,
+      height: settings.height,
+      fps: settings.frameRate,
+    })
+  }, [media, signaling, participantId, roomId])
+
   const handleStartScreenShare = useCallback(async () => {
     const stream = await media.startScreenShare()
     await webrtc.startScreenShare(stream)
@@ -95,24 +130,9 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
   }, [media, webrtc])
 
   const leave = useCallback(() => {
-    // Stop screen share if active before leaving
-    if (webrtc.localScreenStream) {
-      media.stopScreenShare()
-      // Send screen_share_stopped so other peers clean up the tile
-      signaling.send({
-        type: 'screen_share_stopped',
-        from: participantId,
-        room_id: roomId,
-        track_id: 0,
-      })
-    }
-    signaling.send({
-      type: 'leave',
-      participant: participantId,
-      room_id: roomId,
-    })
+    signaling.close()
     navigate('/')
-  }, [signaling, participantId, roomId, navigate, webrtc.localScreenStream, media])
+  }, [signaling, navigate])
 
   const value: CallContextValue = {
     participantId,
@@ -122,8 +142,10 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     remotePeers: webrtc.remotePeers,
     audioEnabled: media.audioEnabled,
     videoEnabled: media.videoEnabled,
-    toggleAudio: media.toggleAudio,
-    toggleVideo: media.toggleVideo,
+    videoSettings: media.videoSettings,
+    toggleAudio: handleToggleAudio,
+    toggleVideo: handleToggleVideo,
+    updateVideoSettings: handleUpdateVideoSettings,
     startScreenShare: handleStartScreenShare,
     stopScreenShare: handleStopScreenShare,
     localScreenStream: webrtc.localScreenStream,

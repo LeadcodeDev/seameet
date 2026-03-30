@@ -46,8 +46,8 @@ export function VideoGrid() {
             stream={peer.stream}
             name={peer.displayName}
             isLocal={false}
-            audioEnabled
-            videoEnabled
+            audioEnabled={!peer.audioMuted}
+            videoEnabled={!peer.videoMuted}
           />
           {peer.screenStream && (
             <VideoTile

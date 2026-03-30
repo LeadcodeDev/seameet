@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use seameet_core::ParticipantId;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +16,9 @@ pub enum SdpMessage {
         participant: ParticipantId,
         /// Target room identifier.
         room_id: String,
+        /// Optional human-readable name for this participant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// Notification that a participant has left a room.
     Leave {
@@ -68,6 +73,9 @@ pub enum SdpMessage {
         /// List of peers already present in the room.
         #[serde(default)]
         peers: Vec<ParticipantId>,
+        /// Display names of the existing peers, keyed by participant ID.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        display_names: HashMap<String, String>,
     },
     /// Sent by the server when a new peer joins the room.
     PeerJoined {
@@ -75,6 +83,9 @@ pub enum SdpMessage {
         participant: ParticipantId,
         /// The room identifier.
         room_id: String,
+        /// Optional human-readable name for this participant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// Sent by the server when a peer leaves the room.
     PeerLeft {
@@ -101,6 +112,54 @@ pub enum SdpMessage {
         /// Track identifier that was stopped.
         track_id: u32,
     },
+    /// Emitted by the client when they mute their microphone.
+    MuteAudio {
+        /// The participant muting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they unmute their microphone.
+    UnmuteAudio {
+        /// The participant unmuting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they mute their camera.
+    MuteVideo {
+        /// The participant muting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they unmute their camera.
+    UnmuteVideo {
+        /// The participant unmuting.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+    },
+    /// Emitted by the client when they change video settings.
+    VideoConfigChanged {
+        /// The participant changing config.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+        /// Video width in pixels.
+        width: u32,
+        /// Video height in pixels.
+        height: u32,
+        /// Frames per second.
+        fps: u32,
+    },
+    /// Sent by the server to request the client to renegotiate with more slots.
+    RequestRenegotiation {
+        /// The room this request belongs to.
+        room_id: String,
+        /// Number of additional slots (audio+video pairs) needed.
+        needed_slots: u32,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -123,7 +182,13 @@ impl SdpMessage {
             | Self::PeerJoined { room_id, .. }
             | Self::PeerLeft { room_id, .. }
             | Self::ScreenShareStarted { room_id, .. }
-            | Self::ScreenShareStopped { room_id, .. } => Some(room_id),
+            | Self::ScreenShareStopped { room_id, .. }
+            | Self::MuteAudio { room_id, .. }
+            | Self::UnmuteAudio { room_id, .. }
+            | Self::MuteVideo { room_id, .. }
+            | Self::UnmuteVideo { room_id, .. }
+            | Self::VideoConfigChanged { room_id, .. }
+            | Self::RequestRenegotiation { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -168,6 +233,7 @@ mod tests {
             SdpMessage::Join {
                 participant: id_a(),
                 room_id: "room-42".into(),
+                display_name: None,
             },
             SdpMessage::Leave {
                 participant: id_a(),
@@ -177,6 +243,11 @@ mod tests {
                 room_id: "r1".into(),
                 initiator: true,
                 peers: vec![],
+                display_names: HashMap::new(),
+            },
+            SdpMessage::RequestRenegotiation {
+                room_id: "r1".into(),
+                needed_slots: 3,
             },
             SdpMessage::Error {
                 code: 404,
@@ -196,6 +267,7 @@ mod tests {
         let msg = SdpMessage::Join {
             participant: id_a(),
             room_id: "test".into(),
+            display_name: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"type\":\"join\""));
@@ -206,7 +278,8 @@ mod tests {
         assert_eq!(
             SdpMessage::Join {
                 participant: id_a(),
-                room_id: "r1".into()
+                room_id: "r1".into(),
+                display_name: None,
             }
             .room_id(),
             Some("r1")
@@ -234,6 +307,7 @@ mod tests {
                 room_id: "r4".into(),
                 initiator: false,
                 peers: vec![],
+                display_names: HashMap::new(),
             }
             .room_id(),
             Some("r4")
@@ -254,6 +328,14 @@ mod tests {
             }
             .room_id(),
             Some("r5")
+        );
+        assert_eq!(
+            SdpMessage::RequestRenegotiation {
+                room_id: "r6".into(),
+                needed_slots: 2
+            }
+            .room_id(),
+            Some("r6")
         );
     }
 
@@ -277,5 +359,47 @@ mod tests {
         let json2 = serde_json::to_string(&msg2).expect("ser");
         let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
         assert_eq!(back2, msg2);
+    }
+
+    #[test]
+    fn test_mute_audio_serde() {
+        let msg = SdpMessage::MuteAudio {
+            from: id_a(),
+            room_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"mute_audio\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+
+        let msg2 = SdpMessage::UnmuteAudio {
+            from: id_a(),
+            room_id: "r1".into(),
+        };
+        let json2 = serde_json::to_string(&msg2).expect("ser");
+        assert!(json2.contains("\"type\":\"unmute_audio\""));
+        let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
+        assert_eq!(back2, msg2);
+        assert_eq!(msg2.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_video_config_changed_serde() {
+        let msg = SdpMessage::VideoConfigChanged {
+            from: id_a(),
+            room_id: "r1".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"video_config_changed\""));
+        assert!(json.contains("\"width\":1920"));
+        assert!(json.contains("\"height\":1080"));
+        assert!(json.contains("\"fps\":30"));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
     }
 }
