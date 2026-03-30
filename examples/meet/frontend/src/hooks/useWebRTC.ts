@@ -51,6 +51,7 @@ export interface UseWebRTCReturn {
   startScreenShare: (screenStream: MediaStream) => Promise<void>
   stopScreenShare: () => Promise<void>
   localScreenStream: MediaStream | null
+  replaceLocalTracks: (stream: MediaStream) => Promise<void>
 }
 
 export function useWebRTC({
@@ -70,6 +71,8 @@ export function useWebRTC({
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
+  const localAudioTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
+  const localVideoTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
 
   // Pool of pre-allocated transceiver pairs from the initial offer.
@@ -276,16 +279,20 @@ export function useWebRTC({
       }
     }
 
-    // Add local tracks (must be available — CallContext waits for localStream)
+    // Add local tracks or dummy transceivers for send slots
     const stream = localStreamRef.current
     if (stream) {
       stream.getTracks().forEach((track) => {
         pc.addTrack(track, stream)
       })
+      // Find local transceivers by track kind
+      const transceivers = pc.getTransceivers()
+      localAudioTransceiverRef.current = transceivers.find(t => t.sender.track?.kind === 'audio') ?? null
+      localVideoTransceiverRef.current = transceivers.find(t => t.sender.track?.kind === 'video') ?? null
       console.log(`[WebRTC] added ${stream.getTracks().length} local tracks`)
     } else {
-      pc.addTransceiver('audio', { direction: 'sendrecv' })
-      pc.addTransceiver('video', { direction: 'sendrecv' })
+      localAudioTransceiverRef.current = pc.addTransceiver('audio', { direction: 'sendrecv' })
+      localVideoTransceiverRef.current = pc.addTransceiver('video', { direction: 'sendrecv' })
       console.log('[WebRTC] no local media — added dummy transceivers')
     }
 
@@ -482,6 +489,21 @@ export function useWebRTC({
     }
   }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, updateRemotePeersState])
 
+  const replaceLocalTracks = useCallback(async (stream: MediaStream) => {
+    const audioTrack = stream.getAudioTracks()[0] ?? null
+    const videoTrack = stream.getVideoTracks()[0] ?? null
+    if (localAudioTransceiverRef.current && audioTrack) {
+      await localAudioTransceiverRef.current.sender.replaceTrack(audioTrack)
+      console.log('[WebRTC] replaced local audio track')
+    }
+    if (localVideoTransceiverRef.current && videoTrack) {
+      await localVideoTransceiverRef.current.sender.replaceTrack(videoTrack)
+      console.log('[WebRTC] replaced local video track')
+    }
+    // Renegotiate so the SFU receives an updated offer with active media
+    await renegotiate()
+  }, [renegotiate])
+
   const startScreenShare = useCallback(async (screenStream: MediaStream) => {
     const pc = pcRef.current
     if (!pc) return
@@ -606,5 +628,6 @@ export function useWebRTC({
     startScreenShare,
     stopScreenShare,
     localScreenStream,
+    replaceLocalTracks,
   }
 }
