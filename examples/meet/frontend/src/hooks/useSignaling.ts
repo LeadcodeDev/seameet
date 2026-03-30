@@ -9,6 +9,7 @@ export interface UseSignalingOptions {
 export interface UseSignalingReturn {
   send: (msg: SignalingMessage) => void
   state: 'connecting' | 'open' | 'closed'
+  close: () => void
   join: (participantId: string, roomId: string, displayName?: string) => void
   sendOffer: (from: string, roomId: string, sdp: string) => void
   sendAnswer: (from: string, to: string, roomId: string, sdp: string) => void
@@ -147,5 +148,17 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     send({ type: 'video_config_changed', from, room_id: roomId, width, height, fps })
   }, [send])
 
-  return { send, state, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig }
+  const close = useCallback(() => {
+    mountedRef.current = false
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+  }, [])
+
+  return { send, state, close, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig }
 }

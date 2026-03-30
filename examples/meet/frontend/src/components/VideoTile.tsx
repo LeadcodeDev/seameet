@@ -25,8 +25,25 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream
+    const video = videoRef.current
+    if (!video) return
+
+    // Null first to force Chrome to tear down and reinit the decoder
+    // even when the same track objects are reused on a new MediaStream.
+    video.srcObject = null
+    video.srcObject = stream
+
+    if (!stream) return
+
+    const tryPlay = () => { video.play().catch(() => {}) }
+    tryPlay()
+
+    // When a track unmutes (RTP starts arriving after reconnection),
+    // autoPlay may not re-trigger — force playback.
+    const tracks = stream.getTracks()
+    for (const t of tracks) t.addEventListener('unmute', tryPlay)
+    return () => {
+      for (const t of tracks) t.removeEventListener('unmute', tryPlay)
     }
   }, [stream])
 

@@ -519,6 +519,26 @@ impl SignalingHooks for SfuServer {
                             }
                         }
                     }
+
+                    // Rapid reconnect: if the joining participant is already in
+                    // room_peers but was NOT caught by prune_stale, notify other
+                    // media tasks so they clear the stale source_slot.  Without
+                    // this, the old slot is silently reused and no keyframe is
+                    // requested for the new media stream → frozen video.
+                    if !pruned.contains(&pid) {
+                        let rooms = self.rooms.read().await;
+                        if let Some(room) = rooms.get(room_id) {
+                            let p = room.peers.read().await;
+                            if p.contains_key(&pid) {
+                                info!(participant = %pid, room = room_id, "SFU: re-join detected (not pruned), sending PeerLeft to media tasks");
+                                for (id, peer) in p.iter() {
+                                    if *id != pid {
+                                        let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 {
