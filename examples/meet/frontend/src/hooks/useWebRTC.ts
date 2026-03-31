@@ -500,9 +500,9 @@ export function useWebRTC({
       await localVideoTransceiverRef.current.sender.replaceTrack(videoTrack)
       console.log('[WebRTC] replaced local video track')
     }
-    // Renegotiate so the SFU receives an updated offer with active media
-    await renegotiate()
-  }, [renegotiate])
+    // No renegotiation needed — replaceTrack sends media on the existing transceiver.
+    // Renegotiation during ICE connecting causes str0m to fail ICE.
+  }, [])
 
   const startScreenShare = useCallback(async (screenStream: MediaStream) => {
     const pc = pcRef.current

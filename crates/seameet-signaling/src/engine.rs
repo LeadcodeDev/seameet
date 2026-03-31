@@ -443,47 +443,10 @@ pub async fn dispatch(
 
             // Prune zombie members whose WS connection closed but whose
             // disconnect handler hasn't run yet (race on tab refresh).
-            let pruned_pids: Vec<ParticipantId> = if let Some(room) = st.room_mut(room_id) {
+            if let Some(room) = st.room_mut(room_id) {
                 let pruned = room.prune_stale();
                 for stale_pid in &pruned {
                     info!(participant = %stale_pid, room = room_id, "pruned stale member on join");
-                }
-                pruned
-            } else {
-                vec![]
-            };
-
-            // Broadcast PeerLeft for pruned zombies BEFORE PeerJoined, so that
-            // existing peers free their transceiver slots before allocating new ones.
-            if !pruned_pids.is_empty() {
-                let active_sinks = st.room(room_id)
-                    .map(|r| r.peer_sinks(participant))
-                    .unwrap_or_default();
-                for stale_pid in &pruned_pids {
-                    let peer_left = SdpMessage::PeerLeft {
-                        participant: *stale_pid,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&peer_left) {
-                        for sink in &active_sinks {
-                            let _ = sink.send(json.clone());
-                        }
-                    }
-                }
-            }
-
-            // If this participant is already in the room (rapid reconnect),
-            // broadcast PeerLeft so other peers clean up the stale entry.
-            if let Some(room) = st.room(room_id) {
-                if room.get(participant).is_some() {
-                    tracing::warn!(%participant, %room_id, "re-join detected, broadcasting PeerLeft for stale entry");
-                    let peer_left = SdpMessage::PeerLeft {
-                        participant: *participant,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&peer_left) {
-                        room.broadcast(&json, participant);
-                    }
                 }
             }
 
@@ -510,22 +473,8 @@ pub async fn dispatch(
                 let _ = self_tx.send(json);
             }
 
-            // Notify existing peers about the new joiner.
-            if !initiator {
-                let peer_sinks = st.peers(room_id, participant);
-                let peer_joined = SdpMessage::PeerJoined {
-                    participant: *participant,
-                    room_id: room_id.clone(),
-                    display_name: display_name.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&peer_joined) {
-                    for peer_tx in peer_sinks {
-                        let _ = peer_tx.send(json.clone());
-                    }
-                }
-            }
-
             // Broadcast room_status snapshot to ALL members (including the new joiner).
+            // This replaces the individual PeerJoined WS broadcast.
             broadcast_room_status(&st, room_id);
             drop(st);
 
@@ -536,20 +485,10 @@ pub async fn dispatch(
             room_id,
         } => {
             let mut st = state.write().await;
-            let peers = st.peers(room_id, participant);
             st.leave(participant, room_id);
 
-            let peer_left = SdpMessage::PeerLeft {
-                participant: *participant,
-                room_id: room_id.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&peer_left) {
-                for peer_tx in peers {
-                    let _ = peer_tx.send(json.clone());
-                }
-            }
-
             // Broadcast room_status snapshot to remaining members.
+            // This replaces the individual PeerLeft WS broadcast.
             broadcast_room_status(&st, room_id);
             drop(st);
 
@@ -727,27 +666,16 @@ pub async fn run_connection<H: SignalingHooks>(
             warn!(participant = %pid, "disconnect: no affected rooms");
         }
 
-        // Broadcast PeerLeft + room_status to remaining peers.
+        // Broadcast room_status to remaining peers (replaces individual PeerLeft).
         for (room_id, _) in &affected {
-            let peer_left = SdpMessage::PeerLeft {
-                participant: pid,
-                room_id: room_id.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&peer_left) {
-                let st = state.read().await;
-                let peers = st.peers(room_id, &pid);
-                info!(
-                    participant = %pid,
-                    room = %room_id,
-                    peer_count = peers.len(),
-                    "broadcasting PeerLeft"
-                );
-                for peer_tx in peers {
-                    let _ = peer_tx.send(json.clone());
-                }
-                broadcast_room_status(&st, room_id);
-                drop(st);
-            }
+            let st = state.read().await;
+            info!(
+                participant = %pid,
+                room = %room_id,
+                "broadcasting room_status after disconnect"
+            );
+            broadcast_room_status(&st, room_id);
+            drop(st);
         }
 
         // Notify hooks about the disconnect.

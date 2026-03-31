@@ -212,21 +212,30 @@ mod tests {
         a.close().await.expect("A close");
         drop(a);
 
+        // After disconnect, B receives a RoomStatus without A (replaces PeerLeft).
+        // Skip any earlier RoomStatus messages from the join phase.
         let msg = tokio::time::timeout(Duration::from_secs(5), async {
-            recv_skip_control(&mut b).await
+            loop {
+                let msg = b.recv().await.expect("recv");
+                if let SdpMessage::RoomStatus { room_id, participants } = &msg {
+                    if room_id == "room-leave" && !participants.iter().any(|p| p.id == id_a) {
+                        return msg;
+                    }
+                }
+            }
         })
         .await
-        .expect("timeout waiting for leave");
+        .expect("timeout waiting for room_status without A");
 
         match msg {
-            SdpMessage::PeerLeft {
-                participant,
+            SdpMessage::RoomStatus {
                 room_id,
+                participants,
             } => {
-                assert_eq!(participant, id_a);
                 assert_eq!(room_id, "room-leave");
+                assert!(participants.iter().any(|p| p.id == id_b), "B should still be in room_status");
             }
-            other => panic!("expected PeerLeft, got {other:?}"),
+            other => panic!("expected RoomStatus, got {other:?}"),
         }
     }
 
@@ -360,36 +369,37 @@ mod tests {
         a.close().await.expect("A close");
         drop(a);
 
-        // B should receive PeerLeft for A in all 3 rooms.
+        // B should receive RoomStatus (without A) for all 3 rooms.
         let mut leave_rooms = HashSet::new();
         for _ in 0..20 {
             match tokio::time::timeout(Duration::from_secs(2), b.recv()).await {
-                Ok(Ok(SdpMessage::PeerLeft {
-                    participant,
+                Ok(Ok(SdpMessage::RoomStatus {
                     room_id,
+                    participants,
                 })) => {
-                    assert_eq!(participant, id_a);
-                    leave_rooms.insert(room_id);
-                    if leave_rooms.len() == 3 {
-                        break;
+                    if !participants.iter().any(|p| p.id == id_a) {
+                        leave_rooms.insert(room_id);
+                        if leave_rooms.len() == 3 {
+                            break;
+                        }
                     }
                 }
-                Ok(Ok(_)) => continue, // Skip Ready/Join messages.
+                Ok(Ok(_)) => continue,
                 _ => break,
             }
         }
 
         assert!(
             leave_rooms.contains("r1"),
-            "expected PeerLeft in r1, got: {leave_rooms:?}"
+            "expected RoomStatus without A in r1, got: {leave_rooms:?}"
         );
         assert!(
             leave_rooms.contains("r2"),
-            "expected PeerLeft in r2, got: {leave_rooms:?}"
+            "expected RoomStatus without A in r2, got: {leave_rooms:?}"
         );
         assert!(
             leave_rooms.contains("r3"),
-            "expected PeerLeft in r3, got: {leave_rooms:?}"
+            "expected RoomStatus without A in r3, got: {leave_rooms:?}"
         );
     }
 

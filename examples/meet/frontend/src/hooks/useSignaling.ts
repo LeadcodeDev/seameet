@@ -49,9 +49,6 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     ws.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as SignalingMessage
-        if (data.type === 'peer_left' || data.type === 'peer_joined') {
-          console.log(`[Signaling] ${data.type}: ${data.participant.slice(0, 8)}`)
-        }
         onMessageRef.current(data)
       } catch {
         // ignore malformed messages
