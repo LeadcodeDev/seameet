@@ -51,10 +51,16 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
   const displayLabel = isScreenShare ? `${name}'s screen` : `${name}${isLocal ? ' (You)' : ''}`
 
   return (
-    <div className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''}`}>
+    <div
+      data-testid="video-tile"
+      data-participant={name}
+      data-video={showVideo ? 'on' : 'off'}
+      className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''}`}
+    >
       {/* Video element */}
       <video
         ref={videoRef}
+        data-testid="video-element"
         autoPlay
         playsInline
         muted={isLocal}
@@ -63,7 +69,7 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
 
       {/* Avatar fallback when video is off (not for screen share) */}
       {!showVideo && !isScreenShare && (
-        <Avatar className="h-20 w-20">
+        <Avatar data-testid="avatar-placeholder" className="h-20 w-20">
           <AvatarFallback className="text-2xl bg-primary text-primary-foreground">
             {getInitials(name)}
           </AvatarFallback>

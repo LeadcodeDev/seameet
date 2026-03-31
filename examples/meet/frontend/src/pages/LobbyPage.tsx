@@ -122,6 +122,7 @@ export default function LobbyPage() {
             {/* Media toggles */}
             <div className="flex justify-center gap-2">
               <Button
+                data-testid="lobby-toggle-mic"
                 type="button"
                 variant={micOn ? 'default' : 'secondary'}
                 size="icon"
@@ -130,6 +131,7 @@ export default function LobbyPage() {
                 {micOn ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
               </Button>
               <Button
+                data-testid="lobby-toggle-camera"
                 type="button"
                 variant={cameraOn ? 'default' : 'secondary'}
                 size="icon"
@@ -141,6 +143,7 @@ export default function LobbyPage() {
 
             <div className="space-y-2">
               <Input
+                data-testid="input-name"
                 placeholder="Your name"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
@@ -151,13 +154,14 @@ export default function LobbyPage() {
 
             <div className="space-y-2">
               <Input
+                data-testid="input-room-code"
                 placeholder="Room code (leave empty to auto-generate)"
                 value={roomCode}
                 onChange={(e) => setRoomCode(e.target.value)}
               />
             </div>
 
-            <Button type="submit" className="w-full" disabled={!displayName.trim()}>
+            <Button data-testid="btn-join" type="submit" className="w-full" disabled={!displayName.trim()}>
               Join
             </Button>
           </form>
