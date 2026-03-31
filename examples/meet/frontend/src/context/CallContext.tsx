@@ -122,8 +122,11 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
       signaling.send({ type: 'mute_video', from: participantId, room_id: roomId })
     } else {
       signaling.send({ type: 'unmute_video', from: participantId, room_id: roomId })
+      if (media.localStream) {
+        await webrtc.replaceLocalTracks(media.localStream)
+      }
     }
-  }, [media, signaling, participantId, roomId])
+  }, [media, signaling, participantId, roomId, webrtc])
 
   const handleUpdateVideoSettings = useCallback((settings: VideoSettings) => {
     media.updateVideoSettings(settings)

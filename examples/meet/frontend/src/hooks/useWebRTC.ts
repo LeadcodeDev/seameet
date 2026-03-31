@@ -317,6 +317,11 @@ export function useWebRTC({
       addRemotePeer(peerId, displayNames?.[peerId])
     }
 
+    // Mark as renegotiating BEFORE sending. This prevents the
+    // replaceLocalTracks effect from firing a second concurrent offer
+    // when localStream arrives while we're still waiting for the initial answer.
+    renegotiatingRef.current = true
+
     signalingRef.current.sendOffer(
       participantIdRef.current,
       roomIdRef.current,

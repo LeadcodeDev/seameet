@@ -17,7 +17,7 @@ export default defineConfig({
     {
       command: 'cargo run -p meet',
       cwd: '../../..',
-      url: 'http://localhost:3001',
+      port: 3001,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
