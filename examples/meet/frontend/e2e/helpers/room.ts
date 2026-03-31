@@ -46,9 +46,11 @@ export async function waitForVideoPlaying(page: Page, selector: string, timeout 
   )
 }
 
-/** Get the tile locator for a specific participant by name */
+/** Get the camera tile locator for a specific participant (excludes screen share tiles) */
 export function getTile(page: Page, name: string): Locator {
-  return page.locator(`[data-testid="video-tile"][data-participant="${name}"]`)
+  return page
+    .locator(`[data-testid="video-tile"][data-participant="${name}"]`)
+    .filter({ hasNot: page.locator(`text="${name}'s screen"`) })
 }
 
 /** Assert that a participant's tile shows video on or off */
@@ -82,4 +84,54 @@ export async function participantHasVideo(page: Page, name: string): Promise<boo
   const tile = getTile(page, name)
   const videoAttr = await tile.getAttribute('data-video')
   return videoAttr === 'on'
+}
+
+/**
+ * Mock getDisplayMedia so screen sharing works in headless Chromium.
+ * Creates a fake video stream using a canvas element.
+ * Must be called BEFORE clicking the screen share button.
+ */
+export async function mockGetDisplayMedia(page: Page) {
+  await page.evaluate(() => {
+    navigator.mediaDevices.getDisplayMedia = async () => {
+      const canvas = Object.assign(document.createElement('canvas'), { width: 640, height: 480 })
+      const ctx = canvas.getContext('2d')!
+      // Draw a colored rectangle so the stream has actual pixel data
+      ctx.fillStyle = '#2563eb'
+      ctx.fillRect(0, 0, 640, 480)
+      ctx.fillStyle = '#fff'
+      ctx.font = '48px sans-serif'
+      ctx.fillText('Screen Share', 120, 260)
+      return canvas.captureStream(5)
+    }
+  })
+}
+
+/** Click the screen share button in the room */
+export async function startScreenShare(page: Page) {
+  await mockGetDisplayMedia(page)
+  await page.click('[data-testid="btn-screen-share"]')
+}
+
+/** Stop screen sharing by clicking the screen share button again */
+export async function stopScreenShare(page: Page) {
+  await page.click('[data-testid="btn-screen-share"]')
+}
+
+/** Get the screen share tile locator for a specific participant */
+export function getScreenShareTile(page: Page, name: string): Locator {
+  return page.locator(`[data-testid="video-tile"][data-participant="${name}"]`).filter({ hasText: `${name}'s screen` })
+}
+
+/** Assert that a screen share tile is visible for a given participant */
+export async function expectScreenShareVisible(page: Page, name: string, timeout = 15_000) {
+  const tile = getScreenShareTile(page, name)
+  await expect(tile).toBeVisible({ timeout })
+  await expect(tile).toHaveAttribute('data-video', 'on', { timeout })
+}
+
+/** Assert that a screen share tile is NOT visible for a given participant */
+export async function expectScreenShareGone(page: Page, name: string, timeout = 10_000) {
+  const tile = getScreenShareTile(page, name)
+  await expect(tile).toHaveCount(0, { timeout })
 }

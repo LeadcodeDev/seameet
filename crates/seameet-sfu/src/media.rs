@@ -444,30 +444,9 @@ pub async fn run_media(
                     Some(PeerCmd::ScreenShareActive(active)) => {
                         screen_share_active = active;
                         if active {
-                            // Mark pending so that the next renegotiation's new video mid
-                            // gets assigned as own_screen_mid.
                             if own_screen_mid.is_none() {
                                 screen_share_pending = true;
-                                // Also check retroactively: renegotiation may have already completed.
-                                let used_mids: std::collections::HashSet<Mid> = source_slots
-                                    .values()
-                                    .flat_map(|s| {
-                                        let mut v = vec![s.audio_mid, s.video_mid];
-                                        if let Some(sm) = s.screen_mid { v.push(sm); }
-                                        v
-                                    })
-                                    .collect();
-                                own_screen_mid = all_mids.iter().rev()
-                                    .find(|(mid, kind)| {
-                                        matches!(kind, MediaKind::Video)
-                                            && Some(*mid) != own_video_mid
-                                            && !used_mids.contains(mid)
-                                    })
-                                    .map(|(mid, _)| *mid);
-                                if own_screen_mid.is_some() {
-                                    screen_share_pending = false;
-                                }
-                                info!(participant = %pid, ?own_screen_mid, "screen share mid lookup");
+                                info!(participant = %pid, "screen share pending — awaiting renegotiation");
                             }
                         } else {
                             own_screen_mid = None;
