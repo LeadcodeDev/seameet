@@ -26,4 +26,5 @@ export type SignalingMessage =
         screen_sharing: boolean;
       }>;
     }
+  | { type: 'bwe_update'; max_bitrate_bps: number }
   | { type: 'error'; code: number; message: string }

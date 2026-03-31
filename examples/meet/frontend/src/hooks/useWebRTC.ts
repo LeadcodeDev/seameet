@@ -303,6 +303,24 @@ export function useWebRTC({
     }
     console.log(`[WebRTC] pre-allocated ${totalSlots} transceiver pairs`)
 
+    // Prefer VP9 over VP8 for ~30-50% better compression at same quality.
+    // Safari without VP9 encode support will fall back to VP8 via SDP negotiation.
+    try {
+      const videoCodecs = RTCRtpReceiver.getCapabilities?.('video')?.codecs ?? []
+      if (videoCodecs.length > 0) {
+        const vp9 = videoCodecs.filter(c => c.mimeType === 'video/VP9')
+        const vp8 = videoCodecs.filter(c => c.mimeType === 'video/VP8')
+        const rest = videoCodecs.filter(c => c.mimeType !== 'video/VP9' && c.mimeType !== 'video/VP8')
+        const preferredCodecs = [...vp9, ...vp8, ...rest]
+        if (localVideoTransceiverRef.current) {
+          try { localVideoTransceiverRef.current.setCodecPreferences(preferredCodecs) } catch { /* browser may not support */ }
+        }
+        for (const slot of pool) {
+          try { slot.videoTransceiver.setCodecPreferences(preferredCodecs) } catch { /* ignore */ }
+        }
+      }
+    } catch { /* RTCRtpReceiver.getCapabilities not available */ }
+
     // Create offer FIRST so transceivers get mids assigned.
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
@@ -471,6 +489,22 @@ export function useWebRTC({
       return
     }
 
+    if (data.type === 'bwe_update') {
+      const pc = pcRef.current
+      if (!pc) return
+      const floor = 100_000 // 100 kbps minimum
+      const cap = Math.max(data.max_bitrate_bps, floor)
+      for (const sender of pc.getSenders().filter(s => s.track?.kind === 'video')) {
+        const params = sender.getParameters()
+        if (params.encodings.length > 0) {
+          const currentMax = getBitrate(videoSettingsRef.current.height, videoSettingsRef.current.frameRate)
+          params.encodings[0].maxBitrate = Math.min(cap, currentMax)
+          sender.setParameters(params)
+        }
+      }
+      return
+    }
+
     if (data.type === 'video_config_changed') {
       const peer = remotePeersRef.current.get(data.from)
       if (peer) {
@@ -514,6 +548,8 @@ export function useWebRTC({
     if (!pc) return
     const track = screenStream.getVideoTracks()[0]
     if (!track) return
+    // Hint the encoder to prioritise spatial detail (text sharpness) for screen share
+    track.contentHint = 'detail'
     // Use addTransceiver (NOT addTrack) to guarantee a NEW transceiver.
     const transceiver = pc.addTransceiver(track, { direction: 'sendrecv' })
     screenTransceiverRef.current = transceiver

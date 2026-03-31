@@ -52,6 +52,7 @@ pub struct ForwardedMedia {
     pub is_screen: bool,
     pub source_pid: ParticipantId,
     pub wallclock: Instant,
+    pub ext_vals: ExtensionValues,
 }
 
 pub struct SourceSlot {
@@ -153,6 +154,7 @@ pub async fn run_media(
 
     let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
     let mut last_pli = Instant::now();
+    let mut last_bwe_notify = Instant::now();
     let mut all_mids: Vec<(Mid, MediaKind)> = Vec::new();
     let mut rtp_rx_count: u64 = 0;
     let mut rtp_tx_count: u64 = 0;
@@ -200,6 +202,8 @@ pub async fn run_media(
             &mut rtp_rx_count,
             &mut new_media,
             &mut ice_connected,
+            &ws_tx,
+            &mut last_bwe_notify,
         )
         .await;
 
@@ -654,6 +658,8 @@ async fn drain_outputs(
     rtp_rx_count: &mut u64,
     new_media: &mut Vec<(Mid, MediaKind)>,
     ice_connected: &mut bool,
+    ws_tx: &mpsc::UnboundedSender<String>,
+    last_bwe_notify: &mut Instant,
 ) -> Option<Instant> {
     // Resolve screen share SSRC from own_screen_mid via str0m's stream mapping.
     // This is the authoritative source — no heuristic needed.
@@ -705,6 +711,7 @@ async fn drain_outputs(
                     }
 
                     let now = Instant::now();
+                    let ext_vals = pkt.header.ext_vals.clone();
                     let p = peers.read().await;
                     for (id, peer) in p.iter() {
                         if id != pid {
@@ -718,12 +725,24 @@ async fn drain_outputs(
                                 is_screen,
                                 source_pid: *pid,
                                 wallclock: now,
+                                ext_vals: ext_vals.clone(),
                             }));
                         }
                     }
                 }
                 Event::EgressBitrateEstimate(bwe) => {
-                    info!(participant = %pid, bitrate = ?bwe, "BWE estimate");
+                    let bitrate_bps = match &bwe {
+                        str0m::bwe::BweKind::Twcc(b) | str0m::bwe::BweKind::Remb(_, b) => b.as_u64(),
+                    };
+                    info!(participant = %pid, bitrate_bps, "BWE estimate");
+                    if last_bwe_notify.elapsed() >= Duration::from_secs(2) {
+                        *last_bwe_notify = Instant::now();
+                        let msg = serde_json::json!({
+                            "type": "bwe_update",
+                            "max_bitrate_bps": bitrate_bps,
+                        });
+                        let _ = ws_tx.send(msg.to_string());
+                    }
                 }
                 Event::KeyframeRequest(_) => {
                     let p = peers.read().await;
@@ -986,8 +1005,8 @@ fn write_forwarded_rtp(
         media.time,
         media.wallclock,
         media.marker,
-        ExtensionValues::default(),
-        false,
+        media.ext_vals.clone(),
+        !media.is_audio,
         media.payload.clone(),
     ) {
         warn!("write_rtp error: {e}");
@@ -1767,6 +1786,7 @@ a=mid:3\r\n";
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
 
         // This should create a slot and successfully write RTP.
@@ -1811,6 +1831,7 @@ a=mid:3\r\n";
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &audio_media, &mut source_slots, &mut rtp_tx_count,
@@ -1830,6 +1851,7 @@ a=mid:3\r\n";
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &video_media, &mut source_slots, &mut rtp_tx_count,
@@ -1861,6 +1883,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: source1, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &m1, &mut source_slots, &mut rtp_tx_count,
@@ -1874,6 +1897,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: source2, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &m2, &mut source_slots, &mut rtp_tx_count,
@@ -1907,6 +1931,7 @@ a=mid:3\r\n";
                 marker: false, payload: vec![0u8; 100],
                 is_audio: false, is_screen: false,
                 source_pid: source, wallclock: Instant::now(),
+            ext_vals: ExtensionValues::default(),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -1936,6 +1961,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: pid(42), wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2028,6 +2054,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2048,6 +2075,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &media2, &mut source_slots, &mut rtp_tx_count,
@@ -2087,6 +2115,7 @@ a=mid:3\r\n";
                 marker: false, payload: vec![0u8; 100],
                 is_audio: false, is_screen: false,
                 source_pid: user2, wallclock: Instant::now(),
+            ext_vals: ExtensionValues::default(),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2107,6 +2136,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2143,6 +2173,7 @@ a=mid:3\r\n";
                 pt: video_pt, seq_no: 1, time: 90000, marker: true,
                 payload: vec![0u8; 100], is_audio: false, is_screen: false,
                 source_pid: source, wallclock: Instant::now(),
+            ext_vals: ExtensionValues::default(),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2162,6 +2193,7 @@ a=mid:3\r\n";
             pt: video_pt, seq_no: 2, time: 93000, marker: false,
             payload: vec![0u8; 100], is_audio: false, is_screen: false,
             source_pid: user3, wallclock: Instant::now(),
+        ext_vals: ExtensionValues::default(),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,

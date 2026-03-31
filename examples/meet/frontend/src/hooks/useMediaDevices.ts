@@ -72,6 +72,8 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
         })
         // Disable all tracks immediately — callers will enable what they need
         stream.getTracks().forEach((t) => { t.enabled = false })
+        // Hint the encoder to prioritise temporal resolution (FPS) for camera video
+        stream.getVideoTracks().forEach((t) => { t.contentHint = 'motion' })
         streamRef.current = stream
         setLocalStream(stream)
         setMediaReady(true)

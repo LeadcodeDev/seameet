@@ -191,7 +191,7 @@ impl SignalingHooks for SfuServer {
                 {
                     let cc = config.codec_config();
                     cc.enable_h264(false);
-                    cc.enable_vp9(false);
+                    cc.enable_vp9(true);
                 }
                 let mut rtc = config.build();
 
