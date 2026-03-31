@@ -16,6 +16,7 @@ export interface UseMediaDevicesOptions {
 
 export interface UseMediaDevicesReturn {
   localStream: MediaStream | null
+  mediaReady: boolean
   audioEnabled: boolean
   videoEnabled: boolean
   videoSettings: VideoSettings
@@ -30,6 +31,7 @@ export interface UseMediaDevicesReturn {
 
 export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevicesReturn {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [mediaReady, setMediaReady] = useState(false)
   const [audioEnabled, setAudioEnabled] = useState(options?.initialAudioEnabled ?? false)
   const [videoEnabled, setVideoEnabled] = useState(options?.initialVideoEnabled ?? false)
   const [videoSettings, setVideoSettings] = useState<VideoSettings>(DEFAULT_VIDEO_SETTINGS)
@@ -70,9 +72,11 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
         stream.getTracks().forEach((t) => { t.enabled = false })
         streamRef.current = stream
         setLocalStream(stream)
+        setMediaReady(true)
         return stream
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to access media devices')
+        setMediaReady(true)
         return null
       } finally {
         acquiringRef.current = null
@@ -83,11 +87,12 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
     return promise
   }, [])
 
-  // Auto-acquire stream on mount if initial media state requests it
+  // Always acquire stream on mount so that localStream is available for the
+  // initial WebRTC offer (real tracks, no dummy transceivers). Then enable
+  // only the tracks the user selected in the lobby.
   const initialAudioRef = useRef(options?.initialAudioEnabled ?? false)
   const initialVideoRef = useRef(options?.initialVideoEnabled ?? false)
   useEffect(() => {
-    if (!initialAudioRef.current && !initialVideoRef.current) return
     let cancelled = false
     ;(async () => {
       const stream = await acquireStream()
@@ -171,6 +176,7 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
 
   return {
     localStream,
+    mediaReady,
     audioEnabled,
     videoEnabled,
     videoSettings,

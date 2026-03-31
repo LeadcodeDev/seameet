@@ -72,21 +72,25 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
   webrtcHandlerRef.current = webrtc.handleMessage
   webrtcScreenStopRef.current = webrtc.stopScreenShare
 
-  // Stable refs for initial media state to avoid stale closures in the join effect
-  const initialVideoRef = useRef(initialVideoEnabled)
-  const initialAudioRef = useRef(initialAudioEnabled)
+  // Refs tracking the *current* media state so the join effect always sends
+  // the correct mute signals — both on first join and on WS reconnection.
+  const videoEnabledRef = useRef(initialVideoEnabled ?? false)
+  const audioEnabledRef = useRef(initialAudioEnabled ?? false)
+  videoEnabledRef.current = media.videoEnabled
+  audioEnabledRef.current = media.audioEnabled
 
-  // Join room as soon as signaling is open — no need to wait for localStream.
+  // Join room once signaling is open AND media has been acquired (or failed) —
+  // ensures createOfferToServer receives real tracks when available.
   useEffect(() => {
-    if (signaling.state === 'open' && !joinedRef.current) {
+    if (signaling.state === 'open' && media.mediaReady && !joinedRef.current) {
       joinedRef.current = true
       console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)}`)
       signaling.join(participantId, roomId, displayName)
-      // Signal initial mute state based on lobby selection
-      signaling.send({ type: initialVideoRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
-      signaling.send({ type: initialAudioRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
+      // Signal current mute state (correct on first join and on reconnection)
+      signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
+      signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
     }
-  }, [signaling.state, signaling, participantId, roomId, displayName])
+  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName])
 
   // Reset joinedRef when signaling reconnects
   useEffect(() => {

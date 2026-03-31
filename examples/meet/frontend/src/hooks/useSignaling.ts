@@ -42,6 +42,7 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return }
+      if (wsRef.current !== ws) { ws.close(); return }
       setState('open')
       reconnectDelayRef.current = 1000
     }
@@ -57,6 +58,10 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
 
     ws.onclose = () => {
       if (!mountedRef.current) return
+      // Ignore onclose from a stale WebSocket (e.g. React StrictMode cleanup
+      // closed WS1 but mount 2 already created WS2 — WS1's async onclose
+      // must NOT trigger a reconnect that would overwrite wsRef).
+      if (wsRef.current !== ws) return
       setState('closed')
       // Auto-reconnect with exponential backoff
       const delay = reconnectDelayRef.current
