@@ -574,6 +574,20 @@ pub async fn dispatch(
                 let _ = peer_tx.send(raw.to_owned());
             }
         }
+        // E2EE: broadcast public key and key rotation to the room (except sender)
+        SdpMessage::E2eePublicKey { room_id, .. } | SdpMessage::E2eeKeyRotation { room_id, .. } => {
+            let st = state.read().await;
+            if let Some(room) = st.room(room_id) {
+                room.broadcast(raw, &pid);
+            }
+        }
+        // E2EE: unicast encrypted sender key to target participant
+        SdpMessage::E2eeSenderKey { to, .. } => {
+            let st = state.read().await;
+            if let Some(peer_tx) = st.sink(to) {
+                let _ = peer_tx.send(raw.to_owned());
+            }
+        }
         _ => {}
     }
 }

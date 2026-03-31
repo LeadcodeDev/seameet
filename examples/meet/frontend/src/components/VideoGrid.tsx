@@ -3,7 +3,7 @@ import { useCall } from '@/context/CallContext'
 import { VideoTile } from '@/components/VideoTile'
 
 export function VideoGrid() {
-  const { localStream, remotePeers, displayName, audioEnabled, videoEnabled, localScreenStream } = useCall()
+  const { localStream, remotePeers, displayName, audioEnabled, videoEnabled, localScreenStream, e2eeEnabled, e2eePeerStates } = useCall()
 
   const peers = useMemo(() => Array.from(remotePeers.values()), [remotePeers])
   const screenShareCount = (localScreenStream ? 1 : 0) + peers.filter(p => p.screenStream).length
@@ -25,6 +25,7 @@ export function VideoGrid() {
         isLocal
         audioEnabled={audioEnabled}
         videoEnabled={videoEnabled}
+        e2eeActive={e2eeEnabled}
       />
 
       {/* Local screen share */}
@@ -48,6 +49,7 @@ export function VideoGrid() {
             isLocal={false}
             audioEnabled={!peer.audioMuted}
             videoEnabled={!peer.videoMuted}
+            e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
           />
           {peer.screenStream && (
             <VideoTile

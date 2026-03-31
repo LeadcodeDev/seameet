@@ -1,0 +1,367 @@
+import { useRef, useEffect, useCallback, useState } from 'react'
+import type { UseSignalingReturn } from '@/hooks/useSignaling'
+import type { SignalingMessage } from '@/types'
+
+// ── Types ──────────────────────────────────────────────────────────────
+
+export interface E2EEPeerState {
+  ready: boolean
+  keyId: number
+}
+
+export interface UseE2EEOptions {
+  enabled: boolean
+  participantId: string
+  roomId: string
+  signaling: UseSignalingReturn
+}
+
+export interface UseE2EEReturn {
+  /** The shared Web Worker performing encrypt/decrypt transforms */
+  worker: Worker | null
+  /** Per-peer E2EE state (ready once sender key exchanged) */
+  peerStates: Map<string, E2EEPeerState>
+  /** Whether E2EE is enabled for this session */
+  enabled: boolean
+  /** Handle incoming E2EE signaling messages */
+  handleMessage: (msg: SignalingMessage) => void
+  /** Notify E2EE of a peer departure (triggers key rotation) */
+  onPeerLeft: (peerId: string) => void
+  /** Notify E2EE of a new peer arrival */
+  onPeerJoined: (peerId: string) => void
+  /** Current local key ID */
+  localKeyId: number
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+async function generateSenderKey(): Promise<ArrayBuffer> {
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt'])
+  return crypto.subtle.exportKey('raw', key)
+}
+
+async function generateECDHKeyPair(): Promise<CryptoKeyPair> {
+  return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey', 'deriveBits'])
+}
+
+async function deriveSharedSecret(privateKey: CryptoKey, publicKey: CryptoKey): Promise<CryptoKey> {
+  return crypto.subtle.deriveKey(
+    { name: 'ECDH', public: publicKey },
+    privateKey,
+    { name: 'AES-GCM', length: 128 },
+    false,
+    ['encrypt', 'decrypt'],
+  )
+}
+
+async function exportPublicKey(key: CryptoKey): Promise<string> {
+  const raw = await crypto.subtle.exportKey('raw', key)
+  return btoa(String.fromCharCode(...new Uint8Array(raw)))
+}
+
+async function importPublicKey(base64: string): Promise<CryptoKey> {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return crypto.subtle.importKey('raw', bytes, { name: 'ECDH', namedCurve: 'P-256' }, true, [])
+}
+
+async function encryptSenderKey(sharedSecret: CryptoKey, senderKeyRaw: ArrayBuffer): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, sharedSecret, senderKeyRaw)
+  // Pack: [iv 12 bytes] [ciphertext]
+  const packed = new Uint8Array(12 + ciphertext.byteLength)
+  packed.set(iv, 0)
+  packed.set(new Uint8Array(ciphertext), 12)
+  return btoa(String.fromCharCode(...packed))
+}
+
+async function decryptSenderKey(sharedSecret: CryptoKey, encryptedBase64: string): Promise<ArrayBuffer> {
+  const binary = atob(encryptedBase64)
+  const packed = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) packed[i] = binary.charCodeAt(i)
+  const iv = packed.slice(0, 12)
+  const ciphertext = packed.slice(12)
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, sharedSecret, ciphertext)
+}
+
+async function ratchetKey(currentKeyRaw: ArrayBuffer, newKeyId: number): Promise<ArrayBuffer> {
+  const keyMaterial = await crypto.subtle.importKey('raw', currentKeyRaw, 'HKDF', false, ['deriveBits'])
+  const info = new TextEncoder().encode(`ratchet-${newKeyId}`)
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(16), info },
+    keyMaterial,
+    128,
+  )
+  return bits
+}
+
+// ── Hook ───────────────────────────────────────────────────────────────
+
+export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOptions): UseE2EEReturn {
+  const workerRef = useRef<Worker | null>(null)
+  const ecdhKeyPairRef = useRef<CryptoKeyPair | null>(null)
+  const senderKeyRawRef = useRef<ArrayBuffer | null>(null)
+  const localKeyIdRef = useRef(0)
+  const [localKeyId, setLocalKeyId] = useState(0)
+
+  // Per-peer ECDH public keys (received, not yet used for sender key exchange)
+  const peerPublicKeysRef = useRef<Map<string, CryptoKey>>(new Map())
+  // Per-peer shared secrets
+  const sharedSecretsRef = useRef<Map<string, CryptoKey>>(new Map())
+  // Peer E2EE states
+  const peerStatesRef = useRef<Map<string, E2EEPeerState>>(new Map())
+  const [peerStates, setPeerStates] = useState<Map<string, E2EEPeerState>>(new Map())
+
+  const signalingRef = useRef(signaling)
+  signalingRef.current = signaling
+
+  const updatePeerStates = useCallback(() => {
+    setPeerStates(new Map(peerStatesRef.current))
+  }, [])
+
+  // ── Worker Lifecycle ───────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!enabled) return
+
+    const worker = new Worker(new URL('../workers/e2ee-worker.ts', import.meta.url), { type: 'module' })
+    workerRef.current = worker
+
+    return () => {
+      worker.terminate()
+      workerRef.current = null
+    }
+  }, [enabled])
+
+  // ── Key Generation on Mount ────────────────────────────────────────
+
+  useEffect(() => {
+    if (!enabled) return
+
+    async function init() {
+      ecdhKeyPairRef.current = await generateECDHKeyPair()
+      senderKeyRawRef.current = await generateSenderKey()
+      localKeyIdRef.current = 0
+      setLocalKeyId(0)
+
+      // Set our own sender key in the worker
+      workerRef.current?.postMessage({
+        type: 'setKey',
+        participantId,
+        keyId: 0,
+        rawKey: senderKeyRawRef.current,
+      })
+    }
+
+    init()
+  }, [enabled, participantId])
+
+  // ── Send public key to room ────────────────────────────────────────
+
+  const broadcastPublicKey = useCallback(async () => {
+    if (!enabled || !ecdhKeyPairRef.current) return
+    const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+    signalingRef.current.send({
+      type: 'e2ee_public_key',
+      from: participantId,
+      room_id: roomId,
+      public_key: pubKeyBase64,
+    } as SignalingMessage)
+  }, [enabled, participantId, roomId])
+
+  // ── Exchange sender key with a specific peer ───────────────────────
+
+  const sendSenderKeyTo = useCallback(async (peerId: string) => {
+    const sharedSecret = sharedSecretsRef.current.get(peerId)
+    const senderKeyRaw = senderKeyRawRef.current
+    if (!sharedSecret || !senderKeyRaw) return
+
+    const encrypted = await encryptSenderKey(sharedSecret, senderKeyRaw)
+    signalingRef.current.send({
+      type: 'e2ee_sender_key',
+      from: participantId,
+      to: peerId,
+      room_id: roomId,
+      encrypted_key: encrypted,
+      key_id: localKeyIdRef.current,
+    } as SignalingMessage)
+  }, [participantId, roomId])
+
+  // ── Rotate sender key (generate new, distribute to all peers) ──────
+
+  const rotateSenderKey = useCallback(async () => {
+    if (!enabled || !senderKeyRawRef.current) return
+    const newKeyId = localKeyIdRef.current + 1
+    senderKeyRawRef.current = await generateSenderKey()
+    localKeyIdRef.current = newKeyId
+    setLocalKeyId(newKeyId)
+
+    // Update worker with new key
+    workerRef.current?.postMessage({
+      type: 'setKey',
+      participantId,
+      keyId: newKeyId,
+      rawKey: senderKeyRawRef.current,
+    })
+
+    // Purge old keys after a delay (allow in-transit frames)
+    setTimeout(() => {
+      workerRef.current?.postMessage({
+        type: 'purgeOldKeys',
+        participantId,
+        keepKeyId: newKeyId,
+      })
+    }, 5000)
+
+    // Send new key to all peers
+    for (const peerId of sharedSecretsRef.current.keys()) {
+      await sendSenderKeyTo(peerId)
+    }
+  }, [enabled, participantId, sendSenderKeyTo])
+
+  // ── Ratchet timer (every 10 minutes) ───────────────────────────────
+
+  useEffect(() => {
+    if (!enabled) return
+    const interval = setInterval(async () => {
+      if (!senderKeyRawRef.current) return
+      const newKeyId = localKeyIdRef.current + 1
+      const ratcheted = await ratchetKey(senderKeyRawRef.current, newKeyId)
+      senderKeyRawRef.current = ratcheted
+      localKeyIdRef.current = newKeyId
+      setLocalKeyId(newKeyId)
+
+      workerRef.current?.postMessage({
+        type: 'setKey',
+        participantId,
+        keyId: newKeyId,
+        rawKey: ratcheted,
+      })
+
+      // Broadcast key_id so peers can ratchet in sync
+      signalingRef.current.send({
+        type: 'e2ee_key_rotation',
+        from: participantId,
+        room_id: roomId,
+        key_id: newKeyId,
+      } as SignalingMessage)
+
+      setTimeout(() => {
+        workerRef.current?.postMessage({
+          type: 'purgeOldKeys',
+          participantId,
+          keepKeyId: newKeyId,
+        })
+      }, 5000)
+    }, 10 * 60 * 1000)
+
+    return () => clearInterval(interval)
+  }, [enabled, participantId, roomId])
+
+  // ── Handle E2EE signaling messages ─────────────────────────────────
+
+  const handleMessage = useCallback(async (msg: SignalingMessage) => {
+    if (!enabled) return
+
+    if (msg.type === 'e2ee_public_key') {
+      const senderId = msg.from
+      if (senderId === participantId) return
+
+      // Import their public key
+      const peerPubKey = await importPublicKey(msg.public_key)
+      peerPublicKeysRef.current.set(senderId, peerPubKey)
+
+      // Derive shared secret
+      if (ecdhKeyPairRef.current) {
+        const sharedSecret = await deriveSharedSecret(ecdhKeyPairRef.current.privateKey, peerPubKey)
+        sharedSecretsRef.current.set(senderId, sharedSecret)
+
+        // Reply with our own public key (they may not have it yet)
+        await broadcastPublicKey()
+
+        // Send our sender key
+        await sendSenderKeyTo(senderId)
+      }
+    }
+
+    if (msg.type === 'e2ee_sender_key') {
+      if (msg.to !== participantId) return
+      const senderId = msg.from
+
+      const sharedSecret = sharedSecretsRef.current.get(senderId)
+      if (!sharedSecret) {
+        console.warn(`[E2EE] received sender key from ${senderId.slice(0, 8)} but no shared secret`)
+        return
+      }
+
+      try {
+        const senderKeyRaw = await decryptSenderKey(sharedSecret, msg.encrypted_key)
+
+        // Set in worker
+        workerRef.current?.postMessage({
+          type: 'setKey',
+          participantId: senderId,
+          keyId: msg.key_id,
+          rawKey: senderKeyRaw,
+        })
+
+        // Update peer state
+        peerStatesRef.current.set(senderId, { ready: true, keyId: msg.key_id })
+        updatePeerStates()
+        console.log(`[E2EE] sender key received from ${senderId.slice(0, 8)}, keyId=${msg.key_id}`)
+      } catch (e) {
+        console.error(`[E2EE] failed to decrypt sender key from ${senderId.slice(0, 8)}:`, e)
+      }
+    }
+
+    if (msg.type === 'e2ee_key_rotation') {
+      const senderId = msg.from
+      if (senderId === participantId) return
+
+      // The sender ratcheted — we need their new sender key via e2ee_sender_key.
+      // The sender will re-send it after rotation. Mark as pending.
+      const currentState = peerStatesRef.current.get(senderId)
+      if (currentState) {
+        peerStatesRef.current.set(senderId, { ...currentState, keyId: msg.key_id })
+        updatePeerStates()
+      }
+    }
+  }, [enabled, participantId, broadcastPublicKey, sendSenderKeyTo, updatePeerStates])
+
+  // ── Peer lifecycle callbacks ───────────────────────────────────────
+
+  const onPeerJoined = useCallback(async (peerId: string) => {
+    if (!enabled) return
+    peerStatesRef.current.set(peerId, { ready: false, keyId: -1 })
+    updatePeerStates()
+    // Broadcast public key so the new peer can derive shared secret
+    await broadcastPublicKey()
+    // Rotate key so the new peer can't decrypt historical frames
+    await rotateSenderKey()
+  }, [enabled, broadcastPublicKey, rotateSenderKey, updatePeerStates])
+
+  const onPeerLeft = useCallback(async (peerId: string) => {
+    if (!enabled) return
+    peerStatesRef.current.delete(peerId)
+    peerPublicKeysRef.current.delete(peerId)
+    sharedSecretsRef.current.delete(peerId)
+    updatePeerStates()
+
+    // Remove departed peer's keys from worker
+    workerRef.current?.postMessage({ type: 'removeKeys', participantId: peerId })
+
+    // Rotate key so the departed peer can't decrypt future frames
+    await rotateSenderKey()
+  }, [enabled, rotateSenderKey, updatePeerStates])
+
+  return {
+    worker: workerRef.current,
+    peerStates,
+    enabled,
+    handleMessage,
+    onPeerLeft,
+    onPeerJoined,
+    localKeyId,
+  }
+}
