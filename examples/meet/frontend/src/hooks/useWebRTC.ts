@@ -51,6 +51,7 @@ export interface UseWebRTCReturn {
   startScreenShare: (screenStream: MediaStream) => Promise<void>
   stopScreenShare: () => Promise<void>
   localScreenStream: MediaStream | null
+  replaceLocalTracks: (stream: MediaStream) => Promise<void>
 }
 
 export function useWebRTC({
@@ -70,6 +71,8 @@ export function useWebRTC({
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
+  const localAudioTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
+  const localVideoTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null)
 
   // Pool of pre-allocated transceiver pairs from the initial offer.
@@ -276,16 +279,20 @@ export function useWebRTC({
       }
     }
 
-    // Add local tracks (must be available — CallContext waits for localStream)
+    // Add local tracks or dummy transceivers for send slots
     const stream = localStreamRef.current
     if (stream) {
       stream.getTracks().forEach((track) => {
         pc.addTrack(track, stream)
       })
+      // Find local transceivers by track kind
+      const transceivers = pc.getTransceivers()
+      localAudioTransceiverRef.current = transceivers.find(t => t.sender.track?.kind === 'audio') ?? null
+      localVideoTransceiverRef.current = transceivers.find(t => t.sender.track?.kind === 'video') ?? null
       console.log(`[WebRTC] added ${stream.getTracks().length} local tracks`)
     } else {
-      pc.addTransceiver('audio', { direction: 'sendrecv' })
-      pc.addTransceiver('video', { direction: 'sendrecv' })
+      localAudioTransceiverRef.current = pc.addTransceiver('audio', { direction: 'sendrecv' })
+      localVideoTransceiverRef.current = pc.addTransceiver('video', { direction: 'sendrecv' })
       console.log('[WebRTC] no local media — added dummy transceivers')
     }
 
@@ -309,6 +316,11 @@ export function useWebRTC({
     for (const peerId of existingPeers) {
       addRemotePeer(peerId, displayNames?.[peerId])
     }
+
+    // Mark as renegotiating BEFORE sending. This prevents the
+    // replaceLocalTracks effect from firing a second concurrent offer
+    // when localStream arrives while we're still waiting for the initial answer.
+    renegotiatingRef.current = true
 
     signalingRef.current.sendOffer(
       participantIdRef.current,
@@ -370,40 +382,35 @@ export function useWebRTC({
       return
     }
 
-    if (data.type === 'peer_joined') {
-      const peerId = data.participant
-      console.log(`[WebRTC] peer_joined: ${peerId.slice(0, 8)}`)
-      addRemotePeer(peerId, data.display_name)
-      return
-    }
+    if (data.type === 'room_status') {
+      const myId = participantIdRef.current
+      const remoteParticipants = data.participants.filter(p => p.id !== myId)
+      const remoteIds = new Set(remoteParticipants.map(p => p.id))
 
-    if (data.type === 'peer_left') {
-      console.log(`[WebRTC] peer_left: ${data.participant.slice(0, 8)}`)
-      removeRemotePeer(data.participant)
-      return
-    }
+      // Remove peers no longer in the room
+      for (const peerId of remotePeersRef.current.keys()) {
+        if (!remoteIds.has(peerId)) {
+          removeRemotePeer(peerId)
+        }
+      }
 
-    if (data.type === 'mute_audio') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.audioMuted = true; updateRemotePeersState() }
-      return
-    }
+      // Add new peers not yet tracked
+      for (const p of remoteParticipants) {
+        if (!remotePeersRef.current.has(p.id)) {
+          addRemotePeer(p.id, p.display_name)
+        }
+      }
 
-    if (data.type === 'unmute_audio') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.audioMuted = false; updateRemotePeersState() }
-      return
-    }
+      // Update media state for all remote peers
+      for (const p of remoteParticipants) {
+        const info = remotePeersRef.current.get(p.id)
+        if (info) {
+          info.audioMuted = p.audio_muted
+          info.videoMuted = p.video_muted
+        }
+      }
 
-    if (data.type === 'mute_video') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.videoMuted = true; updateRemotePeersState() }
-      return
-    }
-
-    if (data.type === 'unmute_video') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.videoMuted = false; updateRemotePeersState() }
+      updateRemotePeersState()
       return
     }
 
@@ -481,6 +488,21 @@ export function useWebRTC({
       return
     }
   }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, updateRemotePeersState])
+
+  const replaceLocalTracks = useCallback(async (stream: MediaStream) => {
+    const audioTrack = stream.getAudioTracks()[0] ?? null
+    const videoTrack = stream.getVideoTracks()[0] ?? null
+    if (localAudioTransceiverRef.current && audioTrack) {
+      await localAudioTransceiverRef.current.sender.replaceTrack(audioTrack)
+      console.log('[WebRTC] replaced local audio track')
+    }
+    if (localVideoTransceiverRef.current && videoTrack) {
+      await localVideoTransceiverRef.current.sender.replaceTrack(videoTrack)
+      console.log('[WebRTC] replaced local video track')
+    }
+    // No renegotiation needed — replaceTrack sends media on the existing transceiver.
+    // Renegotiation during ICE connecting causes str0m to fail ICE.
+  }, [])
 
   const startScreenShare = useCallback(async (screenStream: MediaStream) => {
     const pc = pcRef.current
@@ -606,5 +628,6 @@ export function useWebRTC({
     startScreenShare,
     stopScreenShare,
     localScreenStream,
+    replaceLocalTracks,
   }
 }

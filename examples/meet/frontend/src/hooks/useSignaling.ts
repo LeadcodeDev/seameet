@@ -42,6 +42,7 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return }
+      if (wsRef.current !== ws) { ws.close(); return }
       setState('open')
       reconnectDelayRef.current = 1000
     }
@@ -49,9 +50,6 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     ws.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as SignalingMessage
-        if (data.type === 'peer_left' || data.type === 'peer_joined') {
-          console.log(`[Signaling] ${data.type}: ${data.participant.slice(0, 8)}`)
-        }
         onMessageRef.current(data)
       } catch {
         // ignore malformed messages
@@ -60,6 +58,10 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
 
     ws.onclose = () => {
       if (!mountedRef.current) return
+      // Ignore onclose from a stale WebSocket (e.g. React StrictMode cleanup
+      // closed WS1 but mount 2 already created WS2 — WS1's async onclose
+      // must NOT trigger a reconnect that would overwrite wsRef).
+      if (wsRef.current !== ws) return
       setState('closed')
       // Auto-reconnect with exponential backoff
       const delay = reconnectDelayRef.current

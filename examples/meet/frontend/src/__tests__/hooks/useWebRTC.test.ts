@@ -80,7 +80,7 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.get('peer-b')?.displayName).toBe('Bob')
   })
 
-  it('peer_joined adds peer to map', async () => {
+  it('room_status adds new peer to map', async () => {
     const { result } = renderWebRTC()
 
     // First send ready to initialize PC
@@ -96,10 +96,12 @@ describe('useWebRTC', () => {
 
     await act(async () => {
       result.current.handleMessage({
-        type: 'peer_joined',
-        participant: 'peer-c',
+        type: 'room_status',
         room_id: 'room-1',
-        display_name: 'Charlie',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-c', display_name: 'Charlie', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
       })
       await new Promise(resolve => setTimeout(resolve, 20))
     })
@@ -108,7 +110,7 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.get('peer-c')?.displayName).toBe('Charlie')
   })
 
-  it('peer_left removes peer from map', async () => {
+  it('room_status removes peer no longer present', async () => {
     const { result } = renderWebRTC()
 
     await act(async () => {
@@ -125,9 +127,11 @@ describe('useWebRTC', () => {
 
     await act(async () => {
       result.current.handleMessage({
-        type: 'peer_left',
-        participant: 'peer-a',
+        type: 'room_status',
         room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
       })
       await new Promise(resolve => setTimeout(resolve, 20))
     })
@@ -135,7 +139,7 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.has('peer-a')).toBe(false)
   })
 
-  it('mute_audio sets audioMuted on peer', async () => {
+  it('room_status sets audioMuted on peer', async () => {
     const { result } = renderWebRTC()
 
     await act(async () => {
@@ -150,9 +154,12 @@ describe('useWebRTC', () => {
 
     await act(async () => {
       result.current.handleMessage({
-        type: 'mute_audio',
-        from: 'peer-a',
+        type: 'room_status',
         room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: true, video_muted: false, screen_sharing: false },
+        ],
       })
       await new Promise(resolve => setTimeout(resolve, 20))
     })
@@ -160,7 +167,7 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.get('peer-a')?.audioMuted).toBe(true)
   })
 
-  it('unmute_audio clears audioMuted on peer', async () => {
+  it('room_status clears audioMuted on peer', async () => {
     const { result } = renderWebRTC()
 
     await act(async () => {
@@ -175,20 +182,34 @@ describe('useWebRTC', () => {
 
     // Mute first
     await act(async () => {
-      result.current.handleMessage({ type: 'mute_audio', from: 'peer-a', room_id: 'room-1' })
+      result.current.handleMessage({
+        type: 'room_status',
+        room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: true, video_muted: false, screen_sharing: false },
+        ],
+      })
       await new Promise(resolve => setTimeout(resolve, 10))
     })
     expect(result.current.remotePeers.get('peer-a')?.audioMuted).toBe(true)
 
     // Then unmute
     await act(async () => {
-      result.current.handleMessage({ type: 'unmute_audio', from: 'peer-a', room_id: 'room-1' })
+      result.current.handleMessage({
+        type: 'room_status',
+        room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
       await new Promise(resolve => setTimeout(resolve, 10))
     })
     expect(result.current.remotePeers.get('peer-a')?.audioMuted).toBe(false)
   })
 
-  it('mute_video / unmute_video toggles videoMuted', async () => {
+  it('room_status toggles videoMuted', async () => {
     const { result } = renderWebRTC()
 
     await act(async () => {
@@ -202,13 +223,27 @@ describe('useWebRTC', () => {
     })
 
     await act(async () => {
-      result.current.handleMessage({ type: 'mute_video', from: 'peer-a', room_id: 'room-1' })
+      result.current.handleMessage({
+        type: 'room_status',
+        room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: true, screen_sharing: false },
+        ],
+      })
       await new Promise(resolve => setTimeout(resolve, 10))
     })
     expect(result.current.remotePeers.get('peer-a')?.videoMuted).toBe(true)
 
     await act(async () => {
-      result.current.handleMessage({ type: 'unmute_video', from: 'peer-a', room_id: 'room-1' })
+      result.current.handleMessage({
+        type: 'room_status',
+        room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
       await new Promise(resolve => setTimeout(resolve, 10))
     })
     expect(result.current.remotePeers.get('peer-a')?.videoMuted).toBe(false)

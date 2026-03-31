@@ -14,8 +14,8 @@ interface CallContextValue {
   audioEnabled: boolean
   videoEnabled: boolean
   videoSettings: VideoSettings
-  toggleAudio: () => void
-  toggleVideo: () => void
+  toggleAudio: () => Promise<void>
+  toggleVideo: () => Promise<void>
   updateVideoSettings: (settings: VideoSettings) => void
   startScreenShare: () => Promise<void>
   stopScreenShare: () => Promise<void>
@@ -31,10 +31,12 @@ interface CallProviderProps {
   participantId: string
   displayName: string
   roomId: string
+  initialAudioEnabled?: boolean
+  initialVideoEnabled?: boolean
   children: ReactNode
 }
 
-export function CallProvider({ participantId, displayName, roomId, children }: CallProviderProps) {
+export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
 
@@ -54,6 +56,8 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     onScreenShareEnded: () => {
       webrtcScreenStopRef.current()
     },
+    initialAudioEnabled,
+    initialVideoEnabled,
   })
 
   const webrtc = useWebRTC({
@@ -68,17 +72,25 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
   webrtcHandlerRef.current = webrtc.handleMessage
   webrtcScreenStopRef.current = webrtc.stopScreenShare
 
-  // Join room when BOTH signaling is open AND localStream is available.
-  // This matches the browser-demo behavior: getUserMedia THEN connect signaling.
-  // Without this, createOfferToServer runs with localStream=null and creates
-  // dummy transceivers that never send real tracks to the SFU.
+  // Refs tracking the *current* media state so the join effect always sends
+  // the correct mute signals — both on first join and on WS reconnection.
+  const videoEnabledRef = useRef(initialVideoEnabled ?? false)
+  const audioEnabledRef = useRef(initialAudioEnabled ?? false)
+  videoEnabledRef.current = media.videoEnabled
+  audioEnabledRef.current = media.audioEnabled
+
+  // Join room once signaling is open AND media has been acquired (or failed) —
+  // ensures createOfferToServer receives real tracks when available.
   useEffect(() => {
-    if (signaling.state === 'open' && media.localStream && !joinedRef.current) {
+    if (signaling.state === 'open' && media.mediaReady && !joinedRef.current) {
       joinedRef.current = true
-      console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)} (localStream ready)`)
+      console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)}`)
       signaling.join(participantId, roomId, displayName)
+      // Signal current mute state (correct on first join and on reconnection)
+      signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
+      signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
     }
-  }, [signaling.state, media.localStream, signaling, participantId, roomId, displayName])
+  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName])
 
   // Reset joinedRef when signaling reconnects
   useEffect(() => {
@@ -87,9 +99,19 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     }
   }, [signaling.state])
 
-  const handleToggleAudio = useCallback(() => {
+  // When localStream transitions from null to a real stream, replace the dummy
+  // transceiver tracks so the SFU receives real media without renegotiation.
+  const prevLocalStreamRef = useRef<MediaStream | null>(null)
+  useEffect(() => {
+    if (media.localStream && !prevLocalStreamRef.current) {
+      webrtc.replaceLocalTracks(media.localStream)
+    }
+    prevLocalStreamRef.current = media.localStream
+  }, [media.localStream, webrtc])
+
+  const handleToggleAudio = useCallback(async () => {
     const willBeMuted = media.audioEnabled
-    media.toggleAudio()
+    await media.toggleAudio()
     if (willBeMuted) {
       signaling.send({ type: 'mute_audio', from: participantId, room_id: roomId })
     } else {
@@ -97,15 +119,18 @@ export function CallProvider({ participantId, displayName, roomId, children }: C
     }
   }, [media, signaling, participantId, roomId])
 
-  const handleToggleVideo = useCallback(() => {
+  const handleToggleVideo = useCallback(async () => {
     const willBeMuted = media.videoEnabled
-    media.toggleVideo()
+    await media.toggleVideo()
     if (willBeMuted) {
       signaling.send({ type: 'mute_video', from: participantId, room_id: roomId })
     } else {
       signaling.send({ type: 'unmute_video', from: participantId, room_id: roomId })
+      if (media.localStream) {
+        await webrtc.replaceLocalTracks(media.localStream)
+      }
     }
-  }, [media, signaling, participantId, roomId])
+  }, [media, signaling, participantId, roomId, webrtc])
 
   const handleUpdateVideoSettings = useCallback((settings: VideoSettings) => {
     media.updateVideoSettings(settings)

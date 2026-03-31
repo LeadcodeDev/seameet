@@ -3,6 +3,17 @@ use std::collections::HashMap;
 use seameet_core::ParticipantId;
 use serde::{Deserialize, Serialize};
 
+/// Status of a single participant within a room, used in `RoomStatus` snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParticipantStatus {
+    pub id: ParticipantId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub audio_muted: bool,
+    pub video_muted: bool,
+    pub screen_sharing: bool,
+}
+
 /// Messages exchanged over the signaling channel.
 ///
 /// Every variant except [`Error`](SdpMessage::Error) carries a `room_id`
@@ -160,6 +171,13 @@ pub enum SdpMessage {
         /// Number of additional slots (audio+video pairs) needed.
         needed_slots: u32,
     },
+    /// Server-driven snapshot of all participants' media state in a room.
+    RoomStatus {
+        /// The room this status belongs to.
+        room_id: String,
+        /// Status of every participant in the room.
+        participants: Vec<ParticipantStatus>,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -188,7 +206,8 @@ impl SdpMessage {
             | Self::MuteVideo { room_id, .. }
             | Self::UnmuteVideo { room_id, .. }
             | Self::VideoConfigChanged { room_id, .. }
-            | Self::RequestRenegotiation { room_id, .. } => Some(room_id),
+            | Self::RequestRenegotiation { room_id, .. }
+            | Self::RoomStatus { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -382,6 +401,35 @@ mod tests {
         let back2: SdpMessage = serde_json::from_str(&json2).expect("de");
         assert_eq!(back2, msg2);
         assert_eq!(msg2.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_room_status_serde() {
+        let msg = SdpMessage::RoomStatus {
+            room_id: "r1".into(),
+            participants: vec![
+                ParticipantStatus {
+                    id: id_a(),
+                    display_name: Some("Alice".into()),
+                    audio_muted: true,
+                    video_muted: false,
+                    screen_sharing: false,
+                },
+                ParticipantStatus {
+                    id: id_b(),
+                    display_name: None,
+                    audio_muted: false,
+                    video_muted: true,
+                    screen_sharing: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"room_status\""));
+        assert!(json.contains("\"audio_muted\":true"));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
     }
 
     #[test]

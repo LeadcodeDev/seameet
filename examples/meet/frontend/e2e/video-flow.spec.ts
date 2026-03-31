@@ -5,8 +5,8 @@ test.describe('Video flow', () => {
   test('A joins alone — sees own tile', async ({ page }) => {
     await joinRoom(page, 'e2e-solo', 'Alice')
 
-    await expect(page.locator('video')).toHaveCount(1, { timeout: 10_000 })
-    await waitForVideoPlaying(page, 'video')
+    await expect(page.locator('[data-testid="video-tile"]')).toHaveCount(1, { timeout: 10_000 })
+    await waitForVideoPlaying(page, '[data-testid="video-element"]')
   })
 
   test('A and B join — both see each other', async ({ browser }) => {
@@ -21,9 +21,9 @@ test.describe('Video flow', () => {
     await joinRoom(pageB, room, 'Bob')
 
     // A sees 2 tiles (own + Bob)
-    await expect(pageA.locator('video')).toHaveCount(2, { timeout: 15_000 })
+    await expect(pageA.locator('[data-testid="video-tile"]')).toHaveCount(2, { timeout: 15_000 })
     // B sees 2 tiles (own + Alice)
-    await expect(pageB.locator('video')).toHaveCount(2, { timeout: 15_000 })
+    await expect(pageB.locator('[data-testid="video-tile"]')).toHaveCount(2, { timeout: 15_000 })
 
     await ctxA.close()
     await ctxB.close()
@@ -44,7 +44,7 @@ test.describe('Video flow', () => {
     await joinRoom(pageC, room, 'Charlie')
 
     // C sees 3 tiles (own + Alice + Bob)
-    await expect(pageC.locator('video')).toHaveCount(3, { timeout: 15_000 })
+    await expect(pageC.locator('[data-testid="video-tile"]')).toHaveCount(3, { timeout: 15_000 })
 
     await ctxA.close()
     await ctxB.close()
@@ -63,14 +63,14 @@ test.describe('Video flow', () => {
     await joinRoom(pageB, room, 'Bob')
 
     // A sees 2 tiles
-    await expect(pageA.locator('video')).toHaveCount(2, { timeout: 15_000 })
+    await expect(pageA.locator('[data-testid="video-tile"]')).toHaveCount(2, { timeout: 15_000 })
 
     // B clicks leave
-    await pageB.click('button:has(.lucide-phone)')
+    await pageB.click('[data-testid="btn-leave"]')
     await pageB.waitForURL('**/')
 
     // A should go back to 1 tile
-    await expect(pageA.locator('video')).toHaveCount(1, { timeout: 10_000 })
+    await expect(pageA.locator('[data-testid="video-tile"]')).toHaveCount(1, { timeout: 10_000 })
 
     await ctxA.close()
     await ctxB.close()

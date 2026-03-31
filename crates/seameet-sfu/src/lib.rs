@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use media::*;
 use seameet_core::ParticipantId;
-use seameet_signaling::engine::{SignalingHooks, SignalingState};
+use seameet_signaling::engine::{broadcast_room_status, SignalingHooks, SignalingState};
 use seameet_signaling::SdpMessage;
 use str0m::bwe::Bitrate;
 use str0m::change::SdpOffer;
@@ -346,6 +346,7 @@ impl SignalingHooks for SfuServer {
                     if let Some(peer) = p.get(from) {
                         let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(true));
                     }
+                    // WS broadcast screen_share_started for transceiver routing
                     let msg = SdpMessage::ScreenShareStarted {
                         from: *from,
                         room_id: room_id.clone(),
@@ -358,6 +359,14 @@ impl SignalingHooks for SfuServer {
                             }
                         }
                     }
+                }
+                // Update signaling media state + broadcast room_status
+                {
+                    let mut st = state.write().await;
+                    if let Some(room) = st.room_mut(room_id) {
+                        room.set_screen_sharing(&pid, true);
+                    }
+                    broadcast_room_status(&st, room_id);
                 }
                 true
             }
@@ -372,6 +381,7 @@ impl SignalingHooks for SfuServer {
                     if let Some(peer) = p.get(from) {
                         let _ = peer.cmd_tx.send(PeerCmd::ScreenShareActive(false));
                     }
+                    // WS broadcast screen_share_stopped for transceiver routing
                     let msg = SdpMessage::ScreenShareStopped {
                         from: *from,
                         room_id: room_id.clone(),
@@ -384,6 +394,14 @@ impl SignalingHooks for SfuServer {
                             }
                         }
                     }
+                }
+                // Update signaling media state + broadcast room_status
+                {
+                    let mut st = state.write().await;
+                    if let Some(room) = st.room_mut(room_id) {
+                        room.set_screen_sharing(&pid, false);
+                    }
+                    broadcast_room_status(&st, room_id);
                 }
                 true
             }
@@ -402,17 +420,14 @@ impl SignalingHooks for SfuServer {
                             });
                         }
                     }
-                    let msg = SdpMessage::MuteAudio {
-                        from: *from,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        for (id, peer) in p.iter() {
-                            if *id != pid {
-                                let _ = peer.ws_tx.send(json.clone());
-                            }
-                        }
+                }
+                // Update signaling media state + broadcast room_status
+                {
+                    let mut st = state.write().await;
+                    if let Some(room) = st.room_mut(room_id) {
+                        room.set_audio_muted(&pid, true);
                     }
+                    broadcast_room_status(&st, room_id);
                 }
                 true
             }
@@ -431,18 +446,35 @@ impl SignalingHooks for SfuServer {
                             });
                         }
                     }
-                    let msg = SdpMessage::UnmuteAudio {
-                        from: *from,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        for (id, peer) in p.iter() {
-                            if *id != pid {
-                                let _ = peer.ws_tx.send(json.clone());
-                            }
-                        }
-                    }
                 }
+                // Update signaling media state + broadcast room_status
+                {
+                    let mut st = state.write().await;
+                    if let Some(room) = st.room_mut(room_id) {
+                        room.set_audio_muted(&pid, false);
+                    }
+                    broadcast_room_status(&st, room_id);
+                }
+                true
+            }
+
+            SdpMessage::MuteVideo { room_id, .. } => {
+                // Update signaling media state + broadcast room_status
+                let mut st = state.write().await;
+                if let Some(room) = st.room_mut(room_id) {
+                    room.set_video_muted(&pid, true);
+                }
+                broadcast_room_status(&st, room_id);
+                true
+            }
+
+            SdpMessage::UnmuteVideo { room_id, .. } => {
+                // Update signaling media state + broadcast room_status
+                let mut st = state.write().await;
+                if let Some(room) = st.room_mut(room_id) {
+                    room.set_video_muted(&pid, false);
+                }
+                broadcast_room_status(&st, room_id);
                 true
             }
 
@@ -474,33 +506,16 @@ impl SignalingHooks for SfuServer {
             }
 
             SdpMessage::Join { room_id, .. } => {
-                // Prune stale members from signaling state and notify BOTH
-                // frontends (WS PeerLeft) and media tasks (PeerCmd::PeerLeft)
-                // BEFORE the default dispatch creates the new peer.
-                // The WS PeerLeft must arrive at frontends before PeerJoined
-                // so the LIFO transceiver pool recycles the correct MID slot.
+                // Prune stale members from signaling state and notify
+                // media tasks (PeerCmd::PeerLeft) BEFORE the default dispatch
+                // creates the new peer. WS notification is handled by
+                // room_status broadcast in dispatch.
                 {
                     let mut st = state.write().await;
                     let pruned = st
                         .room_mut(room_id)
                         .map(|r| r.prune_stale())
                         .unwrap_or_default();
-
-                    // Send WS PeerLeft to remaining frontends while we still
-                    // hold the signaling state (ensures ordering before PeerJoined).
-                    if !pruned.is_empty() {
-                        if let Some(room) = st.room(room_id) {
-                            for stale_pid in &pruned {
-                                let peer_left = SdpMessage::PeerLeft {
-                                    participant: *stale_pid,
-                                    room_id: room_id.clone(),
-                                };
-                                if let Ok(json) = serde_json::to_string(&peer_left) {
-                                    room.broadcast(&json, stale_pid);
-                                }
-                            }
-                        }
-                    }
                     drop(st);
 
                     // Notify media tasks so stale source_slots are cleaned up
@@ -581,7 +596,7 @@ impl SignalingHooks for SfuServer {
         &self,
         pid: ParticipantId,
         affected_rooms: &[(String, bool)],
-        _state: &Arc<RwLock<SignalingState>>,
+        state: &Arc<RwLock<SignalingState>>,
     ) {
         {
             let mut r = self.routes.write().await;
@@ -804,6 +819,19 @@ mod tests {
         ctx.register_sfu_peer(peer, id, room_id).await;
     }
 
+    impl TestPeer {
+        /// Receives the next message, skipping any `RoomStatus` messages.
+        async fn recv_skip_status(&mut self) -> SdpMessage {
+            loop {
+                let msg = self.recv().await;
+                if matches!(msg, SdpMessage::RoomStatus { .. }) {
+                    continue;
+                }
+                return msg;
+            }
+        }
+    }
+
     // ── Signaling tests ────────────────────────────────────────────
 
     #[tokio::test]
@@ -843,18 +871,15 @@ mod tests {
             _ => panic!("expected Ready, got {:?}", ready_b),
         }
 
-        let peer_joined = a.recv().await;
-        match &peer_joined {
-            SdpMessage::PeerJoined {
-                participant,
-                display_name,
-                ..
-            } => {
-                assert_eq!(*participant, pid(2));
-                assert_eq!(display_name.as_deref(), Some("Bob"));
-            }
-            _ => panic!("expected PeerJoined, got {:?}", peer_joined),
-        }
+        // A receives room_status with B (pid(2)) present
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let msgs = a.drain().await;
+        let has_b = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(2) && p.display_name.as_deref() == Some("Bob"))
+            } else { false }
+        });
+        assert!(has_b, "A should receive RoomStatus with Bob, got: {:?}", msgs);
     }
 
     #[tokio::test]
@@ -869,14 +894,16 @@ mod tests {
             room_id: "r".into(),
             display_name: None,
         });
-        a.recv().await;
+        a.recv().await; // Ready
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
         });
-        b.recv().await;
-        a.recv().await;
+        b.recv().await; // Ready
+        // Drain A's RoomStatus from both joins
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        a.drain().await;
 
         c.send(&SdpMessage::Join {
             participant: pid(3),
@@ -893,14 +920,20 @@ mod tests {
             _ => panic!("expected Ready, got {:?}", ready_c),
         }
 
-        let a_msg = a.recv().await;
-        assert!(
-            matches!(a_msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
-        );
-        let b_msg = b.recv().await;
-        assert!(
-            matches!(b_msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
-        );
+        // A and B should receive room_status with C (pid(3)) present
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let a_msgs = a.drain().await;
+        assert!(a_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        }));
+        let b_msgs = b.drain().await;
+        assert!(b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        }));
     }
 
     #[tokio::test]
@@ -927,10 +960,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let msgs = a.drain().await;
-        let has_peer_left = msgs.iter().any(|m| {
-            matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
+        // B's departure is notified via room_status (no longer PeerLeft)
+        let has_b_gone = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
         });
-        assert!(has_peer_left, "expected PeerLeft for B, got: {:?}", msgs);
+        assert!(has_b_gone, "expected RoomStatus without B, got: {:?}", msgs);
     }
 
     #[tokio::test]
@@ -954,16 +990,24 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let b_msgs = b.drain().await;
-        let has_mute = b_msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { from, .. } if *from == pid(1)));
-        assert!(has_mute, "B should receive MuteAudio, got: {:?}", b_msgs);
+        let has_mute = b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else {
+                false
+            }
+        });
+        assert!(has_mute, "B should receive RoomStatus with audio_muted for pid(1), got: {:?}", b_msgs);
 
         let c_msgs = c.drain().await;
-        let has_mute = c_msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { from, .. } if *from == pid(1)));
-        assert!(has_mute, "C should receive MuteAudio, got: {:?}", c_msgs);
+        let has_mute = c_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else {
+                false
+            }
+        });
+        assert!(has_mute, "C should receive RoomStatus with audio_muted for pid(1), got: {:?}", c_msgs);
     }
 
     #[tokio::test]
@@ -990,12 +1034,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let b_msgs = b.drain().await;
-        let has_unmute = b_msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::UnmuteAudio { from, .. } if *from == pid(1)));
+        let has_unmute = b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+            } else {
+                false
+            }
+        });
         assert!(
             has_unmute,
-            "B should receive UnmuteAudio, got: {:?}",
+            "B should receive RoomStatus with audio unmuted for pid(1), got: {:?}",
             b_msgs
         );
     }
@@ -1089,17 +1137,19 @@ mod tests {
         let has_screen_stop = b_msgs.iter().any(
             |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
         );
-        let has_peer_left = b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
-        );
+        let has_a_gone = b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(1))
+            } else { false }
+        });
         assert!(
             has_screen_stop,
             "B should receive ScreenShareStopped on disconnect, got: {:?}",
             b_msgs
         );
         assert!(
-            has_peer_left,
-            "B should receive PeerLeft on disconnect, got: {:?}",
+            has_a_gone,
+            "B should receive RoomStatus without A on disconnect, got: {:?}",
             b_msgs
         );
     }
@@ -1166,9 +1216,11 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let msgs = b.drain().await;
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+        assert!(msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        }));
 
         a.send(&SdpMessage::UnmuteAudio {
             from: pid(1),
@@ -1176,9 +1228,11 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let msgs = b.drain().await;
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::UnmuteAudio { .. })));
+        assert!(msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+            } else { false }
+        }));
 
         a.send(&SdpMessage::MuteAudio {
             from: pid(1),
@@ -1186,9 +1240,11 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let msgs = b.drain().await;
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+        assert!(msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        }));
     }
 
     #[tokio::test]
@@ -1324,10 +1380,14 @@ mod tests {
             _ => panic!("expected Ready"),
         }
 
+        // A receives room_status with C (pid(3)) present
         let msg = a.recv().await;
-        assert!(
-            matches!(msg, SdpMessage::PeerJoined { participant, .. } if participant == pid(3))
-        );
+        match &msg {
+            SdpMessage::RoomStatus { participants, .. } => {
+                assert!(participants.iter().any(|p| p.id == pid(3)), "C should be in room_status");
+            }
+            _ => panic!("expected RoomStatus, got {:?}", msg),
+        }
     }
 
     #[tokio::test]
@@ -1356,15 +1416,21 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let msgs = a.drain().await;
 
+        // Each peer's join and leave is reflected via room_status snapshots.
+        // Verify that we received room_status messages showing each peer present then absent.
         for i in 2..=6u128 {
-            let has_joined = msgs.iter().any(
-                |m| matches!(m, SdpMessage::PeerJoined { participant, .. } if *participant == pid(i)),
-            );
-            let has_left = msgs.iter().any(
-                |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(i)),
-            );
-            assert!(has_joined, "missing PeerJoined for pid({i})");
-            assert!(has_left, "missing PeerLeft for pid({i})");
+            let has_joined = msgs.iter().any(|m| {
+                if let SdpMessage::RoomStatus { participants, .. } = m {
+                    participants.iter().any(|p| p.id == pid(i))
+                } else { false }
+            });
+            let has_left = msgs.iter().any(|m| {
+                if let SdpMessage::RoomStatus { participants, .. } = m {
+                    !participants.iter().any(|p| p.id == pid(i))
+                } else { false }
+            });
+            assert!(has_joined, "missing room_status with pid({i}) present");
+            assert!(has_left, "missing room_status without pid({i})");
         }
     }
 
@@ -1389,12 +1455,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let msgs = a.drain().await;
-        let has_left = msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2)),
-        );
+        let has_left = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
+        });
         assert!(
             has_left,
-            "A should receive PeerLeft even though B was muted"
+            "A should receive RoomStatus without B after disconnect"
         );
     }
 
@@ -1414,9 +1482,11 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let msgs = b.drain().await;
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { .. })));
+        assert!(msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        }));
 
         a.send(&SdpMessage::ScreenShareStarted {
             from: pid(1),
@@ -1473,9 +1543,8 @@ mod tests {
             .iter()
             .map(|m| match m {
                 SdpMessage::ScreenShareStarted { .. } => "screen_start",
-                SdpMessage::MuteAudio { .. } => "mute",
-                SdpMessage::UnmuteAudio { .. } => "unmute",
                 SdpMessage::ScreenShareStopped { .. } => "screen_stop",
+                SdpMessage::RoomStatus { .. } => "room_status",
                 _ => "other",
             })
             .collect();
@@ -1485,8 +1554,20 @@ mod tests {
             "missing screen_start in {:?}",
             types
         );
-        assert!(types.contains(&"mute"), "missing mute in {:?}", types);
-        assert!(types.contains(&"unmute"), "missing unmute in {:?}", types);
+        assert!(types.contains(&"room_status"), "missing room_status in {:?}", types);
+        // Verify mute/unmute state in room_status snapshots
+        let has_muted = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        });
+        let has_unmuted = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+            } else { false }
+        });
+        assert!(has_muted, "missing room_status with audio_muted=true");
+        assert!(has_unmuted, "missing room_status with audio_muted=false");
         assert!(
             types.contains(&"screen_stop"),
             "missing screen_stop in {:?}",
@@ -1520,9 +1601,11 @@ mod tests {
         b.disconnect();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let msgs = a.drain().await;
-        assert!(msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
-        ));
+        assert!(msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
+        }));
     }
 
     #[tokio::test]
@@ -1581,19 +1664,23 @@ mod tests {
 
         let b_msgs = b.drain().await;
         assert!(
-            b_msgs
-                .iter()
-                .any(|m| matches!(m, SdpMessage::MuteAudio { .. })),
-            "B should get mute"
+            b_msgs.iter().any(|m| {
+                if let SdpMessage::RoomStatus { participants, .. } = m {
+                    participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+                } else { false }
+            }),
+            "B should get RoomStatus with audio_muted for pid(1)"
         );
 
         let c_msgs = c.drain().await;
-        let c_has_mute = c_msgs
-            .iter()
-            .any(|m| matches!(m, SdpMessage::MuteAudio { .. }));
+        let c_has_mute = c_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        });
         assert!(
             !c_has_mute,
-            "C (different room) should NOT receive MuteAudio"
+            "C (different room) should NOT receive RoomStatus about room1"
         );
     }
 
@@ -1699,29 +1786,33 @@ mod tests {
         let has_screen_stop = b_msgs.iter().any(
             |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
         );
-        let has_left = b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
-        );
+        let has_left = b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(1))
+            } else { false }
+        });
         assert!(
             has_screen_stop,
             "B should get ScreenShareStopped, got: {:?}",
             b_msgs
         );
-        assert!(has_left, "B should get PeerLeft, got: {:?}", b_msgs);
+        assert!(has_left, "B should get RoomStatus without A, got: {:?}", b_msgs);
 
         let c_msgs = c.drain().await;
         let has_screen_stop = c_msgs.iter().any(
             |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
         );
-        let has_left = c_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(1)),
-        );
+        let has_left = c_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(1))
+            } else { false }
+        });
         assert!(
             has_screen_stop,
             "C should get ScreenShareStopped, got: {:?}",
             c_msgs
         );
-        assert!(has_left, "C should get PeerLeft, got: {:?}", c_msgs);
+        assert!(has_left, "C should get RoomStatus without A, got: {:?}", c_msgs);
     }
 
     #[tokio::test]
@@ -1756,20 +1847,26 @@ mod tests {
         c.disconnect();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let a_msgs = a.drain().await;
-        assert!(a_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3))
-        ));
+        assert!(a_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        }));
         let b_msgs = b.drain().await;
-        assert!(b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3))
-        ));
+        assert!(b_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        }));
 
         b.disconnect();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let a_msgs = a.drain().await;
-        assert!(a_msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2))
-        ));
+        assert!(a_msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
+        }));
 
         a.disconnect();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1812,14 +1909,18 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let msgs = a.drain().await;
-        let left_b = msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(2)),
-        );
-        let left_c = msgs.iter().any(
-            |m| matches!(m, SdpMessage::PeerLeft { participant, .. } if *participant == pid(3)),
-        );
-        assert!(left_b, "A should get PeerLeft for B");
-        assert!(left_c, "A should get PeerLeft for C");
+        let left_b = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
+        });
+        let left_c = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        });
+        assert!(left_b, "A should get RoomStatus without B");
+        assert!(left_c, "A should get RoomStatus without C");
     }
 
     #[tokio::test]
@@ -1946,17 +2047,15 @@ mod tests {
             _ => panic!("expected Ready"),
         }
 
+        // A receives room_status with B (pid(2)) present and display_name "Bob v2"
         let msg = a.recv().await;
         match &msg {
-            SdpMessage::PeerJoined {
-                participant,
-                display_name,
-                ..
-            } => {
-                assert_eq!(*participant, pid(2));
-                assert_eq!(display_name.as_deref(), Some("Bob v2"));
+            SdpMessage::RoomStatus { participants, .. } => {
+                let b_status = participants.iter().find(|p| p.id == pid(2));
+                assert!(b_status.is_some(), "B should be in room_status");
+                assert_eq!(b_status.unwrap().display_name.as_deref(), Some("Bob v2"));
             }
-            _ => panic!("expected PeerJoined, got {:?}", msg),
+            _ => panic!("expected RoomStatus, got {:?}", msg),
         }
     }
 
@@ -1968,7 +2067,10 @@ mod tests {
 
         join_and_register(&ctx, &mut a, pid(1), "r").await;
         join_and_register(&ctx, &mut b, pid(2), "r").await;
-        a.recv().await;
+        // Drain join-related messages (PeerJoined, RoomStatus from join)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        a.drain().await;
+        b.drain().await;
 
         for _ in 0..10 {
             a.send(&SdpMessage::MuteAudio {
@@ -1983,16 +2085,20 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let msgs = b.drain().await;
-        let mutes = msgs
-            .iter()
-            .filter(|m| matches!(m, SdpMessage::MuteAudio { .. }))
-            .count();
-        let unmutes = msgs
-            .iter()
-            .filter(|m| matches!(m, SdpMessage::UnmuteAudio { .. }))
-            .count();
-        assert_eq!(mutes, 10, "should receive 10 mute events");
-        assert_eq!(unmutes, 10, "should receive 10 unmute events");
+        // Each mute/unmute now produces a RoomStatus. Count RoomStatus messages
+        // where pid(1) is audio_muted=true and audio_muted=false respectively.
+        let mutes = msgs.iter().filter(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        }).count();
+        let unmutes = msgs.iter().filter(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+            } else { false }
+        }).count();
+        assert_eq!(mutes, 10, "should receive 10 room_status with audio_muted=true");
+        assert_eq!(unmutes, 10, "should receive 10 room_status with audio_muted=false");
     }
 
     #[tokio::test]
@@ -2100,10 +2206,9 @@ mod tests {
             .map(|m| match m {
                 SdpMessage::VideoConfigChanged { .. } => "config",
                 SdpMessage::ScreenShareStarted { .. } => "screen_start",
-                SdpMessage::MuteAudio { .. } => "mute",
-                SdpMessage::UnmuteAudio { .. } => "unmute",
                 SdpMessage::ScreenShareStopped { .. } => "screen_stop",
                 SdpMessage::PeerLeft { .. } => "left",
+                SdpMessage::RoomStatus { .. } => "room_status",
                 _ => "other",
             })
             .collect();
@@ -2118,14 +2223,33 @@ mod tests {
             "missing screen_start in {:?}",
             types
         );
-        assert!(types.contains(&"mute"), "missing mute in {:?}", types);
-        assert!(types.contains(&"unmute"), "missing unmute in {:?}", types);
+        // Mute/unmute state is now delivered via room_status snapshots
+        assert!(types.contains(&"room_status"), "missing room_status in {:?}", types);
+        // Verify the room_status messages contain the expected audio states
+        let has_muted = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+            } else { false }
+        });
+        let has_unmuted = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+            } else { false }
+        });
+        assert!(has_muted, "missing room_status with audio_muted=true");
+        assert!(has_unmuted, "missing room_status with audio_muted=false");
         assert!(
             types.contains(&"screen_stop"),
             "missing screen_stop in {:?}",
             types
         );
-        assert!(types.contains(&"left"), "missing left in {:?}", types);
+        // A's departure is notified via room_status (no longer PeerLeft)
+        let has_a_gone = msgs.iter().any(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(1))
+            } else { false }
+        });
+        assert!(has_a_gone, "missing room_status without A after disconnect");
 
         let config_count = types.iter().filter(|&&t| t == "config").count();
         assert_eq!(config_count, 2, "should have 2 config changes");
@@ -2186,10 +2310,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconnect_peer_left_arrives_before_peer_joined() {
+    async fn test_reconnect_room_status_ordering() {
         // When "bb" refreshes (UUID-2 → UUID-3), "aaa" (pid=1) must receive
-        // peer_left(UUID-2) BEFORE peer_joined(UUID-3) so the frontend
-        // frees the transceiver slot before allocating a new one.
+        // a room_status WITHOUT the old bb before a room_status WITH the new bb,
+        // so the frontend frees the transceiver slot before allocating a new one.
         let ctx = TestCtx::new().await;
         let (mut a, _ha) = ctx.connect_peer();
         let (mut b_old, _hb) = ctx.connect_peer();
@@ -2209,32 +2333,35 @@ mod tests {
             room_id: "room1".into(),
             display_name: Some("bb".into()),
         });
-        // Wait for b_new's Ready.
-        b_new.recv().await;
+        b_new.recv_skip_status().await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Collect all messages "aaa" received.
         let msgs = a.drain().await;
-        let types: Vec<&str> = msgs.iter().map(|m| match m {
-            SdpMessage::PeerLeft { .. } => "peer_left",
-            SdpMessage::PeerJoined { .. } => "peer_joined",
-            SdpMessage::ScreenShareStopped { .. } => "screen_stop",
-            _ => "other",
-        }).collect();
 
-        // Must have peer_left before peer_joined.
-        let left_idx = types.iter().position(|&t| t == "peer_left");
-        let joined_idx = types.iter().position(|&t| t == "peer_joined");
+        // Find first room_status without old bb (pid=2), then first with new bb (pid=3).
+        let without_old = msgs.iter().position(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                !participants.iter().any(|p| p.id == pid(2))
+            } else { false }
+        });
+        let with_new = msgs.iter().position(|m| {
+            if let SdpMessage::RoomStatus { participants, .. } = m {
+                participants.iter().any(|p| p.id == pid(3))
+            } else { false }
+        });
         assert!(
-            left_idx.is_some(),
-            "aaa should receive peer_left for old bb, got: {:?}", types
+            without_old.is_some(),
+            "aaa should receive room_status without old bb, got: {:?}", msgs
         );
         assert!(
-            joined_idx.is_some(),
-            "aaa should receive peer_joined for new bb, got: {:?}", types
+            with_new.is_some(),
+            "aaa should receive room_status with new bb, got: {:?}", msgs
         );
         assert!(
-            left_idx.unwrap() < joined_idx.unwrap(),
-            "peer_left must arrive BEFORE peer_joined, got: {:?}", types
+            without_old.unwrap() <= with_new.unwrap(),
+            "room_status without old bb must arrive BEFORE/WITH room_status with new bb"
         );
     }
 

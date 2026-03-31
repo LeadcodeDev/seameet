@@ -7,13 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-use crate::message::SdpMessage;
+use crate::message::{ParticipantStatus, SdpMessage};
 use crate::transport::IncomingConnection;
+use serde::{Deserialize, Serialize};
 
 /// Per-participant outbound channel.
 pub type WsSink = mpsc::UnboundedSender<String>;
 
 // ── Domain types ────────────────────────────────────────────────────────
+
+/// Tracks the media state (audio/video/screenshare) for a participant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemberMediaState {
+    pub audio_muted: bool,
+    pub video_muted: bool,
+    pub screen_sharing: bool,
+}
 
 /// A connected participant within the signaling system.
 #[derive(Debug, Clone)]
@@ -24,6 +33,8 @@ pub struct Member {
     sink: WsSink,
     /// Optional human-readable name.
     pub display_name: Option<String>,
+    /// Current media state.
+    pub media_state: MemberMediaState,
 }
 
 impl Member {
@@ -33,6 +44,7 @@ impl Member {
             id,
             sink,
             display_name: None,
+            media_state: MemberMediaState::default(),
         }
     }
 
@@ -42,6 +54,7 @@ impl Member {
             id,
             sink,
             display_name,
+            media_state: MemberMediaState::default(),
         }
     }
 
@@ -139,6 +152,48 @@ impl Room {
             .values()
             .filter(|m| m.id != *exclude)
             .map(|m| m.sink.clone())
+            .collect()
+    }
+
+    /// Sends a message to ALL members (including the sender).
+    pub fn broadcast_all(&self, msg: &str) {
+        for member in self.members.values() {
+            member.send(msg);
+        }
+    }
+
+    /// Sets audio muted state for a member.
+    pub fn set_audio_muted(&mut self, id: &ParticipantId, muted: bool) {
+        if let Some(member) = self.members.get_mut(id) {
+            member.media_state.audio_muted = muted;
+        }
+    }
+
+    /// Sets video muted state for a member.
+    pub fn set_video_muted(&mut self, id: &ParticipantId, muted: bool) {
+        if let Some(member) = self.members.get_mut(id) {
+            member.media_state.video_muted = muted;
+        }
+    }
+
+    /// Sets screen sharing state for a member.
+    pub fn set_screen_sharing(&mut self, id: &ParticipantId, sharing: bool) {
+        if let Some(member) = self.members.get_mut(id) {
+            member.media_state.screen_sharing = sharing;
+        }
+    }
+
+    /// Returns a snapshot of all participants' status for the `room_status` message.
+    pub fn participants_snapshot(&self) -> Vec<ParticipantStatus> {
+        self.members
+            .values()
+            .map(|m| ParticipantStatus {
+                id: m.id,
+                display_name: m.display_name.clone(),
+                audio_muted: m.media_state.audio_muted,
+                video_muted: m.media_state.video_muted,
+                screen_sharing: m.media_state.screen_sharing,
+            })
             .collect()
     }
 
@@ -352,6 +407,22 @@ impl SignalingHooks for NoopHooks {
     }
 }
 
+// ── Room status broadcast ────────────────────────────────────────────────
+
+/// Broadcasts a `room_status` snapshot to ALL members of the room (including the sender).
+/// Requires a write lock already held on `SignalingState`.
+pub fn broadcast_room_status(state: &SignalingState, room_id: &str) {
+    if let Some(room) = state.room(room_id) {
+        let msg = SdpMessage::RoomStatus {
+            room_id: room_id.to_owned(),
+            participants: room.participants_snapshot(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            room.broadcast_all(&json);
+        }
+    }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────
 
 /// Dispatches a single signaling message through the engine's default logic.
@@ -372,47 +443,10 @@ pub async fn dispatch(
 
             // Prune zombie members whose WS connection closed but whose
             // disconnect handler hasn't run yet (race on tab refresh).
-            let pruned_pids: Vec<ParticipantId> = if let Some(room) = st.room_mut(room_id) {
+            if let Some(room) = st.room_mut(room_id) {
                 let pruned = room.prune_stale();
                 for stale_pid in &pruned {
                     info!(participant = %stale_pid, room = room_id, "pruned stale member on join");
-                }
-                pruned
-            } else {
-                vec![]
-            };
-
-            // Broadcast PeerLeft for pruned zombies BEFORE PeerJoined, so that
-            // existing peers free their transceiver slots before allocating new ones.
-            if !pruned_pids.is_empty() {
-                let active_sinks = st.room(room_id)
-                    .map(|r| r.peer_sinks(participant))
-                    .unwrap_or_default();
-                for stale_pid in &pruned_pids {
-                    let peer_left = SdpMessage::PeerLeft {
-                        participant: *stale_pid,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&peer_left) {
-                        for sink in &active_sinks {
-                            let _ = sink.send(json.clone());
-                        }
-                    }
-                }
-            }
-
-            // If this participant is already in the room (rapid reconnect),
-            // broadcast PeerLeft so other peers clean up the stale entry.
-            if let Some(room) = st.room(room_id) {
-                if room.get(participant).is_some() {
-                    tracing::warn!(%participant, %room_id, "re-join detected, broadcasting PeerLeft for stale entry");
-                    let peer_left = SdpMessage::PeerLeft {
-                        participant: *participant,
-                        room_id: room_id.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&peer_left) {
-                        room.broadcast(&json, participant);
-                    }
                 }
             }
 
@@ -439,21 +473,10 @@ pub async fn dispatch(
                 let _ = self_tx.send(json);
             }
 
-            // Notify existing peers about the new joiner.
-            if !initiator {
-                let peer_sinks = st.peers(room_id, participant);
-                drop(st);
-                let peer_joined = SdpMessage::PeerJoined {
-                    participant: *participant,
-                    room_id: room_id.clone(),
-                    display_name: display_name.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&peer_joined) {
-                    for peer_tx in peer_sinks {
-                        let _ = peer_tx.send(json.clone());
-                    }
-                }
-            }
+            // Broadcast room_status snapshot to ALL members (including the new joiner).
+            // This replaces the individual PeerJoined WS broadcast.
+            broadcast_room_status(&st, room_id);
+            drop(st);
 
             info!(participant = %participant, room = room_id, "joined");
         }
@@ -462,19 +485,13 @@ pub async fn dispatch(
             room_id,
         } => {
             let mut st = state.write().await;
-            let peers = st.peers(room_id, participant);
             st.leave(participant, room_id);
+
+            // Broadcast room_status snapshot to remaining members.
+            // This replaces the individual PeerLeft WS broadcast.
+            broadcast_room_status(&st, room_id);
             drop(st);
 
-            let peer_left = SdpMessage::PeerLeft {
-                participant: *participant,
-                room_id: room_id.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&peer_left) {
-                for peer_tx in peers {
-                    let _ = peer_tx.send(json.clone());
-                }
-            }
             info!(participant = %participant, room = room_id, "left");
         }
         SdpMessage::Offer { room_id, to, .. } => {
@@ -499,13 +516,57 @@ pub async fn dispatch(
         }
         // RequestRenegotiation is server→client only; ignore if received from client.
         SdpMessage::RequestRenegotiation { .. } => {}
-        SdpMessage::ScreenShareStarted { room_id, .. }
-        | SdpMessage::ScreenShareStopped { room_id, .. }
-        | SdpMessage::MuteAudio { room_id, .. }
-        | SdpMessage::UnmuteAudio { room_id, .. }
-        | SdpMessage::MuteVideo { room_id, .. }
-        | SdpMessage::UnmuteVideo { room_id, .. }
-        | SdpMessage::VideoConfigChanged { room_id, .. } => {
+        SdpMessage::MuteAudio { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_audio_muted(&pid, true);
+            }
+            broadcast_room_status(&st, room_id);
+        }
+        SdpMessage::UnmuteAudio { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_audio_muted(&pid, false);
+            }
+            broadcast_room_status(&st, room_id);
+        }
+        SdpMessage::MuteVideo { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_video_muted(&pid, true);
+            }
+            broadcast_room_status(&st, room_id);
+        }
+        SdpMessage::UnmuteVideo { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_video_muted(&pid, false);
+            }
+            broadcast_room_status(&st, room_id);
+        }
+        SdpMessage::ScreenShareStarted { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_screen_sharing(&pid, true);
+            }
+            let peers = st.peers(room_id, &pid);
+            drop(st);
+            for peer_tx in peers {
+                let _ = peer_tx.send(raw.to_owned());
+            }
+        }
+        SdpMessage::ScreenShareStopped { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_screen_sharing(&pid, false);
+            }
+            let peers = st.peers(room_id, &pid);
+            drop(st);
+            for peer_tx in peers {
+                let _ = peer_tx.send(raw.to_owned());
+            }
+        }
+        SdpMessage::VideoConfigChanged { room_id, .. } => {
             let st = state.read().await;
             let peers = st.peers(room_id, &pid);
             drop(st);
@@ -605,26 +666,16 @@ pub async fn run_connection<H: SignalingHooks>(
             warn!(participant = %pid, "disconnect: no affected rooms");
         }
 
-        // Broadcast PeerLeft to remaining peers.
+        // Broadcast room_status to remaining peers (replaces individual PeerLeft).
         for (room_id, _) in &affected {
-            let peer_left = SdpMessage::PeerLeft {
-                participant: pid,
-                room_id: room_id.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&peer_left) {
-                let st = state.read().await;
-                let peers = st.peers(room_id, &pid);
-                drop(st);
-                info!(
-                    participant = %pid,
-                    room = %room_id,
-                    peer_count = peers.len(),
-                    "broadcasting PeerLeft"
-                );
-                for peer_tx in peers {
-                    let _ = peer_tx.send(json.clone());
-                }
-            }
+            let st = state.read().await;
+            info!(
+                participant = %pid,
+                room = %room_id,
+                "broadcasting room_status after disconnect"
+            );
+            broadcast_room_status(&st, room_id);
+            drop(st);
         }
 
         // Notify hooks about the disconnect.

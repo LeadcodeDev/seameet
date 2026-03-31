@@ -1,21 +1,30 @@
 import { useMemo } from 'react'
-import { useParams, Navigate } from 'react-router-dom'
+import { useParams, useLocation, Navigate } from 'react-router-dom'
 import { CallProvider } from '@/context/CallContext'
 import { VideoGrid } from '@/components/VideoGrid'
 import { ControlBar } from '@/components/ControlBar'
 
 export default function RoomPage() {
   const { code } = useParams<{ code: string }>()
+  const location = useLocation()
   const displayName = sessionStorage.getItem('seameet-display-name')
 
   const participantId = useMemo(() => crypto.randomUUID(), [])
+
+  const lobbyState = location.state as { cameraOn?: boolean; micOn?: boolean } | null
 
   if (!displayName || !code) {
     return <Navigate to="/" replace />
   }
 
   return (
-    <CallProvider participantId={participantId} displayName={displayName} roomId={code}>
+    <CallProvider
+      participantId={participantId}
+      displayName={displayName}
+      roomId={code}
+      initialAudioEnabled={lobbyState?.micOn}
+      initialVideoEnabled={lobbyState?.cameraOn}
+    >
       <div className="h-dvh flex flex-col">
         {/* Header */}
         <div className="flex items-center px-4 py-2">

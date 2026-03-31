@@ -17,7 +17,7 @@ export function VideoGrid() {
   }, [totalTiles])
 
   return (
-    <div className={`grid ${gridCols} gap-2 h-full auto-rows-fr`}>
+    <div data-testid="video-grid" className={`grid ${gridCols} gap-2 h-full auto-rows-fr`}>
       {/* Local video */}
       <VideoTile
         stream={localStream}
