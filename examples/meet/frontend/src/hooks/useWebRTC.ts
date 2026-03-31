@@ -382,40 +382,35 @@ export function useWebRTC({
       return
     }
 
-    if (data.type === 'peer_joined') {
-      const peerId = data.participant
-      console.log(`[WebRTC] peer_joined: ${peerId.slice(0, 8)}`)
-      addRemotePeer(peerId, data.display_name)
-      return
-    }
+    if (data.type === 'room_status') {
+      const myId = participantIdRef.current
+      const remoteParticipants = data.participants.filter(p => p.id !== myId)
+      const remoteIds = new Set(remoteParticipants.map(p => p.id))
 
-    if (data.type === 'peer_left') {
-      console.log(`[WebRTC] peer_left: ${data.participant.slice(0, 8)}`)
-      removeRemotePeer(data.participant)
-      return
-    }
+      // Remove peers no longer in the room
+      for (const peerId of remotePeersRef.current.keys()) {
+        if (!remoteIds.has(peerId)) {
+          removeRemotePeer(peerId)
+        }
+      }
 
-    if (data.type === 'mute_audio') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.audioMuted = true; updateRemotePeersState() }
-      return
-    }
+      // Add new peers not yet tracked
+      for (const p of remoteParticipants) {
+        if (!remotePeersRef.current.has(p.id)) {
+          addRemotePeer(p.id, p.display_name)
+        }
+      }
 
-    if (data.type === 'unmute_audio') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.audioMuted = false; updateRemotePeersState() }
-      return
-    }
+      // Update media state for all remote peers
+      for (const p of remoteParticipants) {
+        const info = remotePeersRef.current.get(p.id)
+        if (info) {
+          info.audioMuted = p.audio_muted
+          info.videoMuted = p.video_muted
+        }
+      }
 
-    if (data.type === 'mute_video') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.videoMuted = true; updateRemotePeersState() }
-      return
-    }
-
-    if (data.type === 'unmute_video') {
-      const info = remotePeersRef.current.get(data.from)
-      if (info) { info.videoMuted = false; updateRemotePeersState() }
+      updateRemotePeersState()
       return
     }
 

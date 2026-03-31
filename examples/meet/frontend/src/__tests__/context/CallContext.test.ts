@@ -91,7 +91,7 @@ describe('CallContext', () => {
     expect(msgs.find(m => m.type === 'mute_audio')).toBeDefined()
   })
 
-  it('A joins, B joins — A sees B in remotePeers', async () => {
+  it('A joins, B joins — A sees B via room_status', async () => {
     const { hook, ws } = await setupCall()
 
     // Answer the initial offer
@@ -106,13 +106,15 @@ describe('CallContext', () => {
       await new Promise(resolve => setTimeout(resolve, 20))
     })
 
-    // B joins
+    // Server sends room_status with B
     await act(async () => {
       ws.serverPush({
-        type: 'peer_joined',
-        participant: 'peer-b',
+        type: 'room_status',
         room_id: 'test-room',
-        display_name: 'Bob',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-b', display_name: 'Bob', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
       })
       await new Promise(resolve => setTimeout(resolve, 20))
     })

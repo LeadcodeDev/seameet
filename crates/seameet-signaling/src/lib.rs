@@ -47,12 +47,12 @@ mod tests {
         format!("ws://{addr}")
     }
 
-    /// Helper: receive the next SdpMessage, skipping Ready and Join control messages.
+    /// Helper: receive the next SdpMessage, skipping Ready, Join, PeerJoined, and RoomStatus control messages.
     #[cfg(feature = "tungstenite")]
     async fn recv_skip_control(ws: &mut WsSignaling) -> SdpMessage {
         loop {
             let msg = ws.recv().await.expect("recv");
-            if matches!(msg, SdpMessage::Ready { .. } | SdpMessage::Join { .. } | SdpMessage::PeerJoined { .. }) {
+            if matches!(msg, SdpMessage::Ready { .. } | SdpMessage::Join { .. } | SdpMessage::PeerJoined { .. } | SdpMessage::RoomStatus { .. }) {
                 continue;
             }
             return msg;
