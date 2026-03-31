@@ -39,6 +39,8 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
   const [error, setError] = useState<string | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const acquiringRef = useRef<Promise<MediaStream | null> | null>(null)
+  const videoSettingsRef = useRef(videoSettings)
+  videoSettingsRef.current = videoSettings
   const onScreenShareEndedRef = useRef(options?.onScreenShareEnded)
   onScreenShareEndedRef.current = options?.onScreenShareEnded
 
@@ -63,9 +65,9 @@ export function useMediaDevices(options?: UseMediaDevicesOptions): UseMediaDevic
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
           video: {
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            frameRate: { ideal: 24, max: 30 },
+            width: { ideal: videoSettingsRef.current.width },
+            height: { ideal: videoSettingsRef.current.height },
+            frameRate: { ideal: videoSettingsRef.current.frameRate, max: 60 },
           },
         })
         // Disable all tracks immediately — callers will enable what they need

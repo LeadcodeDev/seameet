@@ -8,15 +8,10 @@ import type { VideoSettings } from '@/hooks/useMediaDevices'
 // so the initial SDP offer includes enough audio+video pairs for future peers.
 const MAX_PEER_SLOTS = 7
 
-const BITRATE_BY_HEIGHT: Record<number, number> = {
-  360: 500_000,
-  480: 800_000,
-  720: 1_500_000,
-  1080: 3_000_000,
-}
-
-function getBitrateForHeight(height: number): number {
-  return BITRATE_BY_HEIGHT[height] ?? 800_000
+function getBitrate(height: number, fps: number): number {
+  const base: Record<number, number> = { 360: 500_000, 480: 800_000, 720: 1_500_000, 1080: 3_000_000 }
+  const bitrate = base[height] ?? 800_000
+  return fps > 30 ? Math.round(bitrate * 1.6) : bitrate
 }
 
 interface TransceiverSlot {
@@ -34,6 +29,7 @@ export interface RemotePeer {
   videoMuted: boolean
   screenTransceiver: RTCRtpTransceiver | null
   screenStream: MediaStream | null
+  videoConfig?: { width: number; height: number; fps: number }
 }
 
 export interface UseWebRTCOptions {
@@ -475,6 +471,15 @@ export function useWebRTC({
       return
     }
 
+    if (data.type === 'video_config_changed') {
+      const peer = remotePeersRef.current.get(data.from)
+      if (peer) {
+        peer.videoConfig = { width: data.width, height: data.height, fps: data.fps }
+        updateRemotePeersState()
+      }
+      return
+    }
+
     if (data.type === 'screen_share_stopped') {
       const peerId = data.from
       const info = remotePeersRef.current.get(peerId)
@@ -586,13 +591,15 @@ export function useWebRTC({
     const pc = pcRef.current
     if (!pc) return
     try {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video')
-      if (!videoSender) return
-      const params = videoSender.getParameters()
-      if (params.encodings.length > 0) {
-        params.encodings[0].maxBitrate = getBitrateForHeight(videoSettings.height)
-        params.encodings[0].maxFramerate = videoSettings.frameRate
-        videoSender.setParameters(params)
+      const videoSenders = pc.getSenders().filter(s => s.track?.kind === 'video')
+      for (const sender of videoSenders) {
+        const params = sender.getParameters()
+        if (params.encodings.length > 0) {
+          params.encodings[0].maxBitrate = getBitrate(videoSettings.height, videoSettings.frameRate)
+          params.encodings[0].maxFramerate = videoSettings.frameRate
+          params.degradationPreference = 'maintain-resolution'
+          sender.setParameters(params)
+        }
       }
     } catch (e) {
       console.warn('[WebRTC] setParameters failed:', e)

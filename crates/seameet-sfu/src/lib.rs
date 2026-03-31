@@ -71,13 +71,14 @@ pub struct SfuServer {
     sessions: Sessions,
     /// Monotonic counter for SfuPeer generations (reconnection detection).
     next_peer_gen: std::sync::atomic::AtomicU64,
+    /// Optional BWE override from SfuConfig (kbps).
+    bwe_kbps: Option<u32>,
 }
 
 impl SfuServer {
     pub async fn new(config: SfuConfig) -> Result<Arc<Self>, std::io::Error> {
-        let shared_socket = Arc::new(
-            UdpSocket::bind(format!("0.0.0.0:{}", config.udp_port)).await?,
-        );
+        let shared_socket =
+            Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", config.udp_port)).await?);
         let udp_local_addr = shared_socket.local_addr()?;
 
         let all_peers: Peers = Arc::new(RwLock::new(HashMap::new()));
@@ -98,6 +99,7 @@ impl SfuServer {
             udp_local_addr,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             next_peer_gen: std::sync::atomic::AtomicU64::new(1),
+            bwe_kbps: config.bwe_kbps,
         }))
     }
 
@@ -180,7 +182,7 @@ impl SignalingHooks for SfuServer {
                 let bwe = self
                     .config_bwe_kbps()
                     .map(Bitrate::kbps)
-                    .unwrap_or(Bitrate::kbps(800));
+                    .unwrap_or(Bitrate::kbps(8_000));
 
                 let mut config = RtcConfig::new()
                     .set_rtp_mode(true)
@@ -241,7 +243,6 @@ impl SignalingHooks for SfuServer {
                     info!(participant = %pid, ?mid, ?kind, "SDP mid");
                 }
 
-
                 // Drain pending Transmit events (DTLS handshake packets).
                 loop {
                     match rtc.poll_output() {
@@ -269,7 +270,9 @@ impl SignalingHooks for SfuServer {
 
                 info!(participant = %pid, %local_addr, "SDP negotiated");
 
-                let peer_gen = self.next_peer_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let peer_gen = self
+                    .next_peer_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
                 let sfu_peer = SfuPeer {
                     cmd_tx,
@@ -278,11 +281,14 @@ impl SignalingHooks for SfuServer {
                 };
                 {
                     let mut p = room_peers.write().await;
-                    p.insert(pid, SfuPeer {
-                        cmd_tx: sfu_peer.cmd_tx.clone(),
-                        ws_tx: sfu_peer.ws_tx.clone(),
-                        gen: peer_gen,
-                    });
+                    p.insert(
+                        pid,
+                        SfuPeer {
+                            cmd_tx: sfu_peer.cmd_tx.clone(),
+                            ws_tx: sfu_peer.ws_tx.clone(),
+                            gen: peer_gen,
+                        },
+                    );
                 }
                 {
                     let mut ap = self.all_peers.write().await;
@@ -528,7 +534,8 @@ impl SignalingHooks for SfuServer {
                                 info!(participant = %stale_pid, room = room_id, "SFU: pruned stale member on join, sending PeerLeft to media tasks");
                                 for (id, peer) in p.iter() {
                                     if id != stale_pid {
-                                        let _ = peer.cmd_tx.send(PeerCmd::PeerLeft { pid: *stale_pid });
+                                        let _ =
+                                            peer.cmd_tx.send(PeerCmd::PeerLeft { pid: *stale_pid });
                                     }
                                 }
                             }
@@ -596,7 +603,7 @@ impl SignalingHooks for SfuServer {
         &self,
         pid: ParticipantId,
         affected_rooms: &[(String, bool)],
-        state: &Arc<RwLock<SignalingState>>,
+        _state: &Arc<RwLock<SignalingState>>,
     ) {
         {
             let mut r = self.routes.write().await;
@@ -639,16 +646,12 @@ impl SignalingHooks for SfuServer {
 // Private helpers for SfuServer config access.
 impl SfuServer {
     fn config_bwe_kbps(&self) -> Option<u64> {
-        // BWE is configured at construction time via SfuConfig.
-        // For now we use a default; in the future this could be stored.
-        None
+        self.bwe_kbps.map(|v| v as u64)
     }
 
     fn public_ip(&self) -> Option<std::net::IpAddr> {
         // Check PUBLIC_IP env var at runtime.
-        std::env::var("PUBLIC_IP")
-            .ok()
-            .and_then(|s| s.parse().ok())
+        std::env::var("PUBLIC_IP").ok().and_then(|s| s.parse().ok())
     }
 }
 
@@ -693,22 +696,16 @@ mod tests {
         }
 
         async fn recv(&mut self) -> SdpMessage {
-            let json = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.out_rx.recv(),
-            )
-            .await
-            .expect("timeout waiting for message")
-            .expect("channel closed");
+            let json = tokio::time::timeout(std::time::Duration::from_secs(2), self.out_rx.recv())
+                .await
+                .expect("timeout waiting for message")
+                .expect("channel closed");
             serde_json::from_str(&json).unwrap()
         }
 
         async fn try_recv(&mut self) -> Option<SdpMessage> {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                self.out_rx.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), self.out_rx.recv())
+                .await
             {
                 Ok(Some(json)) => serde_json::from_str(&json).ok(),
                 _ => None,
@@ -735,9 +732,7 @@ mod tests {
 
     impl TestCtx {
         async fn new() -> Self {
-            let socket = Arc::new(
-                tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
-            );
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let addr = socket.local_addr().unwrap();
 
             let hooks = Arc::new(SfuServer {
@@ -748,6 +743,7 @@ mod tests {
                 udp_local_addr: addr,
                 sessions: Arc::new(RwLock::new(HashMap::new())),
                 next_peer_gen: std::sync::atomic::AtomicU64::new(1),
+                bwe_kbps: None,
             });
 
             Self {
@@ -876,10 +872,18 @@ mod tests {
         let msgs = a.drain().await;
         let has_b = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(2) && p.display_name.as_deref() == Some("Bob"))
-            } else { false }
+                participants
+                    .iter()
+                    .any(|p| p.id == pid(2) && p.display_name.as_deref() == Some("Bob"))
+            } else {
+                false
+            }
         });
-        assert!(has_b, "A should receive RoomStatus with Bob, got: {:?}", msgs);
+        assert!(
+            has_b,
+            "A should receive RoomStatus with Bob, got: {:?}",
+            msgs
+        );
     }
 
     #[tokio::test]
@@ -901,7 +905,7 @@ mod tests {
             display_name: None,
         });
         b.recv().await; // Ready
-        // Drain A's RoomStatus from both joins
+                        // Drain A's RoomStatus from both joins
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         a.drain().await;
 
@@ -926,13 +930,17 @@ mod tests {
         assert!(a_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         }));
         let b_msgs = b.drain().await;
         assert!(b_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         }));
     }
 
@@ -964,7 +972,9 @@ mod tests {
         let has_b_gone = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(has_b_gone, "expected RoomStatus without B, got: {:?}", msgs);
     }
@@ -997,7 +1007,11 @@ mod tests {
                 false
             }
         });
-        assert!(has_mute, "B should receive RoomStatus with audio_muted for pid(1), got: {:?}", b_msgs);
+        assert!(
+            has_mute,
+            "B should receive RoomStatus with audio_muted for pid(1), got: {:?}",
+            b_msgs
+        );
 
         let c_msgs = c.drain().await;
         let has_mute = c_msgs.iter().any(|m| {
@@ -1007,7 +1021,11 @@ mod tests {
                 false
             }
         });
-        assert!(has_mute, "C should receive RoomStatus with audio_muted for pid(1), got: {:?}", c_msgs);
+        assert!(
+            has_mute,
+            "C should receive RoomStatus with audio_muted for pid(1), got: {:?}",
+            c_msgs
+        );
     }
 
     #[tokio::test]
@@ -1036,7 +1054,9 @@ mod tests {
         let b_msgs = b.drain().await;
         let has_unmute = b_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
+                participants
+                    .iter()
+                    .any(|p| p.id == pid(1) && !p.audio_muted)
             } else {
                 false
             }
@@ -1102,9 +1122,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let b_msgs = b.drain().await;
-        let has_stop = b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
-        );
+        let has_stop = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)));
         assert!(
             has_stop,
             "B should receive ScreenShareStopped, got: {:?}",
@@ -1134,13 +1154,15 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let b_msgs = b.drain().await;
-        let has_screen_stop = b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
-        );
+        let has_screen_stop = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)));
         let has_a_gone = b_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(1))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             has_screen_stop,
@@ -1219,7 +1241,9 @@ mod tests {
         assert!(msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         }));
 
         a.send(&SdpMessage::UnmuteAudio {
@@ -1230,8 +1254,12 @@ mod tests {
         let msgs = b.drain().await;
         assert!(msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
-            } else { false }
+                participants
+                    .iter()
+                    .any(|p| p.id == pid(1) && !p.audio_muted)
+            } else {
+                false
+            }
         }));
 
         a.send(&SdpMessage::MuteAudio {
@@ -1243,7 +1271,9 @@ mod tests {
         assert!(msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         }));
     }
 
@@ -1384,7 +1414,10 @@ mod tests {
         let msg = a.recv().await;
         match &msg {
             SdpMessage::RoomStatus { participants, .. } => {
-                assert!(participants.iter().any(|p| p.id == pid(3)), "C should be in room_status");
+                assert!(
+                    participants.iter().any(|p| p.id == pid(3)),
+                    "C should be in room_status"
+                );
             }
             _ => panic!("expected RoomStatus, got {:?}", msg),
         }
@@ -1422,12 +1455,16 @@ mod tests {
             let has_joined = msgs.iter().any(|m| {
                 if let SdpMessage::RoomStatus { participants, .. } = m {
                     participants.iter().any(|p| p.id == pid(i))
-                } else { false }
+                } else {
+                    false
+                }
             });
             let has_left = msgs.iter().any(|m| {
                 if let SdpMessage::RoomStatus { participants, .. } = m {
                     !participants.iter().any(|p| p.id == pid(i))
-                } else { false }
+                } else {
+                    false
+                }
             });
             assert!(has_joined, "missing room_status with pid({i}) present");
             assert!(has_left, "missing room_status without pid({i})");
@@ -1458,7 +1495,9 @@ mod tests {
         let has_left = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             has_left,
@@ -1485,7 +1524,9 @@ mod tests {
         assert!(msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         }));
 
         a.send(&SdpMessage::ScreenShareStarted {
@@ -1554,17 +1595,27 @@ mod tests {
             "missing screen_start in {:?}",
             types
         );
-        assert!(types.contains(&"room_status"), "missing room_status in {:?}", types);
+        assert!(
+            types.contains(&"room_status"),
+            "missing room_status in {:?}",
+            types
+        );
         // Verify mute/unmute state in room_status snapshots
         let has_muted = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         });
         let has_unmuted = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
-            } else { false }
+                participants
+                    .iter()
+                    .any(|p| p.id == pid(1) && !p.audio_muted)
+            } else {
+                false
+            }
         });
         assert!(has_muted, "missing room_status with audio_muted=true");
         assert!(has_unmuted, "missing room_status with audio_muted=false");
@@ -1604,7 +1655,9 @@ mod tests {
         assert!(msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         }));
     }
 
@@ -1640,7 +1693,11 @@ mod tests {
             })
             .collect();
         assert_eq!(configs.len(), 3, "B should receive all 3 config changes");
-        assert_eq!(configs[2], (1920, 1080, 60), "last config should be 1080p60");
+        assert_eq!(
+            configs[2],
+            (1920, 1080, 60),
+            "last config should be 1080p60"
+        );
     }
 
     #[tokio::test]
@@ -1667,7 +1724,9 @@ mod tests {
             b_msgs.iter().any(|m| {
                 if let SdpMessage::RoomStatus { participants, .. } = m {
                     participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-                } else { false }
+                } else {
+                    false
+                }
             }),
             "B should get RoomStatus with audio_muted for pid(1)"
         );
@@ -1676,7 +1735,9 @@ mod tests {
         let c_has_mute = c_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             !c_has_mute,
@@ -1783,36 +1844,48 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let b_msgs = b.drain().await;
-        let has_screen_stop = b_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
-        );
+        let has_screen_stop = b_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)));
         let has_left = b_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(1))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             has_screen_stop,
             "B should get ScreenShareStopped, got: {:?}",
             b_msgs
         );
-        assert!(has_left, "B should get RoomStatus without A, got: {:?}", b_msgs);
+        assert!(
+            has_left,
+            "B should get RoomStatus without A, got: {:?}",
+            b_msgs
+        );
 
         let c_msgs = c.drain().await;
-        let has_screen_stop = c_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)),
-        );
+        let has_screen_stop = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStopped { from, .. } if *from == pid(1)));
         let has_left = c_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(1))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             has_screen_stop,
             "C should get ScreenShareStopped, got: {:?}",
             c_msgs
         );
-        assert!(has_left, "C should get RoomStatus without A, got: {:?}", c_msgs);
+        assert!(
+            has_left,
+            "C should get RoomStatus without A, got: {:?}",
+            c_msgs
+        );
     }
 
     #[tokio::test]
@@ -1850,13 +1923,17 @@ mod tests {
         assert!(a_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         }));
         let b_msgs = b.drain().await;
         assert!(b_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         }));
 
         b.disconnect();
@@ -1865,7 +1942,9 @@ mod tests {
         assert!(a_msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         }));
 
         a.disconnect();
@@ -1912,12 +1991,16 @@ mod tests {
         let left_b = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         });
         let left_c = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(left_b, "A should get RoomStatus without B");
         assert!(left_c, "A should get RoomStatus without C");
@@ -1956,17 +2039,17 @@ mod tests {
 
         let a_msgs = a.drain().await;
         assert!(
-            a_msgs
-                .iter()
-                .any(|m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))),
+            a_msgs.iter().any(
+                |m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))
+            ),
             "A should still receive messages from non-muted B"
         );
 
         let c_msgs = c.drain().await;
         assert!(
-            c_msgs
-                .iter()
-                .any(|m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))),
+            c_msgs.iter().any(
+                |m| matches!(m, SdpMessage::VideoConfigChanged { from, .. } if *from == pid(2))
+            ),
             "C should still receive messages from non-muted B"
         );
     }
@@ -1998,12 +2081,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let c_msgs = c.drain().await;
-        let from_a = c_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(1)),
-        );
-        let from_b = c_msgs.iter().any(
-            |m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(2)),
-        );
+        let from_a = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(1)));
+        let from_b = c_msgs
+            .iter()
+            .any(|m| matches!(m, SdpMessage::ScreenShareStarted { from, .. } if *from == pid(2)));
         assert!(from_a, "C should see A's screen share");
         assert!(from_b, "C should see B's screen share");
     }
@@ -2087,18 +2170,36 @@ mod tests {
         let msgs = b.drain().await;
         // Each mute/unmute now produces a RoomStatus. Count RoomStatus messages
         // where pid(1) is audio_muted=true and audio_muted=false respectively.
-        let mutes = msgs.iter().filter(|m| {
-            if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
-        }).count();
-        let unmutes = msgs.iter().filter(|m| {
-            if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
-            } else { false }
-        }).count();
-        assert_eq!(mutes, 10, "should receive 10 room_status with audio_muted=true");
-        assert_eq!(unmutes, 10, "should receive 10 room_status with audio_muted=false");
+        let mutes = msgs
+            .iter()
+            .filter(|m| {
+                if let SdpMessage::RoomStatus { participants, .. } = m {
+                    participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
+                } else {
+                    false
+                }
+            })
+            .count();
+        let unmutes = msgs
+            .iter()
+            .filter(|m| {
+                if let SdpMessage::RoomStatus { participants, .. } = m {
+                    participants
+                        .iter()
+                        .any(|p| p.id == pid(1) && !p.audio_muted)
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert_eq!(
+            mutes, 10,
+            "should receive 10 room_status with audio_muted=true"
+        );
+        assert_eq!(
+            unmutes, 10,
+            "should receive 10 room_status with audio_muted=false"
+        );
     }
 
     #[tokio::test]
@@ -2213,28 +2314,34 @@ mod tests {
             })
             .collect();
 
-        assert!(
-            types.contains(&"config"),
-            "missing config in {:?}",
-            types
-        );
+        assert!(types.contains(&"config"), "missing config in {:?}", types);
         assert!(
             types.contains(&"screen_start"),
             "missing screen_start in {:?}",
             types
         );
         // Mute/unmute state is now delivered via room_status snapshots
-        assert!(types.contains(&"room_status"), "missing room_status in {:?}", types);
+        assert!(
+            types.contains(&"room_status"),
+            "missing room_status in {:?}",
+            types
+        );
         // Verify the room_status messages contain the expected audio states
         let has_muted = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(1) && p.audio_muted)
-            } else { false }
+            } else {
+                false
+            }
         });
         let has_unmuted = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
-                participants.iter().any(|p| p.id == pid(1) && !p.audio_muted)
-            } else { false }
+                participants
+                    .iter()
+                    .any(|p| p.id == pid(1) && !p.audio_muted)
+            } else {
+                false
+            }
         });
         assert!(has_muted, "missing room_status with audio_muted=true");
         assert!(has_unmuted, "missing room_status with audio_muted=false");
@@ -2247,7 +2354,9 @@ mod tests {
         let has_a_gone = msgs.iter().any(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(1))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(has_a_gone, "missing room_status without A after disconnect");
 
@@ -2255,10 +2364,7 @@ mod tests {
         assert_eq!(config_count, 2, "should have 2 config changes");
 
         let screen_stop_count = types.iter().filter(|&&t| t == "screen_stop").count();
-        assert!(
-            screen_stop_count >= 1,
-            "should have at least 1 screen_stop"
-        );
+        assert!(screen_stop_count >= 1, "should have at least 1 screen_stop");
     }
 
     // ── Reconnect ghost tile tests ────────────────────────────────
@@ -2344,20 +2450,26 @@ mod tests {
         let without_old = msgs.iter().position(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 !participants.iter().any(|p| p.id == pid(2))
-            } else { false }
+            } else {
+                false
+            }
         });
         let with_new = msgs.iter().position(|m| {
             if let SdpMessage::RoomStatus { participants, .. } = m {
                 participants.iter().any(|p| p.id == pid(3))
-            } else { false }
+            } else {
+                false
+            }
         });
         assert!(
             without_old.is_some(),
-            "aaa should receive room_status without old bb, got: {:?}", msgs
+            "aaa should receive room_status without old bb, got: {:?}",
+            msgs
         );
         assert!(
             with_new.is_some(),
-            "aaa should receive room_status with new bb, got: {:?}", msgs
+            "aaa should receive room_status with new bb, got: {:?}",
+            msgs
         );
         assert!(
             without_old.unwrap() <= with_new.unwrap(),

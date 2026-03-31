@@ -12,7 +12,7 @@ const RESOLUTION_PRESETS: { label: string; width: number; height: number }[] = [
   { label: '1080p', width: 1920, height: 1080 },
 ]
 
-const FPS_OPTIONS = [15, 24, 30]
+const FPS_OPTIONS = [15, 24, 30, 60]
 
 export function VideoSettingsPopover() {
   const { videoSettings, updateVideoSettings } = useCall()

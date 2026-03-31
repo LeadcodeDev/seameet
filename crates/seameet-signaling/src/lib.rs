@@ -13,11 +13,11 @@ pub mod traits;
 pub mod transport;
 
 #[cfg(feature = "tungstenite")]
+pub mod room_server;
+#[cfg(feature = "tungstenite")]
 pub mod ws;
 #[cfg(feature = "tungstenite")]
 pub mod ws_listener;
-#[cfg(feature = "tungstenite")]
-pub mod room_server;
 
 pub use message::SdpMessage;
 pub use traits::SignalingBackend;
@@ -28,7 +28,6 @@ pub use ws::{WsSignaling, WsSignalingConfig};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::SignalingState;
     use seameet_core::ParticipantId;
     use std::collections::HashSet;
     use std::time::Duration;
@@ -52,7 +51,13 @@ mod tests {
     async fn recv_skip_control(ws: &mut WsSignaling) -> SdpMessage {
         loop {
             let msg = ws.recv().await.expect("recv");
-            if matches!(msg, SdpMessage::Ready { .. } | SdpMessage::Join { .. } | SdpMessage::PeerJoined { .. } | SdpMessage::RoomStatus { .. }) {
+            if matches!(
+                msg,
+                SdpMessage::Ready { .. }
+                    | SdpMessage::Join { .. }
+                    | SdpMessage::PeerJoined { .. }
+                    | SdpMessage::RoomStatus { .. }
+            ) {
                 continue;
             }
             return msg;
@@ -217,7 +222,11 @@ mod tests {
         let msg = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let msg = b.recv().await.expect("recv");
-                if let SdpMessage::RoomStatus { room_id, participants } = &msg {
+                if let SdpMessage::RoomStatus {
+                    room_id,
+                    participants,
+                } = &msg
+                {
                     if room_id == "room-leave" && !participants.iter().any(|p| p.id == id_a) {
                         return msg;
                     }
@@ -233,7 +242,10 @@ mod tests {
                 participants,
             } => {
                 assert_eq!(room_id, "room-leave");
-                assert!(participants.iter().any(|p| p.id == id_b), "B should still be in room_status");
+                assert!(
+                    participants.iter().any(|p| p.id == id_b),
+                    "B should still be in room_status"
+                );
             }
             other => panic!("expected RoomStatus, got {other:?}"),
         }
@@ -318,10 +330,7 @@ mod tests {
         let msg = recv_skip_control(&mut a).await;
         match msg {
             SdpMessage::Offer {
-                from,
-                room_id,
-                sdp,
-                ..
+                from, room_id, sdp, ..
             } => {
                 assert_eq!(from, id_b);
                 assert_eq!(room_id, "alpha");
@@ -425,9 +434,7 @@ mod tests {
         let msg = a.recv().await.expect("A recv ready");
         match msg {
             SdpMessage::Ready {
-                room_id,
-                initiator,
-                ..
+                room_id, initiator, ..
             } => {
                 assert_eq!(room_id, "init-room");
                 assert!(initiator, "first joiner should be initiator");
@@ -447,9 +454,7 @@ mod tests {
         let msg = b.recv().await.expect("B recv ready");
         match msg {
             SdpMessage::Ready {
-                room_id,
-                initiator,
-                ..
+                room_id, initiator, ..
             } => {
                 assert_eq!(room_id, "init-room");
                 assert!(!initiator, "second joiner should not be initiator");
@@ -575,9 +580,7 @@ mod tests {
 
         let msg = recv_skip_control(&mut b).await;
         match msg {
-            SdpMessage::ScreenShareStarted {
-                from, track_id, ..
-            } => {
+            SdpMessage::ScreenShareStarted { from, track_id, .. } => {
                 assert_eq!(from, id_a);
                 assert_eq!(track_id, 99);
             }

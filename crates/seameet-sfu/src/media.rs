@@ -515,7 +515,7 @@ pub async fn run_media(
             _ = tokio::time::sleep(wait) => {
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
 
-                if media_started && last_pli.elapsed() >= Duration::from_secs(2) {
+                if media_started && last_pli.elapsed() >= Duration::from_secs(5) {
                     last_pli = Instant::now();
                     if let Some(mid) = own_video_mid {
                         let mut api = rtc.direct_api();
