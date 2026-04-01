@@ -30,6 +30,7 @@ export interface RemotePeer {
   screenTransceiver: RTCRtpTransceiver | null
   screenStream: MediaStream | null
   videoConfig?: { width: number; height: number; fps: number }
+  e2ee: boolean
 }
 
 export interface UseWebRTCOptions {
@@ -163,6 +164,7 @@ export function useWebRTC({
       videoMuted: false,
       screenTransceiver: null,
       screenStream: null,
+      e2ee: false,
     }
 
     remotePeersRef.current.set(peerId, peer)
@@ -459,6 +461,22 @@ export function useWebRTC({
         if (info) {
           info.audioMuted = p.audio_muted
           info.videoMuted = p.video_muted
+          info.e2ee = p.e2ee ?? false
+        }
+      }
+
+      // Disable tracks for E2EE peers when local client has no E2EE.
+      // This prevents the browser from playing encrypted bytes as garbled audio/video.
+      // Note: we do NOT remove decrypt transforms for non-E2EE peers — the E2EE worker
+      // handles passthrough natively (no sender key → frame enqueued as-is).
+      if (!e2eeEnabledRef.current) {
+        for (const p of remoteParticipants) {
+          if (!(p.e2ee ?? false)) continue
+          const info = remotePeersRef.current.get(p.id)
+          if (!info) continue
+          for (const track of info.stream.getTracks()) {
+            track.enabled = false
+          }
         }
       }
 

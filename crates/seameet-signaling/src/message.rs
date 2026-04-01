@@ -12,6 +12,8 @@ pub struct ParticipantStatus {
     pub audio_muted: bool,
     pub video_muted: bool,
     pub screen_sharing: bool,
+    #[serde(default)]
+    pub e2ee: bool,
 }
 
 /// Messages exchanged over the signaling channel.
@@ -479,6 +481,7 @@ mod tests {
                     audio_muted: true,
                     video_muted: false,
                     screen_sharing: false,
+                    e2ee: false,
                 },
                 ParticipantStatus {
                     id: id_b(),
@@ -486,6 +489,7 @@ mod tests {
                     audio_muted: false,
                     video_muted: true,
                     screen_sharing: true,
+                    e2ee: true,
                 },
             ],
         };

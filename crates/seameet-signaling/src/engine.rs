@@ -22,6 +22,7 @@ pub struct MemberMediaState {
     pub audio_muted: bool,
     pub video_muted: bool,
     pub screen_sharing: bool,
+    pub e2ee: bool,
 }
 
 /// A connected participant within the signaling system.
@@ -196,6 +197,13 @@ impl Room {
         }
     }
 
+    /// Sets E2EE active state for a member.
+    pub fn set_e2ee(&mut self, id: &ParticipantId, active: bool) {
+        if let Some(member) = self.members.get_mut(id) {
+            member.media_state.e2ee = active;
+        }
+    }
+
     /// Returns a snapshot of all participants' status for the `room_status` message.
     pub fn participants_snapshot(&self) -> Vec<ParticipantStatus> {
         self.members
@@ -206,6 +214,7 @@ impl Room {
                 audio_muted: m.media_state.audio_muted,
                 video_muted: m.media_state.video_muted,
                 screen_sharing: m.media_state.screen_sharing,
+                e2ee: m.media_state.e2ee,
             })
             .collect()
     }
@@ -607,10 +616,12 @@ pub async fn dispatch(
         SdpMessage::ActiveSpeaker { .. } => {}
         // E2EE: broadcast public key and key rotation to the room (except sender)
         SdpMessage::E2eePublicKey { room_id, .. } | SdpMessage::E2eeKeyRotation { room_id, .. } => {
-            let st = state.read().await;
-            if let Some(room) = st.room(room_id) {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.set_e2ee(&pid, true);
                 room.broadcast(raw, &pid);
             }
+            broadcast_room_status(&st, room_id);
         }
         // E2EE: unicast encrypted sender key to target participant
         SdpMessage::E2eeSenderKey { to, .. } => {

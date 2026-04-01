@@ -38,7 +38,7 @@ export function VideoGrid() {
               name={speakerPeer.displayName}
               isLocal={false}
               audioEnabled={!speakerPeer.audioMuted}
-              videoEnabled={!speakerPeer.videoMuted}
+              videoEnabled={!e2eeEnabled && speakerPeer.e2ee ? false : !speakerPeer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(speakerPeer.id)?.ready}
               isActiveSpeaker
             />
@@ -84,7 +84,7 @@ export function VideoGrid() {
                   name={peer.displayName}
                   isLocal={false}
                   audioEnabled={!peer.audioMuted}
-                  videoEnabled={!peer.videoMuted}
+                  videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
                   e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
                 />
               </div>
@@ -147,7 +147,7 @@ export function VideoGrid() {
             name={peer.displayName}
             isLocal={false}
             audioEnabled={!peer.audioMuted}
-            videoEnabled={!peer.videoMuted}
+            videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
             e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
           />
           {peer.screenStream && (

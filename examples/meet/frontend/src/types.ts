@@ -24,6 +24,7 @@ export type SignalingMessage =
         audio_muted: boolean;
         video_muted: boolean;
         screen_sharing: boolean;
+        e2ee?: boolean;
       }>;
     }
   | { type: 'e2ee_public_key'; from: string; room_id: string; public_key: string }
