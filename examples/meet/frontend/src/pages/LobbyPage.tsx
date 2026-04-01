@@ -3,7 +3,8 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Video, VideoOff, Mic, MicOff } from 'lucide-react'
+import { Video, VideoOff, Mic, MicOff, ShieldCheck } from 'lucide-react'
+import { isE2EESupported } from '@/lib/e2ee-support'
 
 const ADJECTIVES = [
   'blue', 'red', 'green', 'happy', 'calm', 'bold', 'warm', 'cool',
@@ -28,6 +29,8 @@ export default function LobbyPage() {
   const [roomCode, setRoomCode] = useState(code ?? '')
   const [cameraOn, setCameraOn] = useState(false)
   const [micOn, setMicOn] = useState(false)
+  const [e2eeOn, setE2eeOn] = useState(false)
+  const e2eeSupported = isE2EESupported()
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
 
@@ -85,7 +88,7 @@ export default function LobbyPage() {
       streamRef.current.getTracks().forEach((t) => t.stop())
       streamRef.current = null
     }
-    navigate(`/room/${finalCode}`, { state: { cameraOn, micOn } })
+    navigate(`/room/${finalCode}`, { state: { cameraOn, micOn, e2eeOn } })
   }
 
   return (
@@ -139,6 +142,18 @@ export default function LobbyPage() {
               >
                 {cameraOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
               </Button>
+              {e2eeSupported && (
+                <Button
+                  data-testid="lobby-toggle-e2ee"
+                  type="button"
+                  variant={e2eeOn ? 'default' : 'secondary'}
+                  size="icon"
+                  onClick={() => setE2eeOn((v) => !v)}
+                  title="End-to-end encryption"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                </Button>
+              )}
             </div>
 
             <div className="space-y-2">

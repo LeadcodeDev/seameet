@@ -11,7 +11,7 @@ export default function RoomPage() {
 
   const participantId = useMemo(() => crypto.randomUUID(), [])
 
-  const lobbyState = location.state as { cameraOn?: boolean; micOn?: boolean } | null
+  const lobbyState = location.state as { cameraOn?: boolean; micOn?: boolean; e2eeOn?: boolean } | null
 
   if (!displayName || !code) {
     return <Navigate to="/" replace />
@@ -24,6 +24,7 @@ export default function RoomPage() {
       roomId={code}
       initialAudioEnabled={lobbyState?.micOn}
       initialVideoEnabled={lobbyState?.cameraOn}
+      initialE2EEEnabled={lobbyState?.e2eeOn}
     >
       <div className="h-dvh flex flex-col">
         {/* Header */}

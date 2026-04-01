@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useSignaling } from '@/hooks/useSignaling'
 import { useMediaDevices, type VideoSettings } from '@/hooks/useMediaDevices'
 import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
+import { useE2EE, type E2EEPeerState } from '@/hooks/useE2EE'
 import type { SignalingMessage } from '@/types'
 
 interface CallContextValue {
@@ -23,6 +24,8 @@ interface CallContextValue {
   connectionState: RTCPeerConnectionState
   signalingState: 'connecting' | 'open' | 'closed'
   leave: () => void
+  e2eeEnabled: boolean
+  e2eePeerStates: Map<string, E2EEPeerState>
 }
 
 const CallContext = createContext<CallContextValue | null>(null)
@@ -33,10 +36,11 @@ interface CallProviderProps {
   roomId: string
   initialAudioEnabled?: boolean
   initialVideoEnabled?: boolean
+  initialE2EEEnabled?: boolean
   children: ReactNode
 }
 
-export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, children }: CallProviderProps) {
+export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
 
@@ -45,9 +49,26 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
 
   const signaling = useSignaling({
     onMessage: (msg) => {
+      // Route E2EE signaling messages to the E2EE hook
+      if (msg.type === 'e2ee_public_key' || msg.type === 'e2ee_sender_key' || msg.type === 'e2ee_key_rotation') {
+        e2eeHandlerRef.current(msg)
+        return
+      }
       webrtcHandlerRef.current(msg)
     },
   })
+
+  // E2EE hook
+  const e2ee = useE2EE({
+    enabled: initialE2EEEnabled ?? false,
+    participantId,
+    roomId,
+    signaling,
+  })
+
+  // Ref for e2ee handler to avoid stale closures
+  const e2eeHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
+  e2eeHandlerRef.current = e2ee.handleMessage
 
   // Ref to call webrtc.stopScreenShare when browser native stop fires
   const webrtcScreenStopRef = useRef<() => Promise<void>>(async () => {})
@@ -66,6 +87,8 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     localStream: media.localStream,
     signaling,
     videoSettings: media.videoSettings,
+    e2eeWorker: e2ee.worker,
+    e2eeEnabled: e2ee.enabled,
   })
 
   // Wire WebRTC handler — updated every render (safe, no side effects)
@@ -154,6 +177,28 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     await webrtc.stopScreenShare()
   }, [media, webrtc])
 
+  // Track E2EE peer lifecycle via remotePeers changes
+  const prevRemotePeerIdsRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!e2ee.enabled) return
+    const currentIds = new Set(webrtc.remotePeers.keys())
+    const prevIds = prevRemotePeerIdsRef.current
+
+    // New peers
+    for (const id of currentIds) {
+      if (!prevIds.has(id)) {
+        e2ee.onPeerJoined(id)
+      }
+    }
+    // Left peers
+    for (const id of prevIds) {
+      if (!currentIds.has(id)) {
+        e2ee.onPeerLeft(id)
+      }
+    }
+    prevRemotePeerIdsRef.current = currentIds
+  }, [webrtc.remotePeers, e2ee])
+
   const leave = useCallback(() => {
     signaling.close()
     navigate('/')
@@ -177,6 +222,8 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     connectionState: webrtc.connectionState,
     signalingState: signaling.state,
     leave,
+    e2eeEnabled: e2ee.enabled,
+    e2eePeerStates: e2ee.peerStates,
   }
 
   return (

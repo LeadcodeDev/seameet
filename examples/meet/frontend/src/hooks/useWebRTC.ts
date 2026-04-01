@@ -38,6 +38,8 @@ export interface UseWebRTCOptions {
   localStream: MediaStream | null
   signaling: UseSignalingReturn
   videoSettings: VideoSettings
+  e2eeWorker?: Worker | null
+  e2eeEnabled?: boolean
 }
 
 export interface UseWebRTCReturn {
@@ -56,6 +58,8 @@ export function useWebRTC({
   localStream,
   signaling,
   videoSettings,
+  e2eeWorker,
+  e2eeEnabled,
 }: UseWebRTCOptions): UseWebRTCReturn {
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const remotePeersRef = useRef<Map<string, RemotePeer>>(new Map())
@@ -85,12 +89,16 @@ export function useWebRTC({
   const signalingRef = useRef(signaling)
 
   const videoSettingsRef = useRef(videoSettings)
+  const e2eeWorkerRef = useRef(e2eeWorker)
+  const e2eeEnabledRef = useRef(e2eeEnabled)
 
   participantIdRef.current = participantId
   roomIdRef.current = roomId
   localStreamRef.current = localStream
   signalingRef.current = signaling
   videoSettingsRef.current = videoSettings
+  e2eeWorkerRef.current = e2eeWorker ?? null
+  e2eeEnabledRef.current = e2eeEnabled ?? false
 
   const updateRemotePeersState = useCallback(() => {
     setRemotePeers(new Map(remotePeersRef.current))
@@ -158,6 +166,19 @@ export function useWebRTC({
     }
 
     remotePeersRef.current.set(peerId, peer)
+
+    // Apply E2EE Encoded Transforms to receivers
+    if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
+      const worker = e2eeWorkerRef.current
+      slot.audioTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, {
+        operation: 'decrypt', senderId: peerId,
+      })
+      slot.videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, {
+        operation: 'decrypt', senderId: peerId,
+      })
+      console.log(`[WebRTC] E2EE decrypt transforms applied for peer ${peerId.slice(0, 8)}`)
+    }
+
     updateRemotePeersState()
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [removeRemotePeer, updateRemotePeersState])
@@ -331,6 +352,23 @@ export function useWebRTC({
       addRemotePeer(peerId, displayNames?.[peerId])
     }
 
+    // Apply E2EE Encoded Transforms to local senders
+    if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
+      const worker = e2eeWorkerRef.current
+      const pid = participantIdRef.current
+      if (localAudioTransceiverRef.current) {
+        localAudioTransceiverRef.current.sender.transform = new RTCRtpScriptTransform(worker, {
+          operation: 'encrypt', participantId: pid,
+        })
+      }
+      if (localVideoTransceiverRef.current) {
+        localVideoTransceiverRef.current.sender.transform = new RTCRtpScriptTransform(worker, {
+          operation: 'encrypt', participantId: pid,
+        })
+      }
+      console.log('[WebRTC] E2EE transforms applied to local senders')
+    }
+
     // Mark as renegotiating BEFORE sending. This prevents the
     // replaceLocalTracks effect from firing a second concurrent offer
     // when localStream arrives while we're still waiting for the initial answer.
@@ -482,6 +520,13 @@ export function useWebRTC({
       const videoTrack = screenTransceiver.receiver.track
       if (videoTrack) screenStream.addTrack(videoTrack)
 
+      // Apply E2EE to remote screen share receiver
+      if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
+        screenTransceiver.receiver.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
+          operation: 'decrypt', senderId: peerId,
+        })
+      }
+
       info.screenTransceiver = screenTransceiver
       info.screenStream = screenStream
       updateRemotePeersState()
@@ -553,6 +598,14 @@ export function useWebRTC({
     // Use addTransceiver (NOT addTrack) to guarantee a NEW transceiver.
     const transceiver = pc.addTransceiver(track, { direction: 'sendrecv' })
     screenTransceiverRef.current = transceiver
+
+    // Apply E2EE to screen share sender
+    if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
+      transceiver.sender.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
+        operation: 'encrypt', participantId: participantIdRef.current,
+      })
+    }
+
     setLocalScreenStream(screenStream)
     // Send signal BEFORE renegotiation so the SFU sets screen_share_active
     // before processing the renegotiation that adds the screen mid.

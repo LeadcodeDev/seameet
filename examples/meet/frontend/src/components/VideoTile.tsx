@@ -1,5 +1,5 @@
 import { useRef, useEffect } from 'react'
-import { MicOff } from 'lucide-react'
+import { MicOff, ShieldCheck } from 'lucide-react'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 
 interface VideoTileProps {
@@ -9,6 +9,7 @@ interface VideoTileProps {
   audioEnabled: boolean
   videoEnabled: boolean
   isScreenShare?: boolean
+  e2eeActive?: boolean
 }
 
 function getInitials(name: string): string {
@@ -21,7 +22,7 @@ function getInitials(name: string): string {
     .toUpperCase()
 }
 
-export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare }: VideoTileProps) {
+export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -80,6 +81,13 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
       {!audioEnabled && !isScreenShare && (
         <div className="absolute top-2 right-2 bg-black/60 rounded-full p-1">
           <MicOff className="w-4 h-4 text-red-400" />
+        </div>
+      )}
+
+      {/* E2EE indicator */}
+      {e2eeActive && (
+        <div className="absolute top-2 left-2 bg-black/60 rounded-full p-1">
+          <ShieldCheck className="w-3 h-3 text-green-400" />
         </div>
       )}
 

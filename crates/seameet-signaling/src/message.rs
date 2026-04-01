@@ -178,6 +178,37 @@ pub enum SdpMessage {
         /// Status of every participant in the room.
         participants: Vec<ParticipantStatus>,
     },
+    /// E2EE: broadcasts a participant's ECDH public key to the room.
+    E2eePublicKey {
+        /// The participant sharing their public key.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+        /// Base64-encoded ECDH P-256 public key.
+        public_key: String,
+    },
+    /// E2EE: sends an encrypted sender key to a specific participant.
+    E2eeSenderKey {
+        /// The participant sending their sender key.
+        from: ParticipantId,
+        /// The target participant.
+        to: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+        /// Base64-encoded encrypted sender key.
+        encrypted_key: String,
+        /// Key generation identifier.
+        key_id: u32,
+    },
+    /// E2EE: notifies the room of a key rotation.
+    E2eeKeyRotation {
+        /// The participant rotating their key.
+        from: ParticipantId,
+        /// The room this applies to.
+        room_id: String,
+        /// New key generation identifier.
+        key_id: u32,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -207,7 +238,10 @@ impl SdpMessage {
             | Self::UnmuteVideo { room_id, .. }
             | Self::VideoConfigChanged { room_id, .. }
             | Self::RequestRenegotiation { room_id, .. }
-            | Self::RoomStatus { room_id, .. } => Some(room_id),
+            | Self::RoomStatus { room_id, .. }
+            | Self::E2eePublicKey { room_id, .. }
+            | Self::E2eeSenderKey { room_id, .. }
+            | Self::E2eeKeyRotation { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -446,6 +480,53 @@ mod tests {
         assert!(json.contains("\"width\":1920"));
         assert!(json.contains("\"height\":1080"));
         assert!(json.contains("\"fps\":30"));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_e2ee_public_key_serde() {
+        let msg = SdpMessage::E2eePublicKey {
+            from: id_a(),
+            room_id: "r1".into(),
+            public_key: "base64pubkey==".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"e2ee_public_key\""));
+        assert!(json.contains("\"public_key\":\"base64pubkey==\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_e2ee_sender_key_serde() {
+        let msg = SdpMessage::E2eeSenderKey {
+            from: id_a(),
+            to: id_b(),
+            room_id: "r1".into(),
+            encrypted_key: "encrypteddata==".into(),
+            key_id: 42,
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"e2ee_sender_key\""));
+        assert!(json.contains("\"key_id\":42"));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_e2ee_key_rotation_serde() {
+        let msg = SdpMessage::E2eeKeyRotation {
+            from: id_a(),
+            room_id: "r1".into(),
+            key_id: 7,
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"e2ee_key_rotation\""));
+        assert!(json.contains("\"key_id\":7"));
         let back: SdpMessage = serde_json::from_str(&json).expect("de");
         assert_eq!(back, msg);
         assert_eq!(msg.room_id(), Some("r1"));

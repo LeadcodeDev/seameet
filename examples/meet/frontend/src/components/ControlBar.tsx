@@ -13,6 +13,8 @@ import {
   MicOff,
   Monitor,
   Phone,
+  ShieldAlert,
+  ShieldCheck,
   Video,
   VideoOff,
 } from "lucide-react";
@@ -29,7 +31,14 @@ export function ControlBar() {
     localScreenStream,
     leave,
     roomId,
+    e2eeEnabled,
+    e2eePeerStates,
+    remotePeers,
   } = useCall();
+
+  const allPeersE2EE = e2eeEnabled && remotePeers.size > 0 &&
+    Array.from(remotePeers.keys()).every(id => e2eePeerStates.get(id)?.ready);
+  const someNotReady = e2eeEnabled && remotePeers.size > 0 && !allPeersE2EE;
 
   const [copied, setCopied] = useState(false);
 
@@ -113,6 +122,33 @@ export function ControlBar() {
           {localScreenStream ? "Stop sharing" : "Share screen"}
         </TooltipContent>
       </Tooltip>
+
+      {/* E2EE indicator */}
+      {e2eeEnabled && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div
+              data-testid="e2ee-indicator"
+              className={`flex items-center justify-center h-12 w-12 rounded-full ${
+                someNotReady
+                  ? "bg-orange-500/20 text-orange-400"
+                  : "bg-green-500/20 text-green-400"
+              }`}
+            >
+              {someNotReady ? (
+                <ShieldAlert className="h-5 w-5" />
+              ) : (
+                <ShieldCheck className="h-5 w-5" />
+              )}
+            </div>
+          </TooltipTrigger>
+          <TooltipContent>
+            {someNotReady
+              ? "E2EE active — some participants not yet secured"
+              : "End-to-end encrypted"}
+          </TooltipContent>
+        </Tooltip>
+      )}
 
       {/* Video settings */}
       <VideoSettingsPopover />
