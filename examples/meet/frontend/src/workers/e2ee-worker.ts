@@ -1,16 +1,22 @@
 /**
  * E2EE Web Worker — AES-128-GCM encryption/decryption for encoded media frames.
  *
- * Frame format:
- *   [unencrypted codec header (N bytes)] [IV 12 bytes] [encrypted payload] [GCM tag 16 bytes] [trailer 1 byte = N]
+ * Frame format (v2 — SFrame-inspired):
+ *   [codec header (N bytes)] [KID 1 byte] [CTR 4 bytes big-endian] [ciphertext + GCM tag 16 bytes] [trailer 1 byte = N]
  *
- * Audio (Opus) uses implicit IV derived from SSRC + sequence number → no explicit IV in frame.
+ * Key improvements over v1:
+ *   - Deterministic nonce: salt XOR counter (no explicit IV in frame — saves 12 bytes/video frame)
+ *   - HKDF key derivation: (key, salt) derived from base_key via HKDF-SHA256
+ *   - KID in header: receiver selects key directly without brute-force
+ *   - Replay protection: per-sender sliding window rejects duplicate/old frames
+ *
+ * AAD (additional authenticated data) = codec header + e2ee header (KID + CTR).
  */
 
 // Type declarations for RTCEncodedFrame APIs available inside a Worker scope
 interface RTCEncodedFrame {
-  readonly data: ArrayBuffer
   readonly timestamp: number
+  data: ArrayBuffer
   getMetadata(): RTCEncodedFrameMetadata
 }
 
@@ -40,13 +46,95 @@ interface TransformOptions {
 
 interface KeyEntry {
   key: CryptoKey
+  salt: Uint8Array // 12 bytes, derived via HKDF
   keyId: number
 }
 
 const senderKeys = new Map<string, KeyEntry[]>()
 const GCM_TAG_LENGTH = 128 // bits
-const IV_LENGTH = 12 // bytes
-const TRAILER_LENGTH = 1 // byte encoding the unencrypted header size
+const HEADER_KID_LENGTH = 1
+const HEADER_CTR_LENGTH = 4
+const E2EE_HEADER_LENGTH = HEADER_KID_LENGTH + HEADER_CTR_LENGTH // 5 bytes
+const TRAILER_LENGTH = 1
+
+// Per-participant frame counters (for encryption)
+const frameCounters = new Map<string, number>()
+
+// ── HKDF Key Derivation ───────────────────────────────────────────────
+
+async function deriveKeyAndSalt(rawKey: ArrayBuffer, keyId: number): Promise<{ key: CryptoKey; salt: Uint8Array }> {
+  const keyMaterial = await crypto.subtle.importKey('raw', rawKey, 'HKDF', false, ['deriveBits', 'deriveKey'])
+  const hkdfSalt = new Uint8Array(16) // fixed empty salt (ikm is already random)
+  const encoder = new TextEncoder()
+
+  const key = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: hkdfSalt, info: encoder.encode(`seameet-e2ee-key-${keyId}`) },
+    keyMaterial,
+    { name: 'AES-GCM', length: 128 },
+    false,
+    ['encrypt', 'decrypt'],
+  )
+
+  const saltBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: hkdfSalt, info: encoder.encode(`seameet-e2ee-salt-${keyId}`) },
+    keyMaterial,
+    96, // 12 bytes
+  )
+
+  return { key, salt: new Uint8Array(saltBits) }
+}
+
+// ── Deterministic Nonce ───────────────────────────────────────────────
+
+function computeNonce(salt: Uint8Array, ctr: number): Uint8Array {
+  const nonce = new Uint8Array(12)
+  nonce.set(salt)
+  // XOR counter into the last 4 bytes of the salt
+  const view = new DataView(nonce.buffer)
+  view.setUint32(8, view.getUint32(8) ^ ctr)
+  return nonce
+}
+
+// ── Replay Protection ─────────────────────────────────────────────────
+
+interface ReplayWindow {
+  highestCtr: number
+  bitmap: bigint // sliding window of 64 frames behind highestCtr
+}
+
+const replayWindows = new Map<string, ReplayWindow>()
+
+const REPLAY_WINDOW_SIZE = 64
+
+function checkReplay(senderId: string, keyId: number, ctr: number): boolean {
+  const windowKey = `${senderId}:${keyId}`
+  const window = replayWindows.get(windowKey)
+
+  if (!window) {
+    replayWindows.set(windowKey, { highestCtr: ctr, bitmap: 1n })
+    return true
+  }
+
+  if (ctr > window.highestCtr) {
+    const shift = ctr - window.highestCtr
+    if (shift < REPLAY_WINDOW_SIZE) {
+      window.bitmap = (window.bitmap << BigInt(shift)) | 1n
+    } else {
+      window.bitmap = 1n
+    }
+    window.highestCtr = ctr
+    return true
+  }
+
+  const diff = window.highestCtr - ctr
+  if (diff >= REPLAY_WINDOW_SIZE) return false
+
+  const bit = 1n << BigInt(diff)
+  if (window.bitmap & bit) return false
+
+  window.bitmap |= bit
+  return true
+}
 
 // ── Codec Header Detection ─────────────────────────────────────────────
 
@@ -71,9 +159,6 @@ function getVP9UnencryptedBytes(data: ArrayBuffer): number {
 /** Returns the number of unencrypted header bytes to preserve for SFU keyframe detection. */
 function getUnencryptedBytes(metadata: RTCEncodedFrameMetadata, data: ArrayBuffer, isAudio: boolean): number {
   if (isAudio) return 0
-
-  // Detect codec from payloadType — VP8 is typically 96-99, VP9 100-103
-  // In practice we try VP8 first since it's the most common fallback
   const pt = metadata.payloadType ?? 0
   if (pt >= 100 && pt < 110) return getVP9UnencryptedBytes(data)
   return getVP8UnencryptedBytes(data)
@@ -89,59 +174,58 @@ async function encryptFrame(
 ) {
   const entries = senderKeys.get(participantId)
   if (!entries || entries.length === 0) {
-    // No key yet — pass through unencrypted
     controller.enqueue(frame)
     return
   }
 
-  const { key, keyId } = entries[entries.length - 1]
+  const { key, salt, keyId } = entries[entries.length - 1]
   const data = frame.data
   const metadata = frame.getMetadata()
   const unencryptedBytes = getUnencryptedBytes(metadata, data, isAudio)
 
-  const header = new Uint8Array(data, 0, unencryptedBytes)
+  const codecHeader = new Uint8Array(data, 0, unencryptedBytes)
   const payload = new Uint8Array(data, unencryptedBytes)
 
-  let iv: Uint8Array
-  let ivInFrame: boolean
+  // Increment frame counter (per participant + keyId)
+  const ctrKey = `${participantId}:${keyId}`
+  const ctr = (frameCounters.get(ctrKey) ?? 0) + 1
+  frameCounters.set(ctrKey, ctr)
 
-  if (isAudio && metadata.synchronizationSource !== undefined && metadata.sequenceNumber !== undefined) {
-    // Implicit IV for audio: SSRC (4 bytes) + seq_no (4 bytes) + keyId (4 bytes)
-    iv = new Uint8Array(IV_LENGTH)
-    const dvIv = new DataView(iv.buffer)
-    dvIv.setUint32(0, metadata.synchronizationSource)
-    dvIv.setUint32(4, metadata.sequenceNumber)
-    dvIv.setUint32(8, keyId)
-    ivInFrame = false
-  } else {
-    // Explicit random IV for video
-    iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH))
-    ivInFrame = true
-  }
+  // Deterministic nonce
+  const iv = computeNonce(salt, ctr)
+
+  // Build E2EE header: [KID 1 byte] [CTR 4 bytes big-endian]
+  const e2eeHeader = new Uint8Array(E2EE_HEADER_LENGTH)
+  e2eeHeader[0] = keyId & 0xff
+  new DataView(e2eeHeader.buffer).setUint32(HEADER_KID_LENGTH, ctr)
+
+  // AAD = codec header + e2ee header
+  const aad = new Uint8Array(unencryptedBytes + E2EE_HEADER_LENGTH)
+  aad.set(codecHeader, 0)
+  aad.set(e2eeHeader, unencryptedBytes)
 
   try {
     const ciphertext = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv, additionalData: header, tagLength: GCM_TAG_LENGTH },
+      { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
       key,
       payload,
     )
 
     const ciphertextBytes = new Uint8Array(ciphertext)
-    const outputLength = unencryptedBytes + (ivInFrame ? IV_LENGTH : 0) + ciphertextBytes.byteLength + TRAILER_LENGTH
+    const outputLength = unencryptedBytes + E2EE_HEADER_LENGTH + ciphertextBytes.byteLength + TRAILER_LENGTH
     const output = new Uint8Array(outputLength)
 
     let offset = 0
-    output.set(header, offset); offset += unencryptedBytes
-    if (ivInFrame) { output.set(iv, offset); offset += IV_LENGTH }
+    output.set(codecHeader, offset); offset += unencryptedBytes
+    output.set(e2eeHeader, offset); offset += E2EE_HEADER_LENGTH
     output.set(ciphertextBytes, offset); offset += ciphertextBytes.byteLength
-    // Trailer: high bit = ivInFrame flag, lower 7 bits = unencryptedBytes
-    output[offset] = (ivInFrame ? 0x80 : 0x00) | (unencryptedBytes & 0x7f)
+    // Trailer: lower 7 bits = unencrypted codec header size
+    output[offset] = unencryptedBytes & 0x7f
 
     frame.data = output.buffer
     controller.enqueue(frame)
   } catch (e) {
     console.error('[E2EE Worker] encrypt error:', e)
-    // Pass through unencrypted on failure
     controller.enqueue(frame)
   }
 }
@@ -156,65 +240,79 @@ async function decryptFrame(
 ) {
   const entries = senderKeys.get(senderId)
   if (!entries || entries.length === 0) {
-    // No key — pass through (unencrypted stream)
     controller.enqueue(frame)
     return
   }
 
   const data = new Uint8Array(frame.data)
-  if (data.byteLength < TRAILER_LENGTH + 16) {
-    // Too small to be encrypted — pass through
+  const minSize = TRAILER_LENGTH + E2EE_HEADER_LENGTH + 16 // header + at least GCM tag
+  if (data.byteLength < minSize) {
     controller.enqueue(frame)
     return
   }
 
   const trailer = data[data.byteLength - 1]
-  const ivInFrame = (trailer & 0x80) !== 0
   const unencryptedBytes = trailer & 0x7f
-  const metadata = frame.getMetadata()
 
-  const header = data.slice(0, unencryptedBytes)
+  const codecHeader = data.slice(0, unencryptedBytes)
 
-  let iv: Uint8Array
-  let ciphertextStart: number
+  // Read KID and CTR from e2ee header
+  const hdrStart = unencryptedBytes
+  const kid = data[hdrStart]
+  const ctr = new DataView(data.buffer, data.byteOffset + hdrStart + HEADER_KID_LENGTH, HEADER_CTR_LENGTH).getUint32(0)
+  const e2eeHeader = data.slice(hdrStart, hdrStart + E2EE_HEADER_LENGTH)
 
-  if (ivInFrame) {
-    iv = data.slice(unencryptedBytes, unencryptedBytes + IV_LENGTH)
-    ciphertextStart = unencryptedBytes + IV_LENGTH
-  } else {
-    // Implicit IV for audio
-    iv = new Uint8Array(IV_LENGTH)
-    const dvIv = new DataView(iv.buffer)
-    dvIv.setUint32(0, metadata.synchronizationSource ?? 0)
-    dvIv.setUint32(4, metadata.sequenceNumber ?? 0)
-    // Try all key IDs for implicit IV
-    ciphertextStart = unencryptedBytes
-  }
+  const ciphertext = data.slice(hdrStart + E2EE_HEADER_LENGTH, data.byteLength - TRAILER_LENGTH)
 
-  const ciphertext = data.slice(ciphertextStart, data.byteLength - TRAILER_LENGTH)
+  // AAD = codec header + e2ee header
+  const aad = new Uint8Array(unencryptedBytes + E2EE_HEADER_LENGTH)
+  aad.set(codecHeader, 0)
+  aad.set(e2eeHeader, unencryptedBytes)
 
-  // Try all keys (most recent first) to handle key rotation gracefully
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const { key, keyId } = entries[i]
-
-    let actualIv = iv
-    if (!ivInFrame) {
-      actualIv = new Uint8Array(IV_LENGTH)
-      const dvIv = new DataView(actualIv.buffer)
-      dvIv.setUint32(0, metadata.synchronizationSource ?? 0)
-      dvIv.setUint32(4, metadata.sequenceNumber ?? 0)
-      dvIv.setUint32(8, keyId)
+  // Find matching key by KID (direct lookup, no brute-force)
+  const matchingEntry = entries.find(e => (e.keyId & 0xff) === kid)
+  if (matchingEntry) {
+    if (!checkReplay(senderId, kid, ctr)) {
+      console.warn(`[E2EE Worker] replay detected for sender ${senderId.slice(0, 8)}, ctr=${ctr}`)
+      return
     }
 
+    const iv = computeNonce(matchingEntry.salt, ctr)
     try {
       const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: actualIv, additionalData: header, tagLength: GCM_TAG_LENGTH },
-        key,
+        { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+        matchingEntry.key,
         ciphertext,
       )
 
       const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
-      output.set(header, 0)
+      output.set(codecHeader, 0)
+      output.set(new Uint8Array(plaintext), unencryptedBytes)
+      frame.data = output.buffer
+      controller.enqueue(frame)
+      return
+    } catch {
+      // KID matched but decryption failed — fall through to try other keys
+    }
+  }
+
+  // Fallback: try all keys (handles edge cases during key rotation)
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]
+    if (entry === matchingEntry) continue
+
+    const iv = computeNonce(entry.salt, ctr)
+    try {
+      const plaintext = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+        entry.key,
+        ciphertext,
+      )
+
+      checkReplay(senderId, entry.keyId & 0xff, ctr)
+
+      const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
+      output.set(codecHeader, 0)
       output.set(new Uint8Array(plaintext), unencryptedBytes)
       frame.data = output.buffer
       controller.enqueue(frame)
@@ -224,7 +322,6 @@ async function decryptFrame(
     }
   }
 
-  // All keys failed — drop frame silently (key not yet received or rotated)
   console.warn(`[E2EE Worker] decrypt failed for sender ${senderId.slice(0, 8)} — dropping frame`)
 }
 
@@ -233,18 +330,13 @@ async function decryptFrame(
 function setupTransform(options: TransformOptions, readable: ReadableStream<RTCEncodedFrame>, writable: WritableStream<RTCEncodedFrame>) {
   const { operation, participantId, senderId } = options
 
-  // Detect audio by checking track kind from initial frames
   let detectedAudio: boolean | null = null
 
   const transform = new TransformStream<RTCEncodedFrame, RTCEncodedFrame>({
     transform(frame, controller) {
-      // Heuristic: audio frames are typically very small (<200 bytes)
-      // and video frames are larger. We check payloadType from metadata.
       if (detectedAudio === null) {
         const meta = frame.getMetadata()
         const pt = meta.payloadType ?? 0
-        // Common audio payload types: 111 (opus)
-        // Common video payload types: 96-110 (VP8/VP9/H264)
         detectedAudio = pt === 111 || pt === 109 || pt === 110
       }
 
@@ -285,21 +377,22 @@ self.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
   const msg = event.data
 
   if (msg.type === 'setKey') {
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw',
-      msg.rawKey,
-      { name: 'AES-GCM', length: 128 },
-      false,
-      ['encrypt', 'decrypt'],
-    )
+    const { key, salt } = await deriveKeyAndSalt(msg.rawKey, msg.keyId)
     const entries = senderKeys.get(msg.participantId) ?? []
-    entries.push({ key: cryptoKey, keyId: msg.keyId })
+    entries.push({ key, salt, keyId: msg.keyId })
     senderKeys.set(msg.participantId, entries)
-    console.log(`[E2EE Worker] setKey for ${msg.participantId.slice(0, 8)}, keyId=${msg.keyId}`)
+    console.log(`[E2EE Worker] setKey for ${msg.participantId.slice(0, 8)}, keyId=${msg.keyId} (HKDF-derived)`)
   }
 
   if (msg.type === 'removeKeys') {
     senderKeys.delete(msg.participantId)
+    // Clean up frame counters and replay windows for this participant
+    for (const key of frameCounters.keys()) {
+      if (key.startsWith(msg.participantId + ':')) frameCounters.delete(key)
+    }
+    for (const key of replayWindows.keys()) {
+      if (key.startsWith(msg.participantId + ':')) replayWindows.delete(key)
+    }
     console.log(`[E2EE Worker] removeKeys for ${msg.participantId.slice(0, 8)}`)
   }
 
