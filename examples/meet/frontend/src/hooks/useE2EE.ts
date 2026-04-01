@@ -31,6 +31,10 @@ export interface UseE2EEReturn {
   onPeerJoined: (peerId: string) => void
   /** Current local key ID */
   localKeyId: number
+  /** Encrypt a chat message with our sender key. Returns null if E2EE not ready. */
+  encryptChat: (content: string) => Promise<{ ciphertext: string; keyId: number } | null>
+  /** Decrypt a chat message from a peer. Returns null if key unavailable. */
+  decryptChat: (from: string, ciphertext: string, keyId: number) => Promise<string | null>
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -112,6 +116,8 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   // Peer E2EE states
   const peerStatesRef = useRef<Map<string, E2EEPeerState>>(new Map())
   const [peerStates, setPeerStates] = useState<Map<string, E2EEPeerState>>(new Map())
+  // Per-peer decrypted sender keys for chat encryption
+  const peerSenderKeysRef = useRef<Map<string, { raw: ArrayBuffer; keyId: number }>>(new Map())
 
   const signalingRef = useRef(signaling)
   signalingRef.current = signaling
@@ -298,6 +304,9 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       try {
         const senderKeyRaw = await decryptSenderKey(sharedSecret, msg.encrypted_key)
 
+        // Store peer sender key for chat decryption
+        peerSenderKeysRef.current.set(senderId, { raw: senderKeyRaw, keyId: msg.key_id })
+
         // Set in worker
         workerRef.current?.postMessage({
           type: 'setKey',
@@ -346,6 +355,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     peerStatesRef.current.delete(peerId)
     peerPublicKeysRef.current.delete(peerId)
     sharedSecretsRef.current.delete(peerId)
+    peerSenderKeysRef.current.delete(peerId)
     updatePeerStates()
 
     // Remove departed peer's keys from worker
@@ -355,6 +365,51 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     await rotateSenderKey()
   }, [enabled, rotateSenderKey, updatePeerStates])
 
+  // ── Chat encryption / decryption ──────────────────────────────────
+
+  const encryptChat = useCallback(async (content: string): Promise<{ ciphertext: string; keyId: number } | null> => {
+    if (!enabled || !senderKeyRawRef.current) return null
+    try {
+      const key = await crypto.subtle.importKey('raw', senderKeyRawRef.current, { name: 'AES-GCM' }, false, ['encrypt'])
+      const iv = crypto.getRandomValues(new Uint8Array(12))
+      const encoded = new TextEncoder().encode(content)
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, encoded)
+      const packed = new Uint8Array(12 + ciphertext.byteLength)
+      packed.set(iv, 0)
+      packed.set(new Uint8Array(ciphertext), 12)
+      return { ciphertext: btoa(String.fromCharCode(...packed)), keyId: localKeyIdRef.current }
+    } catch (e) {
+      console.error('[E2EE] encryptChat failed:', e)
+      return null
+    }
+  }, [enabled])
+
+  const decryptChat = useCallback(async (from: string, ciphertext: string, keyId: number): Promise<string | null> => {
+    if (!enabled) return null
+    // Use own sender key if the message is from ourselves (echo)
+    let rawKey: ArrayBuffer | undefined
+    if (from === participantId) {
+      rawKey = senderKeyRawRef.current ?? undefined
+    } else {
+      const peerKey = peerSenderKeysRef.current.get(from)
+      if (peerKey) rawKey = peerKey.raw
+    }
+    if (!rawKey) return null
+    try {
+      const key = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt'])
+      const binary = atob(ciphertext)
+      const packed = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) packed[i] = binary.charCodeAt(i)
+      const iv = packed.slice(0, 12)
+      const data = packed.slice(12)
+      const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, key, data)
+      return new TextDecoder().decode(decrypted)
+    } catch (e) {
+      console.warn(`[E2EE] decryptChat failed for ${from.slice(0, 8)}, keyId=${keyId}:`, e)
+      return null
+    }
+  }, [enabled, participantId])
+
   return {
     worker: workerRef.current,
     peerStates,
@@ -363,5 +418,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     onPeerLeft,
     onPeerJoined,
     localKeyId,
+    encryptChat,
+    decryptChat,
   }
 }

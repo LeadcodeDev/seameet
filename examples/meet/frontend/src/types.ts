@@ -29,5 +29,7 @@ export type SignalingMessage =
   | { type: 'e2ee_public_key'; from: string; room_id: string; public_key: string }
   | { type: 'e2ee_sender_key'; from: string; to: string; room_id: string; encrypted_key: string; key_id: number }
   | { type: 'e2ee_key_rotation'; from: string; room_id: string; key_id: number }
+  | { type: 'chat_message'; from: string; room_id: string; display_name?: string; content: string; timestamp: number; encrypted?: boolean; key_id?: number }
+  | { type: 'active_speaker'; room_id: string; speaker: string; level: number }
   | { type: 'bwe_update'; max_bitrate_bps: number }
   | { type: 'error'; code: number; message: string }

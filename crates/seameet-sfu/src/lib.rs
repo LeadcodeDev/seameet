@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use media::*;
 use seameet_core::ParticipantId;
 use seameet_signaling::engine::{broadcast_room_status, SignalingHooks, SignalingState};
@@ -64,6 +65,8 @@ type Sessions = Arc<RwLock<HashMap<ParticipantId, PeerSession>>>;
 
 pub struct SfuServer {
     rooms: Rooms,
+    /// Global peers map used by the UDP reader for STUN broadcast.
+    /// Kept in sync with per-room peers.
     all_peers: Peers,
     socket: Arc<UdpSocket>,
     routes: RouteTable,
@@ -82,7 +85,7 @@ impl SfuServer {
         let udp_local_addr = shared_socket.local_addr()?;
 
         let all_peers: Peers = Arc::new(RwLock::new(HashMap::new()));
-        let routes: RouteTable = Arc::new(RwLock::new(HashMap::new()));
+        let routes: RouteTable = Arc::new(DashMap::new());
 
         // Spawn UDP reader.
         tokio::spawn(udp_reader(
@@ -605,10 +608,7 @@ impl SignalingHooks for SfuServer {
         affected_rooms: &[(String, bool)],
         _state: &Arc<RwLock<SignalingState>>,
     ) {
-        {
-            let mut r = self.routes.write().await;
-            r.retain(|_, v| *v != pid);
-        }
+        self.routes.retain(|_, v| *v != pid);
         self.all_peers.write().await.remove(&pid);
 
         for (room_id, room_empty) in affected_rooms {
@@ -739,7 +739,7 @@ mod tests {
                 rooms: Arc::new(RwLock::new(HashMap::new())),
                 all_peers: Arc::new(RwLock::new(HashMap::new())),
                 socket,
-                routes: Arc::new(RwLock::new(HashMap::new())),
+                routes: Arc::new(DashMap::new()),
                 udp_local_addr: addr,
                 sessions: Arc::new(RwLock::new(HashMap::new())),
                 next_peer_gen: std::sync::atomic::AtomicU64::new(1),

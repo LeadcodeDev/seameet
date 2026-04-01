@@ -9,6 +9,7 @@ import { useCall } from "@/context/CallContext";
 import {
   Check,
   Copy,
+  MessageSquare,
   Mic,
   MicOff,
   Monitor,
@@ -20,7 +21,12 @@ import {
 } from "lucide-react";
 import { useCallback, useState } from "react";
 
-export function ControlBar() {
+interface ControlBarProps {
+  onToggleChat?: () => void
+  chatOpen?: boolean
+}
+
+export function ControlBar({ onToggleChat, chatOpen }: ControlBarProps) {
   const {
     audioEnabled,
     videoEnabled,
@@ -147,6 +153,24 @@ export function ControlBar() {
               ? "E2EE active — some participants not yet secured"
               : "End-to-end encrypted"}
           </TooltipContent>
+        </Tooltip>
+      )}
+
+      {/* Chat */}
+      {onToggleChat && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              data-testid="btn-toggle-chat"
+              variant={chatOpen ? "default" : "secondary"}
+              size="icon"
+              className="h-12 w-12 rounded-full"
+              onClick={onToggleChat}
+            >
+              <MessageSquare className="h-5 w-5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{chatOpen ? "Close chat" : "Open chat"}</TooltipContent>
         </Tooltip>
       )}
 

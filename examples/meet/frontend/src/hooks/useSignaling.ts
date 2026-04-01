@@ -17,6 +17,7 @@ export interface UseSignalingReturn {
   sendMuteAudio: (from: string, roomId: string) => void
   sendUnmuteAudio: (from: string, roomId: string) => void
   sendVideoConfig: (from: string, roomId: string, width: number, height: number, fps: number) => void
+  sendChatMessage: (from: string, roomId: string, content: string, displayName?: string) => void
 }
 
 const DEFAULT_WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.hostname}:3001`
@@ -150,6 +151,10 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     send({ type: 'video_config_changed', from, room_id: roomId, width, height, fps })
   }, [send])
 
+  const sendChatMessage = useCallback((from: string, roomId: string, content: string, displayName?: string) => {
+    send({ type: 'chat_message', from, room_id: roomId, content, display_name: displayName, timestamp: Date.now() })
+  }, [send])
+
   const close = useCallback(() => {
     mountedRef.current = false
     if (reconnectTimerRef.current) {
@@ -162,5 +167,5 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     }
   }, [])
 
-  return { send, state, close, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig }
+  return { send, state, close, join, sendOffer, sendAnswer, sendIceCandidate, sendMuteAudio, sendUnmuteAudio, sendVideoConfig, sendChatMessage }
 }

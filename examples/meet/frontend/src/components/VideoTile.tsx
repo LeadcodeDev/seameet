@@ -10,6 +10,7 @@ interface VideoTileProps {
   videoEnabled: boolean
   isScreenShare?: boolean
   e2eeActive?: boolean
+  isActiveSpeaker?: boolean
 }
 
 function getInitials(name: string): string {
@@ -22,7 +23,7 @@ function getInitials(name: string): string {
     .toUpperCase()
 }
 
-export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive }: VideoTileProps) {
+export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -56,7 +57,7 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
       data-testid="video-tile"
       data-participant={name}
       data-video={showVideo ? 'on' : 'off'}
-      className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''}`}
+      className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''} ${isActiveSpeaker ? 'ring-2 ring-green-500' : ''}`}
     >
       {/* Video element */}
       <video

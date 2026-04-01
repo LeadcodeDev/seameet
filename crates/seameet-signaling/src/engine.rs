@@ -73,6 +73,8 @@ impl Member {
 #[derive(Debug)]
 pub struct Room {
     members: HashMap<ParticipantId, Member>,
+    /// Stored raw JSON of chat messages for late joiners.
+    chat_history: Vec<String>,
 }
 
 impl Room {
@@ -80,7 +82,18 @@ impl Room {
     pub fn new() -> Self {
         Self {
             members: HashMap::new(),
+            chat_history: Vec::new(),
         }
+    }
+
+    /// Appends a raw JSON chat message to the room history.
+    pub fn push_chat(&mut self, raw: &str) {
+        self.chat_history.push(raw.to_owned());
+    }
+
+    /// Returns the stored chat history.
+    pub fn chat_history(&self) -> &[String] {
+        &self.chat_history
     }
 
     /// Adds a member to the room. Returns `true` if this is the first member (initiator).
@@ -476,6 +489,14 @@ pub async fn dispatch(
             // Broadcast room_status snapshot to ALL members (including the new joiner).
             // This replaces the individual PeerJoined WS broadcast.
             broadcast_room_status(&st, room_id);
+
+            // Send chat history to the new joiner
+            if let Some(room) = st.room(room_id) {
+                for msg_json in room.chat_history() {
+                    let _ = self_tx.send(msg_json.clone());
+                }
+            }
+
             drop(st);
 
             info!(participant = %participant, room = room_id, "joined");
@@ -574,6 +595,16 @@ pub async fn dispatch(
                 let _ = peer_tx.send(raw.to_owned());
             }
         }
+        // Chat: store in history then broadcast to ALL members (including sender)
+        SdpMessage::ChatMessage { room_id, .. } => {
+            let mut st = state.write().await;
+            if let Some(room) = st.room_mut(room_id) {
+                room.push_chat(raw);
+                room.broadcast_all(raw);
+            }
+        }
+        // ActiveSpeaker: server-only, ignore if received from client.
+        SdpMessage::ActiveSpeaker { .. } => {}
         // E2EE: broadcast public key and key rotation to the room (except sender)
         SdpMessage::E2eePublicKey { room_id, .. } | SdpMessage::E2eeKeyRotation { room_id, .. } => {
             let st = state.read().await;

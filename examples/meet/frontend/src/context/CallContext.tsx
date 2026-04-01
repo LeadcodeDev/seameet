@@ -1,9 +1,10 @@
-import { createContext, useContext, useEffect, useCallback, useRef, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useCallback, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSignaling } from '@/hooks/useSignaling'
 import { useMediaDevices, type VideoSettings } from '@/hooks/useMediaDevices'
 import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
 import { useE2EE, type E2EEPeerState } from '@/hooks/useE2EE'
+import type { ChatMessage } from '@/components/ChatPanel'
 import type { SignalingMessage } from '@/types'
 
 interface CallContextValue {
@@ -26,6 +27,9 @@ interface CallContextValue {
   leave: () => void
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, E2EEPeerState>
+  chatMessages: ChatMessage[]
+  sendChatMessage: (content: string) => void
+  activeSpeakerId: string | null
 }
 
 const CallContext = createContext<CallContextValue | null>(null)
@@ -43,6 +47,8 @@ interface CallProviderProps {
 export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
 
   // Ref-based message routing: useSignaling → useWebRTC
   const webrtcHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
@@ -52,6 +58,36 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
       // Route E2EE signaling messages to the E2EE hook
       if (msg.type === 'e2ee_public_key' || msg.type === 'e2ee_sender_key' || msg.type === 'e2ee_key_rotation') {
         e2eeHandlerRef.current(msg)
+        return
+      }
+      // Handle chat messages
+      if (msg.type === 'chat_message') {
+        ;(async () => {
+          let content = msg.content
+          let encrypted = false
+          if (msg.encrypted) {
+            const decrypted = await e2eeRef.current.decryptChat(msg.from, msg.content, msg.key_id ?? 0)
+            if (decrypted !== null) {
+              content = decrypted
+            } else {
+              content = '\u{1F512} Message chiffré'
+              encrypted = true
+            }
+          }
+          setChatMessages(prev => [...prev, {
+            id: `${msg.from}-${msg.timestamp}`,
+            from: msg.from,
+            displayName: msg.display_name ?? msg.from.slice(0, 8),
+            content,
+            timestamp: msg.timestamp,
+            encrypted,
+          }])
+        })()
+        return
+      }
+      // Handle active speaker
+      if (msg.type === 'active_speaker') {
+        setActiveSpeakerId(msg.speaker)
         return
       }
       webrtcHandlerRef.current(msg)
@@ -69,6 +105,10 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
   // Ref for e2ee handler to avoid stale closures
   const e2eeHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
   e2eeHandlerRef.current = e2ee.handleMessage
+
+  // Ref for e2ee encrypt/decrypt to avoid stale closures in async chat handler
+  const e2eeRef = useRef(e2ee)
+  e2eeRef.current = e2ee
 
   // Ref to call webrtc.stopScreenShare when browser native stop fires
   const webrtcScreenStopRef = useRef<() => Promise<void>>(async () => {})
@@ -199,6 +239,30 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     prevRemotePeerIdsRef.current = currentIds
   }, [webrtc.remotePeers, e2ee])
 
+  const handleSendChatMessage = useCallback((content: string) => {
+    if (e2eeRef.current.enabled) {
+      e2eeRef.current.encryptChat(content).then((result) => {
+        if (result) {
+          signaling.send({
+            type: 'chat_message',
+            from: participantId,
+            room_id: roomId,
+            display_name: displayName,
+            content: result.ciphertext,
+            timestamp: Date.now(),
+            encrypted: true,
+            key_id: result.keyId,
+          } as SignalingMessage)
+        } else {
+          // Fallback to plaintext if encryption fails
+          signaling.sendChatMessage(participantId, roomId, content, displayName)
+        }
+      })
+    } else {
+      signaling.sendChatMessage(participantId, roomId, content, displayName)
+    }
+  }, [signaling, participantId, roomId, displayName])
+
   const leave = useCallback(() => {
     signaling.close()
     navigate('/')
@@ -224,6 +288,9 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     leave,
     e2eeEnabled: e2ee.enabled,
     e2eePeerStates: e2ee.peerStates,
+    chatMessages,
+    sendChatMessage: handleSendChatMessage,
+    activeSpeakerId,
   }
 
   return (

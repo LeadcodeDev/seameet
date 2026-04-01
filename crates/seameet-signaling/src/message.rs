@@ -209,6 +209,35 @@ pub enum SdpMessage {
         /// New key generation identifier.
         key_id: u32,
     },
+    /// Chat message broadcast to all room members.
+    ChatMessage {
+        /// The sender.
+        from: ParticipantId,
+        /// The room this message belongs to.
+        room_id: String,
+        /// Display name of the sender (for UI rendering).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        /// The text content of the message (plaintext or Base64 ciphertext when encrypted).
+        content: String,
+        /// Unix timestamp in milliseconds.
+        timestamp: u64,
+        /// Whether this message is E2EE-encrypted.
+        #[serde(default)]
+        encrypted: bool,
+        /// Key generation identifier (present when encrypted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_id: Option<u32>,
+    },
+    /// Active speaker notification broadcast by the server.
+    ActiveSpeaker {
+        /// The room this applies to.
+        room_id: String,
+        /// The participant currently speaking (loudest).
+        speaker: ParticipantId,
+        /// Audio level (0 = silence, 127 = loudest).
+        level: u8,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -241,7 +270,9 @@ impl SdpMessage {
             | Self::RoomStatus { room_id, .. }
             | Self::E2eePublicKey { room_id, .. }
             | Self::E2eeSenderKey { room_id, .. }
-            | Self::E2eeKeyRotation { room_id, .. } => Some(room_id),
+            | Self::E2eeKeyRotation { room_id, .. }
+            | Self::ChatMessage { room_id, .. }
+            | Self::ActiveSpeaker { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }

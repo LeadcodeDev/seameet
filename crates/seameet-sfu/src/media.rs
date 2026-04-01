@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use dashmap::DashMap;
 use seameet_core::ParticipantId;
 use seameet_signaling::SdpMessage;
 use str0m::change::SdpOffer;
@@ -47,12 +49,12 @@ pub struct ForwardedMedia {
     pub seq_no: u64,
     pub time: u32,
     pub marker: bool,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub is_audio: bool,
     pub is_screen: bool,
     pub source_pid: ParticipantId,
     pub wallclock: Instant,
-    pub ext_vals: ExtensionValues,
+    pub ext_vals: Arc<ExtensionValues>,
 }
 
 pub struct SourceSlot {
@@ -77,7 +79,8 @@ pub struct SfuPeer {
 
 pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
 /// Maps remote UDP address → ParticipantId for efficient packet routing.
-pub type RouteTable = Arc<RwLock<HashMap<SocketAddr, ParticipantId>>>;
+/// Uses DashMap for lock-free reads on the hot UDP path.
+pub type RouteTable = Arc<DashMap<SocketAddr, ParticipantId>>;
 
 /// Maximum number of media packets buffered per source while awaiting renegotiation.
 const MEDIA_BUFFER_CAP: usize = 500;
@@ -97,11 +100,8 @@ pub async fn udp_reader(socket: Arc<UdpSocket>, peers: Peers, routes: RouteTable
         let data = buf[..n].to_vec();
 
         // Try route table first (fast path for known peers).
-        // Use try_read to never block the UDP reader.
-        let target_pid = routes
-            .try_read()
-            .ok()
-            .and_then(|r| r.get(&source).copied());
+        // DashMap provides lock-free reads — no contention on the hot path.
+        let target_pid = routes.get(&source).map(|r| *r);
 
         let p = peers.read().await;
         if let Some(pid) = target_pid {
@@ -155,6 +155,10 @@ pub async fn run_media(
     let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
     let mut last_pli = Instant::now();
     let mut last_bwe_notify = Instant::now();
+    // Active speaker detection: exponential moving average of audio level per peer.
+    let mut audio_levels: HashMap<ParticipantId, f32> = HashMap::new();
+    let mut last_speaker_broadcast = Instant::now();
+    let mut current_active_speaker: Option<ParticipantId> = None;
     let mut all_mids: Vec<(Mid, MediaKind)> = Vec::new();
     let mut rtp_rx_count: u64 = 0;
     let mut rtp_tx_count: u64 = 0;
@@ -204,6 +208,7 @@ pub async fn run_media(
             &mut ice_connected,
             &ws_tx,
             &mut last_bwe_notify,
+            &mut audio_levels,
         )
         .await;
 
@@ -293,7 +298,7 @@ pub async fn run_media(
                         ) {
                             let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
                             if ice_connected && !route_registered {
-                                routes.write().await.insert(source, pid);
+                                routes.insert(source, pid);
                                 route_registered = true;
                                 info!(participant = %pid, %source, "registered UDP route");
                             }
@@ -491,6 +496,7 @@ pub async fn run_media(
                         pending_media.remove(&left_pid);
                         muted_peers.remove(&left_pid);
                         source_keyframe_pending.remove(&left_pid);
+                        audio_levels.remove(&left_pid);
                     }
                     Some(PeerCmd::PeerCountChanged { remote_peer_count }) => {
                         let own_count = 2 + if own_screen_mid.is_some() { 1 } else { 0 };
@@ -519,7 +525,11 @@ pub async fn run_media(
             _ = tokio::time::sleep(wait) => {
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
 
-                if media_started && last_pli.elapsed() >= Duration::from_secs(5) {
+                // Safety-net PLI at 30s intervals — only for own video/screen.
+                // No blast to all peers; targeted PLI on new peer / packet loss
+                // is handled elsewhere. This avoids ~10x bandwidth waste from
+                // unnecessary keyframes every 5s.
+                if media_started && last_pli.elapsed() >= Duration::from_secs(30) {
                     last_pli = Instant::now();
                     if let Some(mid) = own_video_mid {
                         let mut api = rtc.direct_api();
@@ -533,11 +543,37 @@ pub async fn run_media(
                             rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
                         }
                     }
-                    let p = peers.read().await;
-                    for (id, peer) in p.iter() {
-                        if *id != pid {
-                            let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                }
+
+                // Active speaker detection: every 500ms, find the loudest peer
+                // and broadcast if the speaker changed.
+                if media_started && last_speaker_broadcast.elapsed() >= Duration::from_millis(500) {
+                    last_speaker_broadcast = Instant::now();
+                    // Find peer with highest EMA audio level (threshold: 10 to avoid noise)
+                    let loudest = audio_levels.iter()
+                        .filter(|(_, level)| **level > 10.0)
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    if let Some((speaker_pid, level)) = loudest {
+                        let speaker_pid = *speaker_pid;
+                        let level_u8 = (*level as u8).min(127);
+                        if current_active_speaker != Some(speaker_pid) {
+                            current_active_speaker = Some(speaker_pid);
+                            let msg = SdpMessage::ActiveSpeaker {
+                                room_id: room_id.clone(),
+                                speaker: speaker_pid,
+                                level: level_u8,
+                            };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let p = peers.read().await;
+                                for peer in p.values() {
+                                    let _ = peer.ws_tx.send(json.clone());
+                                }
+                            }
                         }
+                    }
+                    // Decay all levels towards zero for peers that stopped talking
+                    for level in audio_levels.values_mut() {
+                        *level *= 0.85;
                     }
                 }
 
@@ -660,6 +696,7 @@ async fn drain_outputs(
     ice_connected: &mut bool,
     ws_tx: &mpsc::UnboundedSender<String>,
     last_bwe_notify: &mut Instant,
+    audio_levels: &mut HashMap<ParticipantId, f32>,
 ) -> Option<Instant> {
     // Resolve screen share SSRC from own_screen_mid via str0m's stream mapping.
     // This is the authoritative source — no heuristic needed.
@@ -710,8 +747,23 @@ async fn drain_outputs(
                         );
                     }
 
+                    // Extract audio level from RTP extension for active speaker detection.
+                    if is_audio {
+                        if let Some(level) = pkt.header.ext_vals.audio_level {
+                            // audio_level is 0..=127 where 0=loudest, 127=silence (RFC 6464).
+                            // Invert: 127 - level so higher = louder for our EMA.
+                            let linear = (127 - level as i32).max(0) as f32;
+                            let entry = audio_levels.entry(*pid).or_insert(0.0);
+                            // Exponential moving average (α=0.3)
+                            *entry = 0.3 * linear + 0.7 * *entry;
+                        }
+                    }
+
                     let now = Instant::now();
-                    let ext_vals = pkt.header.ext_vals.clone();
+                    // Zero-copy: wrap payload in Bytes (Arc-backed) so
+                    // cloning to N-1 peers is a refcount bump, not a memcpy.
+                    let payload: Bytes = Bytes::copy_from_slice(&pkt.payload);
+                    let ext_vals = Arc::new(pkt.header.ext_vals.clone());
                     let p = peers.read().await;
                     for (id, peer) in p.iter() {
                         if id != pid {
@@ -720,12 +772,12 @@ async fn drain_outputs(
                                 seq_no: (*pkt.seq_no).into(),
                                 time: pkt.header.timestamp,
                                 marker: pkt.header.marker,
-                                payload: pkt.payload.clone(),
+                                payload: payload.clone(),
                                 is_audio,
                                 is_screen,
                                 source_pid: *pid,
                                 wallclock: now,
-                                ext_vals: ext_vals.clone(),
+                                ext_vals: Arc::clone(&ext_vals),
                             }));
                         }
                     }
@@ -1005,9 +1057,9 @@ fn write_forwarded_rtp(
         media.time,
         media.wallclock,
         media.marker,
-        media.ext_vals.clone(),
+        (*media.ext_vals).clone(),
         !media.is_audio,
-        media.payload.clone(),
+        media.payload.to_vec(),
     ) {
         warn!("write_rtp error: {e}");
     }
@@ -1781,12 +1833,12 @@ a=mid:3\r\n";
             seq_no: 1,
             time: 90000,
             marker: true,
-            payload: vec![0u8; 100],
+            payload: Bytes::from(vec![0u8; 100]),
             is_audio: false,
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
 
         // This should create a slot and successfully write RTP.
@@ -1826,12 +1878,12 @@ a=mid:3\r\n";
             seq_no: 1,
             time: 48000,
             marker: false,
-            payload: vec![0u8; 50],
+            payload: Bytes::from(vec![0u8; 50]),
             is_audio: true,
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &audio_media, &mut source_slots, &mut rtp_tx_count,
@@ -1846,12 +1898,12 @@ a=mid:3\r\n";
             seq_no: 1,
             time: 90000,
             marker: true,
-            payload: vec![0u8; 100],
+            payload: Bytes::from(vec![0u8; 100]),
             is_audio: false,
             is_screen: false,
             source_pid: source,
             wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &video_media, &mut source_slots, &mut rtp_tx_count,
@@ -1881,9 +1933,9 @@ a=mid:3\r\n";
         // Source 1 sends video.
         let m1 = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: source1, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &m1, &mut source_slots, &mut rtp_tx_count,
@@ -1895,9 +1947,9 @@ a=mid:3\r\n";
         // Source 2 sends video.
         let m2 = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: source2, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &m2, &mut source_slots, &mut rtp_tx_count,
@@ -1928,10 +1980,10 @@ a=mid:3\r\n";
         for i in 0..5 {
             let media = ForwardedMedia {
                 pt: video_pt, seq_no: i, time: 90000 + i as u32 * 3000,
-                marker: false, payload: vec![0u8; 100],
+                marker: false, payload: Bytes::from(vec![0u8; 100]),
                 is_audio: false, is_screen: false,
                 source_pid: source, wallclock: Instant::now(),
-            ext_vals: ExtensionValues::default(),
+            ext_vals: Arc::new(ExtensionValues::default()),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -1959,9 +2011,9 @@ a=mid:3\r\n";
 
         let media = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: pid(42), wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2052,9 +2104,9 @@ a=mid:3\r\n";
         // User2 sends video → slot created.
         let media = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2073,9 +2125,9 @@ a=mid:3\r\n";
         // User2 reconnects → sends video again.
         let media2 = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &media2, &mut source_slots, &mut rtp_tx_count,
@@ -2112,10 +2164,10 @@ a=mid:3\r\n";
         for i in 0..10 {
             let media = ForwardedMedia {
                 pt: video_pt, seq_no: i, time: 90000 + i as u32 * 3000,
-                marker: false, payload: vec![0u8; 100],
+                marker: false, payload: Bytes::from(vec![0u8; 100]),
                 is_audio: false, is_screen: false,
                 source_pid: user2, wallclock: Instant::now(),
-            ext_vals: ExtensionValues::default(),
+            ext_vals: Arc::new(ExtensionValues::default()),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2134,9 +2186,9 @@ a=mid:3\r\n";
         // User2 reconnects and sends 1 packet.
         let media = ForwardedMedia {
             pt: video_pt, seq_no: 1, time: 90000, marker: true,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: user2, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2171,9 +2223,9 @@ a=mid:3\r\n";
         for source in [user2, user3] {
             let media = ForwardedMedia {
                 pt: video_pt, seq_no: 1, time: 90000, marker: true,
-                payload: vec![0u8; 100], is_audio: false, is_screen: false,
+                payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
                 source_pid: source, wallclock: Instant::now(),
-            ext_vals: ExtensionValues::default(),
+            ext_vals: Arc::new(ExtensionValues::default()),
             };
             write_forwarded_rtp(
                 &mut server, &media, &mut source_slots, &mut rtp_tx_count,
@@ -2191,9 +2243,9 @@ a=mid:3\r\n";
         // User3 still forwards fine.
         let media = ForwardedMedia {
             pt: video_pt, seq_no: 2, time: 93000, marker: false,
-            payload: vec![0u8; 100], is_audio: false, is_screen: false,
+            payload: Bytes::from(vec![0u8; 100]), is_audio: false, is_screen: false,
             source_pid: user3, wallclock: Instant::now(),
-        ext_vals: ExtensionValues::default(),
+        ext_vals: Arc::new(ExtensionValues::default()),
         };
         write_forwarded_rtp(
             &mut server, &media, &mut source_slots, &mut rtp_tx_count,
