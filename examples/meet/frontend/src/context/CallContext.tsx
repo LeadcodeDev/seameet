@@ -27,6 +27,7 @@ interface CallContextValue {
   leave: () => void
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, E2EEPeerState>
+  e2eeSafetyNumbers: Map<string, string>
   chatMessages: ChatMessage[]
   sendChatMessage: (content: string) => void
   activeSpeakerId: string | null
@@ -288,6 +289,7 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     leave,
     e2eeEnabled: e2ee.enabled,
     e2eePeerStates: e2ee.peerStates,
+    e2eeSafetyNumbers: e2ee.safetyNumbers,
     chatMessages,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,

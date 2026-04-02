@@ -35,12 +35,14 @@ export interface UseE2EEReturn {
   encryptChat: (content: string) => Promise<{ ciphertext: string; keyId: number } | null>
   /** Decrypt a chat message from a peer. Returns null if key unavailable. */
   decryptChat: (from: string, ciphertext: string, keyId: number) => Promise<string | null>
+  /** Per-peer safety numbers for identity verification (hex fingerprints). */
+  safetyNumbers: Map<string, string>
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
 async function generateSenderKey(): Promise<ArrayBuffer> {
-  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt'])
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
   return crypto.subtle.exportKey('raw', key)
 }
 
@@ -52,7 +54,7 @@ async function deriveSharedSecret(privateKey: CryptoKey, publicKey: CryptoKey): 
   return crypto.subtle.deriveKey(
     { name: 'ECDH', public: publicKey },
     privateKey,
-    { name: 'AES-GCM', length: 128 },
+    { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt'],
   )
@@ -89,15 +91,49 @@ async function decryptSenderKey(sharedSecret: CryptoKey, encryptedBase64: string
   return crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, sharedSecret, ciphertext)
 }
 
-async function ratchetKey(currentKeyRaw: ArrayBuffer, newKeyId: number): Promise<ArrayBuffer> {
-  const keyMaterial = await crypto.subtle.importKey('raw', currentKeyRaw, 'HKDF', false, ['deriveBits'])
-  const info = new TextEncoder().encode(`ratchet-${newKeyId}`)
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(16), info },
-    keyMaterial,
-    128,
-  )
-  return bits
+/**
+ * Compute a safety number (fingerprint) from two public keys for identity verification.
+ * The fingerprint is a SHA-256 hash of the sorted concatenation of both raw public keys,
+ * displayed as groups of 5 digits (similar to Signal's Safety Numbers).
+ */
+async function computeSafetyNumber(localPubKey: CryptoKey, remotePubKey: CryptoKey): Promise<string> {
+  const localRaw = new Uint8Array(await crypto.subtle.exportKey('raw', localPubKey))
+  const remoteRaw = new Uint8Array(await crypto.subtle.exportKey('raw', remotePubKey))
+
+  // Sort keys lexicographically so both sides compute the same fingerprint
+  let first: Uint8Array, second: Uint8Array
+  const cmp = compareBytes(localRaw, remoteRaw)
+  if (cmp <= 0) {
+    first = localRaw; second = remoteRaw
+  } else {
+    first = remoteRaw; second = localRaw
+  }
+
+  const combined = new Uint8Array(first.length + second.length)
+  combined.set(first, 0)
+  combined.set(second, first.length)
+
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', combined))
+
+  // Format as groups of 5 digits (12 groups = 60 digits, from 32 bytes)
+  let digits = ''
+  for (let i = 0; i < hash.length; i++) {
+    digits += hash[i].toString(10).padStart(3, '0')
+  }
+  // Take 60 digits, format as 12 groups of 5
+  const groups: string[] = []
+  for (let i = 0; i < 60; i += 5) {
+    groups.push(digits.slice(i, i + 5))
+  }
+  return groups.join(' ')
+}
+
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  const len = Math.min(a.length, b.length)
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i]
+  }
+  return a.length - b.length
 }
 
 // ── Hook ───────────────────────────────────────────────────────────────
@@ -118,12 +154,19 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   const [peerStates, setPeerStates] = useState<Map<string, E2EEPeerState>>(new Map())
   // Per-peer decrypted sender keys for chat encryption
   const peerSenderKeysRef = useRef<Map<string, { raw: ArrayBuffer; keyId: number }>>(new Map())
+  // Safety numbers per peer
+  const safetyNumbersRef = useRef<Map<string, string>>(new Map())
+  const [safetyNumbers, setSafetyNumbers] = useState<Map<string, string>>(new Map())
 
   const signalingRef = useRef(signaling)
   signalingRef.current = signaling
 
   const updatePeerStates = useCallback(() => {
     setPeerStates(new Map(peerStatesRef.current))
+  }, [])
+
+  const updateSafetyNumbers = useCallback(() => {
+    setSafetyNumbers(new Map(safetyNumbersRef.current))
   }, [])
 
   // ── Worker Lifecycle ───────────────────────────────────────────────
@@ -226,33 +269,37 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     }
   }, [enabled, participantId, sendSenderKeyTo])
 
-  // ── Ratchet timer (every 10 minutes) ───────────────────────────────
+  // ── DH Ratchet (every 2 minutes) ─────────────────────────────────
+  //
+  // Provides Post-Compromise Security (PCS) by injecting fresh entropy.
+  // Unlike the old HKDF ratchet (which derived from the previous key),
+  // this generates a new ECDH keypair and fresh random sender key.
+  // An attacker who compromised the old key cannot derive future keys
+  // because the new shared secrets include fresh DH entropy.
 
   useEffect(() => {
     if (!enabled) return
     const interval = setInterval(async () => {
       if (!senderKeyRawRef.current) return
+
+      // 1. Generate new ECDH keypair (fresh entropy for PCS)
+      ecdhKeyPairRef.current = await generateECDHKeyPair()
+
+      // 2. Generate fresh random sender key (not derived from old key)
       const newKeyId = localKeyIdRef.current + 1
-      const ratcheted = await ratchetKey(senderKeyRawRef.current, newKeyId)
-      senderKeyRawRef.current = ratcheted
+      senderKeyRawRef.current = await generateSenderKey()
       localKeyIdRef.current = newKeyId
       setLocalKeyId(newKeyId)
 
+      // 3. Set new key in worker
       workerRef.current?.postMessage({
         type: 'setKey',
         participantId,
         keyId: newKeyId,
-        rawKey: ratcheted,
+        rawKey: senderKeyRawRef.current,
       })
 
-      // Broadcast key_id so peers can ratchet in sync
-      signalingRef.current.send({
-        type: 'e2ee_key_rotation',
-        from: participantId,
-        room_id: roomId,
-        key_id: newKeyId,
-      } as SignalingMessage)
-
+      // 4. Purge old keys after a delay
       setTimeout(() => {
         workerRef.current?.postMessage({
           type: 'purgeOldKeys',
@@ -260,10 +307,21 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
           keepKeyId: newKeyId,
         })
       }, 5000)
-    }, 10 * 60 * 1000)
+
+      // 5. Clear old shared secrets (they used the old ECDH keypair)
+      sharedSecretsRef.current.clear()
+
+      // 6. Broadcast new public key — peers will:
+      //    a) Derive new shared secret (their private + our new public)
+      //    b) Respond with their public key
+      //    c) We re-derive shared secret and send new sender key
+      await broadcastPublicKey()
+
+      console.log(`[E2EE] DH ratchet completed, new keyId=${newKeyId}`)
+    }, 2 * 60 * 1000)
 
     return () => clearInterval(interval)
-  }, [enabled, participantId, roomId])
+  }, [enabled, participantId, roomId, broadcastPublicKey])
 
   // ── Handle E2EE signaling messages ─────────────────────────────────
 
@@ -282,6 +340,11 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       if (ecdhKeyPairRef.current) {
         const sharedSecret = await deriveSharedSecret(ecdhKeyPairRef.current.privateKey, peerPubKey)
         sharedSecretsRef.current.set(senderId, sharedSecret)
+
+        // Compute safety number for this peer
+        const safetyNumber = await computeSafetyNumber(ecdhKeyPairRef.current.publicKey, peerPubKey)
+        safetyNumbersRef.current.set(senderId, safetyNumber)
+        updateSafetyNumbers()
 
         // Reply with our own public key (they may not have it yet)
         await broadcastPublicKey()
@@ -336,7 +399,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         updatePeerStates()
       }
     }
-  }, [enabled, participantId, broadcastPublicKey, sendSenderKeyTo, updatePeerStates])
+  }, [enabled, participantId, broadcastPublicKey, sendSenderKeyTo, updatePeerStates, updateSafetyNumbers])
 
   // ── Peer lifecycle callbacks ───────────────────────────────────────
 
@@ -356,14 +419,16 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     peerPublicKeysRef.current.delete(peerId)
     sharedSecretsRef.current.delete(peerId)
     peerSenderKeysRef.current.delete(peerId)
+    safetyNumbersRef.current.delete(peerId)
     updatePeerStates()
+    updateSafetyNumbers()
 
     // Remove departed peer's keys from worker
     workerRef.current?.postMessage({ type: 'removeKeys', participantId: peerId })
 
     // Rotate key so the departed peer can't decrypt future frames
     await rotateSenderKey()
-  }, [enabled, rotateSenderKey, updatePeerStates])
+  }, [enabled, rotateSenderKey, updatePeerStates, updateSafetyNumbers])
 
   // ── Chat encryption / decryption ──────────────────────────────────
 
@@ -420,5 +485,6 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     localKeyId,
     encryptChat,
     decryptChat,
+    safetyNumbers,
   }
 }
