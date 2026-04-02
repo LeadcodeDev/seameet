@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, memo } from 'react'
 import { MicOff, ShieldCheck } from 'lucide-react'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 
@@ -23,7 +23,7 @@ function getInitials(name: string): string {
     .toUpperCase()
 }
 
-export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker }: VideoTileProps) {
+export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -42,6 +42,7 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
 
     // When a track unmutes (RTP starts arriving after reconnection),
     // autoPlay may not re-trigger — force playback.
+    // Snapshot tracks at attach time so cleanup always removes the right listeners.
     const tracks = stream.getTracks()
     for (const t of tracks) t.addEventListener('unmute', tryPlay)
     return () => {
@@ -98,4 +99,4 @@ export function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, i
       </div>
     </div>
   )
-}
+})

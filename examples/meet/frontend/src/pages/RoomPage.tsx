@@ -1,21 +1,29 @@
 import { useMemo, useState, useCallback } from 'react'
 import { useParams, useLocation, Navigate } from 'react-router-dom'
 import { CallProvider, useCall } from '@/context/CallContext'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { VideoGrid } from '@/components/VideoGrid'
 import { ControlBar } from '@/components/ControlBar'
 import { ChatPanel } from '@/components/ChatPanel'
 
 function RoomContent() {
-  const { chatMessages, sendChatMessage, participantId } = useCall()
+  const { chatMessages, sendChatMessage, participantId, mediaError, roomId } = useCall()
   const [chatOpen, setChatOpen] = useState(false)
 
   const toggleChat = useCallback(() => setChatOpen(prev => !prev), [])
 
   return (
     <div className="h-dvh flex flex-col">
+      {/* Media error banner */}
+      {mediaError && (
+        <div className="bg-destructive/10 border-b border-destructive/20 px-4 py-2 text-sm text-destructive">
+          Camera/microphone unavailable: {mediaError}
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center px-4 py-2">
-        <span className="text-sm text-muted-foreground font-mono">{useCall().roomId}</span>
+        <span className="text-sm text-muted-foreground font-mono">{roomId}</span>
       </div>
 
       {/* Main content area */}
@@ -56,15 +64,17 @@ export default function RoomPage() {
   }
 
   return (
-    <CallProvider
-      participantId={participantId}
-      displayName={displayName}
-      roomId={code}
-      initialAudioEnabled={lobbyState?.micOn}
-      initialVideoEnabled={lobbyState?.cameraOn}
-      initialE2EEEnabled={lobbyState?.e2eeOn}
-    >
-      <RoomContent />
-    </CallProvider>
+    <ErrorBoundary>
+      <CallProvider
+        participantId={participantId}
+        displayName={displayName}
+        roomId={code}
+        initialAudioEnabled={lobbyState?.micOn}
+        initialVideoEnabled={lobbyState?.cameraOn}
+        initialE2EEEnabled={lobbyState?.e2eeOn}
+      >
+        <RoomContent />
+      </CallProvider>
+    </ErrorBoundary>
   )
 }

@@ -31,6 +31,7 @@ interface CallContextValue {
   chatMessages: ChatMessage[]
   sendChatMessage: (content: string) => void
   activeSpeakerId: string | null
+  mediaError: string | null
 }
 
 const CallContext = createContext<CallContextValue | null>(null)
@@ -75,14 +76,18 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
               encrypted = true
             }
           }
-          setChatMessages(prev => [...prev, {
-            id: `${msg.from}-${msg.timestamp}`,
-            from: msg.from,
-            displayName: msg.display_name ?? msg.from.slice(0, 8),
-            content,
-            timestamp: msg.timestamp,
-            encrypted,
-          }])
+          setChatMessages(prev => {
+            const next = [...prev, {
+              id: `${msg.from}-${msg.timestamp}`,
+              from: msg.from,
+              displayName: msg.display_name ?? msg.from.slice(0, 8),
+              content,
+              timestamp: msg.timestamp,
+              encrypted,
+            }]
+            // Keep only the most recent 500 messages to avoid unbounded growth
+            return next.length > 500 ? next.slice(-500) : next
+          })
         })()
         return
       }
@@ -293,6 +298,7 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     chatMessages,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,
+    mediaError: media.error,
   }
 
   return (
