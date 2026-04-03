@@ -88,13 +88,22 @@ impl Room {
     }
 
     /// Appends a raw JSON chat message to the room history.
-    pub fn push_chat(&mut self, raw: &str) {
+    /// If the history exceeds `max_entries`, the oldest message is removed.
+    pub fn push_chat(&mut self, raw: &str, max_entries: usize) {
+        if self.chat_history.len() >= max_entries && max_entries > 0 {
+            self.chat_history.remove(0);
+        }
         self.chat_history.push(raw.to_owned());
     }
 
     /// Returns the stored chat history.
     pub fn chat_history(&self) -> &[String] {
         &self.chat_history
+    }
+
+    /// Returns the number of members in this room.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
     }
 
     /// Adds a member to the room. Returns `true` if this is the first member (initiator).
@@ -382,6 +391,20 @@ impl Default for SignalingState {
 /// runs, and react to participant disconnections. This is the primary
 /// extension point for SFU-style servers that need to handle Offer/Answer
 /// themselves while letting the engine manage room membership.
+///
+/// The trait also exposes injectable security hooks with sensible defaults:
+/// - [`on_authenticate`](SignalingHooks::on_authenticate): validates join
+///   tokens (default: allows all)
+/// - [`on_rate_check`](SignalingHooks::on_rate_check): per-message rate
+///   limiting (default: allows all)
+/// - [`max_room_members`](SignalingHooks::max_room_members): room capacity
+///   (default: 25)
+/// - [`max_chat_history`](SignalingHooks::max_chat_history): chat history
+///   retention (default: 1000)
+/// - [`max_room_id_len`](SignalingHooks::max_room_id_len): room ID length
+///   limit (default: 64)
+/// - [`max_display_name_len`](SignalingHooks::max_display_name_len): display
+///   name length limit (default: 64)
 pub trait SignalingHooks: Send + Sync + 'static {
     /// Called before the default dispatch for each incoming message.
     ///
@@ -403,6 +426,61 @@ pub trait SignalingHooks: Send + Sync + 'static {
         affected_rooms: &[(String, bool)],
         state: &Arc<RwLock<SignalingState>>,
     ) -> impl Future<Output = ()> + Send;
+
+    /// Called when a participant sends a `Join` message. Return `Ok(())` to
+    /// allow the join, or `Err(reason)` to reject it.
+    ///
+    /// The `token` parameter comes from the optional `token` field in the
+    /// `Join` message. Consumers should implement this method to validate
+    /// JWTs, API keys, or any other authentication mechanism.
+    ///
+    /// Default: allows all joins.
+    fn on_authenticate(
+        &self,
+        _participant: ParticipantId,
+        _room_id: &str,
+        _token: Option<&str>,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called before processing each incoming message. Return `true` to allow
+    /// the message through, or `false` to silently drop it.
+    ///
+    /// Consumers should implement this method with a token bucket, sliding
+    /// window, or similar rate-limiting strategy.
+    ///
+    /// Default: allows all messages.
+    fn on_rate_check(
+        &self,
+        _pid: ParticipantId,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+
+    /// Maximum number of members allowed per room.
+    /// Default: 25.
+    fn max_room_members(&self) -> usize {
+        25
+    }
+
+    /// Maximum number of chat messages stored per room for late joiners.
+    /// Default: 1000.
+    fn max_chat_history(&self) -> usize {
+        1000
+    }
+
+    /// Maximum allowed length for room IDs.
+    /// Default: 64 characters.
+    fn max_room_id_len(&self) -> usize {
+        64
+    }
+
+    /// Maximum allowed length for display names.
+    /// Default: 64 characters.
+    fn max_display_name_len(&self) -> usize {
+        64
+    }
 }
 
 /// No-op hooks for a plain signaling relay server.
@@ -448,18 +526,23 @@ pub fn broadcast_room_status(state: &SignalingState, room_id: &str) {
 // ── Dispatch ────────────────────────────────────────────────────────────
 
 /// Dispatches a single signaling message through the engine's default logic.
+///
+/// The `max_chat_history` parameter controls how many chat messages are
+/// retained per room for late joiners (0 = unlimited, for backward compat).
 pub async fn dispatch(
     sdp: &SdpMessage,
     raw: &str,
     pid: ParticipantId,
     self_tx: &WsSink,
     state: &Arc<RwLock<SignalingState>>,
+    max_chat_history: usize,
 ) {
     match sdp {
         SdpMessage::Join {
             participant,
             room_id,
             display_name,
+            ..
         } => {
             let mut st = state.write().await;
 
@@ -608,7 +691,7 @@ pub async fn dispatch(
         SdpMessage::ChatMessage { room_id, .. } => {
             let mut st = state.write().await;
             if let Some(room) = st.room_mut(room_id) {
-                room.push_chat(raw);
+                room.push_chat(raw, max_chat_history);
                 room.broadcast_all(raw);
             }
         }
@@ -670,12 +753,98 @@ pub async fn run_connection<H: SignalingHooks>(
         };
 
         if participant_id.is_none() {
-            if let SdpMessage::Join { participant, .. } = &sdp {
+            if let SdpMessage::Join {
+                participant,
+                room_id,
+                display_name,
+                token,
+            } = &sdp
+            {
+                // ── Validate room ID ───────────────────────────────────
+                let max_room_id = hooks.max_room_id_len();
+                if room_id.len() > max_room_id
+                    || room_id.is_empty()
+                    || room_id.chars().any(|c| c.is_control())
+                {
+                    let err = SdpMessage::Error {
+                        code: 400,
+                        message: format!("invalid room_id (max {max_room_id} chars, no control chars)"),
+                    };
+                    if let Ok(json) = serde_json::to_string(&err) {
+                        let _ = tx.send(json);
+                    }
+                    continue;
+                }
+
+                // ── Sanitize display name ──────────────────────────────
+                let max_name = hooks.max_display_name_len();
+                let sanitized_name = display_name.as_ref().map(|name| {
+                    let cleaned: String = name.chars().filter(|c| !c.is_control()).collect();
+                    if cleaned.len() > max_name {
+                        cleaned[..max_name].to_owned()
+                    } else {
+                        cleaned
+                    }
+                });
+
+                // ── Authenticate ───────────────────────────────────────
+                if let Err(reason) = hooks
+                    .on_authenticate(*participant, room_id, token.as_deref())
+                    .await
+                {
+                    warn!(participant = %participant, room = room_id, "auth rejected: {reason}");
+                    let err = SdpMessage::Error {
+                        code: 401,
+                        message: reason,
+                    };
+                    if let Ok(json) = serde_json::to_string(&err) {
+                        let _ = tx.send(json);
+                    }
+                    return; // close connection
+                }
+
+                // ── Check room capacity ────────────────────────────────
+                {
+                    let st = state.read().await;
+                    if let Some(room) = st.room(room_id) {
+                        if room.member_count() >= hooks.max_room_members() {
+                            warn!(participant = %participant, room = room_id, "room full");
+                            let err = SdpMessage::Error {
+                                code: 403,
+                                message: "room is full".into(),
+                            };
+                            if let Ok(json) = serde_json::to_string(&err) {
+                                let _ = tx.send(json);
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 participant_id = Some(*participant);
                 // Register our generation before hooks/dispatch process the Join.
                 let mut st = state.write().await;
                 st.set_connection_gen(*participant, my_gen);
                 drop(st);
+
+                // Rebuild the Join message with the sanitized display name
+                let sanitized_sdp = SdpMessage::Join {
+                    participant: *participant,
+                    room_id: room_id.clone(),
+                    display_name: sanitized_name,
+                    token: None, // strip token from forwarding
+                };
+                let sanitized_raw =
+                    serde_json::to_string(&sanitized_sdp).unwrap_or_else(|_| msg.clone());
+
+                let pid = *participant;
+                let handled = hooks
+                    .on_message(&sanitized_sdp, &sanitized_raw, pid, &tx, &state)
+                    .await;
+                if !handled {
+                    dispatch(&sanitized_sdp, &sanitized_raw, pid, &tx, &state, hooks.max_chat_history()).await;
+                }
+                continue;
             } else {
                 continue;
             }
@@ -683,10 +852,24 @@ pub async fn run_connection<H: SignalingHooks>(
 
         let pid = participant_id.expect("set above");
 
+        // ── Rate limit check ───────────────────────────────────────────
+        if !hooks.on_rate_check(pid).await {
+            warn!(participant = %pid, "rate limited");
+            continue;
+        }
+
+        // ── Validate room_id on subsequent messages ────────────────────
+        if let Some(room_id) = sdp.room_id() {
+            let max_room_id = hooks.max_room_id_len();
+            if room_id.len() > max_room_id || room_id.is_empty() {
+                continue;
+            }
+        }
+
         // Let hooks intercept the message first.
         let handled = hooks.on_message(&sdp, &msg, pid, &tx, &state).await;
         if !handled {
-            dispatch(&sdp, &msg, pid, &tx, &state).await;
+            dispatch(&sdp, &msg, pid, &tx, &state, hooks.max_chat_history()).await;
         }
     }
 

@@ -713,26 +713,6 @@ export function useWebRTC({
     }
   }, [videoSettings, connectionState])
 
-  // Pause video encoding when tab is hidden to save CPU/bandwidth
-  useEffect(() => {
-    const handleVisibility = () => {
-      const pc = pcRef.current
-      if (!pc) return
-      const hidden = document.hidden
-      for (const sender of pc.getSenders()) {
-        if (sender.track?.kind === 'video') {
-          const params = sender.getParameters()
-          if (params.encodings.length > 0) {
-            params.encodings[0].active = !hidden
-            sender.setParameters(params).catch(() => {})
-          }
-        }
-      }
-    }
-    document.addEventListener('visibilitychange', handleVisibility)
-    return () => document.removeEventListener('visibilitychange', handleVisibility)
-  }, [])
-
   // Cleanup on unmount
   useEffect(() => {
     return () => {

@@ -392,97 +392,102 @@ async function decryptFrame(
   const data = new Uint8Array(frame.data)
   const minSize = TRAILER_LENGTH + E2EE_HEADER_LENGTH + 16 // header + at least GCM tag
   if (data.byteLength < minSize) {
-    controller.enqueue(frame)
+    // Frame too small to be E2EE-encrypted — drop it (not pass through,
+    // which would feed encrypted/garbled data to the decoder).
     return
   }
 
   return withChainLock(senderId, async () => {
-    const trailer = data[data.byteLength - 1]
-    const unencryptedBytes = trailer & 0x7f
+    // The entire decrypt body is wrapped in try/catch: if ANY exception
+    // propagates (e.g. RangeError from a malformed/unencrypted frame whose
+    // trailer yields an out-of-bounds DataView offset), the frame is silently
+    // dropped instead of killing the TransformStream permanently.
+    try {
+      const trailer = data[data.byteLength - 1]
+      const unencryptedBytes = trailer & 0x7f
 
-    const codecHeader = data.slice(0, unencryptedBytes)
-
-    // Read KID and CTR from e2ee header
-    const hdrStart = unencryptedBytes
-    const kid = data[hdrStart]
-    const ctr = new DataView(data.buffer, data.byteOffset + hdrStart + HEADER_KID_LENGTH, HEADER_CTR_LENGTH).getUint32(0)
-    const e2eeHeader = data.slice(hdrStart, hdrStart + E2EE_HEADER_LENGTH)
-
-    const ciphertext = data.slice(hdrStart + E2EE_HEADER_LENGTH, data.byteLength - TRAILER_LENGTH)
-
-    // AAD = sender_id + codec header + e2ee header
-    const aad = buildAAD(senderId, codecHeader, e2eeHeader)
-
-    // Find matching chain entry by KID
-    const matchingEntry = entries.find(e => (e.keyId & 0xff) === kid)
-    if (matchingEntry) {
-      if (!checkReplay(senderId, kid, ctr)) {
-        console.warn(`[E2EE Worker] replay detected for sender ${senderId.slice(0, 8)}, ctr=${ctr}`)
-        return
+      // Bounds check: unencryptedBytes must leave room for e2ee header + ciphertext + trailer
+      if (unencryptedBytes + E2EE_HEADER_LENGTH + TRAILER_LENGTH > data.byteLength) {
+        return // malformed frame — drop
       }
 
-      // Derive per-frame message key via KDF chain
-      const messageKey = await getDecryptionKey(matchingEntry, ctr)
-      if (!messageKey) {
-        console.warn(`[E2EE Worker] chain key unavailable for sender ${senderId.slice(0, 8)}, ctr=${ctr}`)
-        return
+      const codecHeader = data.slice(0, unencryptedBytes)
+
+      // Read KID and CTR from e2ee header
+      const hdrStart = unencryptedBytes
+      const kid = data[hdrStart]
+      const ctr = new DataView(data.buffer, data.byteOffset + hdrStart + HEADER_KID_LENGTH, HEADER_CTR_LENGTH).getUint32(0)
+      const e2eeHeader = data.slice(hdrStart, hdrStart + E2EE_HEADER_LENGTH)
+
+      const ciphertext = data.slice(hdrStart + E2EE_HEADER_LENGTH, data.byteLength - TRAILER_LENGTH)
+
+      // AAD = sender_id + codec header + e2ee header
+      const aad = buildAAD(senderId, codecHeader, e2eeHeader)
+
+      // Find matching chain entry by KID
+      const matchingEntry = entries.find(e => (e.keyId & 0xff) === kid)
+      if (matchingEntry) {
+        if (!checkReplay(senderId, kid, ctr)) {
+          return
+        }
+
+        // Derive per-frame message key via KDF chain
+        const messageKey = await getDecryptionKey(matchingEntry, ctr)
+        if (!messageKey) {
+          return
+        }
+
+        const iv = computeNonce(matchingEntry.baseSalt, ctr)
+        try {
+          const plaintext = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+            messageKey,
+            ciphertext,
+          )
+
+          const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
+          output.set(codecHeader, 0)
+          output.set(new Uint8Array(plaintext), unencryptedBytes)
+          frame.data = output.buffer
+          controller.enqueue(frame)
+          return
+        } catch {
+          // KID matched but decryption failed — frame corrupted or key mismatch during rotation
+        }
       }
 
-      const iv = computeNonce(matchingEntry.baseSalt, ctr)
-      try {
-        const plaintext = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
-          messageKey,
-          ciphertext,
-        )
+      // Fallback: try other chain entries (handles edge cases during key rotation)
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i]
+        if (entry === matchingEntry) continue
 
-        const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
-        output.set(codecHeader, 0)
-        output.set(new Uint8Array(plaintext), unencryptedBytes)
-        frame.data = output.buffer
-        controller.enqueue(frame)
-        return
-      } catch {
-        // KID matched but decryption failed — frame corrupted or key mismatch during rotation
-      }
-    }
-
-    // Fallback: try other chain entries (handles edge cases during key rotation)
-    // Note: we only attempt entries where decryption doesn't advance the chain
-    // (we use a fresh copy to avoid corrupting state on failure)
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i]
-      if (entry === matchingEntry) continue
-
-      // For fallback, we need to check if we can derive the key without destroying state
-      // Only attempt if the ctr is ahead of the entry's position (safe to advance)
-      if (ctr < entry.nextCtr) {
-        // Check cached keys
-        const cached = entry.skippedKeys.get(ctr)
-        if (cached) {
-          const iv = computeNonce(entry.baseSalt, ctr)
-          try {
-            const plaintext = await crypto.subtle.decrypt(
-              { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
-              cached,
-              ciphertext,
-            )
-            entry.skippedKeys.delete(ctr)
-            checkReplay(senderId, entry.keyId & 0xff, ctr)
-            const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
-            output.set(codecHeader, 0)
-            output.set(new Uint8Array(plaintext), unencryptedBytes)
-            frame.data = output.buffer
-            controller.enqueue(frame)
-            return
-          } catch {
-            // Try next entry
+        if (ctr < entry.nextCtr) {
+          const cached = entry.skippedKeys.get(ctr)
+          if (cached) {
+            const iv = computeNonce(entry.baseSalt, ctr)
+            try {
+              const plaintext = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+                cached,
+                ciphertext,
+              )
+              entry.skippedKeys.delete(ctr)
+              checkReplay(senderId, entry.keyId & 0xff, ctr)
+              const output = new Uint8Array(unencryptedBytes + plaintext.byteLength)
+              output.set(codecHeader, 0)
+              output.set(new Uint8Array(plaintext), unencryptedBytes)
+              frame.data = output.buffer
+              controller.enqueue(frame)
+              return
+            } catch {
+              // Try next entry
+            }
           }
         }
       }
+    } catch (e) {
+      console.warn(`[E2EE Worker] decrypt error for sender ${senderId.slice(0, 8)}:`, e)
     }
-
-    console.warn(`[E2EE Worker] decrypt failed for sender ${senderId.slice(0, 8)} — dropping frame`)
   })
 }
 

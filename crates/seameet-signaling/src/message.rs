@@ -32,6 +32,10 @@ pub enum SdpMessage {
         /// Optional human-readable name for this participant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
+        /// Optional authentication token. Validated by [`SignalingHooks::on_authenticate`]
+        /// if the server provides a custom implementation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     /// Notification that a participant has left a room.
     Leave {
@@ -320,6 +324,7 @@ mod tests {
                 participant: id_a(),
                 room_id: "room-42".into(),
                 display_name: None,
+                token: None,
             },
             SdpMessage::Leave {
                 participant: id_a(),
@@ -354,6 +359,7 @@ mod tests {
             participant: id_a(),
             room_id: "test".into(),
             display_name: None,
+            token: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"type\":\"join\""));
@@ -366,6 +372,7 @@ mod tests {
                 participant: id_a(),
                 room_id: "r1".into(),
                 display_name: None,
+                token: None,
             }
             .room_id(),
             Some("r1")

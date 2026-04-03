@@ -79,6 +79,7 @@ pub use seameet_core::Passthrough;
 
 pub use seameet_signaling::engine::{
     dispatch as signaling_dispatch, run_connection, NoopHooks, SignalingHooks, SignalingState,
+    Room as SignalingRoom, Member, WsSink,
 };
 pub use seameet_signaling::transport::{ConnectionReader, IncomingConnection, TransportListener};
 pub use seameet_signaling::{SdpMessage, SignalingBackend};

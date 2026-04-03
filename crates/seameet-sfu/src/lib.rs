@@ -810,6 +810,7 @@ mod tests {
             participant: id,
             room_id: room_id.into(),
             display_name: None,
+            token: None,
         });
         peer.recv().await; // Ready
         ctx.register_sfu_peer(peer, id, room_id).await;
@@ -840,6 +841,7 @@ mod tests {
             participant: pid(1),
             room_id: "room1".into(),
             display_name: Some("Alice".into()),
+            token: None,
         });
         let ready = a.recv().await;
         assert!(matches!(
@@ -854,6 +856,7 @@ mod tests {
             participant: pid(2),
             room_id: "room1".into(),
             display_name: Some("Bob".into()),
+            token: None,
         });
         let ready_b = b.recv().await;
         match &ready_b {
@@ -897,12 +900,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await; // Ready
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await; // Ready
                         // Drain A's RoomStatus from both joins
@@ -913,6 +918,7 @@ mod tests {
             participant: pid(3),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         let ready_c = c.recv().await;
         match &ready_c {
@@ -954,12 +960,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await;
         a.recv().await;
@@ -1287,12 +1295,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await;
         a.recv().await;
@@ -1320,6 +1330,7 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
 
@@ -1345,6 +1356,7 @@ mod tests {
                 participant: pid(i),
                 room_id: "big".into(),
                 display_name: Some(format!("P{i}")),
+                token: None,
             });
             let ready = p.recv().await;
             match &ready {
@@ -1379,6 +1391,7 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
 
@@ -1386,6 +1399,7 @@ mod tests {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await;
         a.recv().await;
@@ -1399,6 +1413,7 @@ mod tests {
             participant: pid(3),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         let ready = c.recv().await;
         match &ready {
@@ -1431,6 +1446,7 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
 
@@ -1440,6 +1456,7 @@ mod tests {
                 participant: pid(i),
                 room_id: "r".into(),
                 display_name: None,
+                token: None,
             });
             p.recv().await;
             p.disconnect();
@@ -1788,6 +1805,7 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: Some("Alice".into()),
+            token: None,
         });
         a.recv().await;
 
@@ -1795,6 +1813,7 @@ mod tests {
             participant: pid(2),
             room_id: "r".into(),
             display_name: Some("Bob".into()),
+            token: None,
         });
         let ready = b.recv().await;
         match &ready {
@@ -1899,12 +1918,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await;
         a.recv().await;
@@ -1912,6 +1933,7 @@ mod tests {
             participant: pid(3),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         c.recv().await;
         a.recv().await;
@@ -1965,12 +1987,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
         b.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b.recv().await;
         a.recv().await;
@@ -1978,6 +2002,7 @@ mod tests {
             participant: pid(3),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         c.recv().await;
         a.recv().await;
@@ -2101,12 +2126,14 @@ mod tests {
             participant: pid(1),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         a.recv().await;
         b1.send(&SdpMessage::Join {
             participant: pid(2),
             room_id: "r".into(),
             display_name: None,
+            token: None,
         });
         b1.recv().await;
         a.recv().await;
@@ -2120,6 +2147,7 @@ mod tests {
             participant: pid(2),
             room_id: "r".into(),
             display_name: Some("Bob v2".into()),
+            token: None,
         });
         let ready = b2.recv().await;
         match &ready {
@@ -2395,6 +2423,7 @@ mod tests {
             participant: pid(3),
             room_id: "room1".into(),
             display_name: Some("bb".into()),
+            token: None,
         });
         let ready = b_new.recv().await;
         match ready {
@@ -2438,6 +2467,7 @@ mod tests {
             participant: pid(3),
             room_id: "room1".into(),
             display_name: Some("bb".into()),
+            token: None,
         });
         b_new.recv_skip_status().await;
 
@@ -2496,6 +2526,7 @@ mod tests {
             participant: pid(3),
             room_id: "room1".into(),
             display_name: Some("cc".into()),
+            token: None,
         });
         let ready = c.recv().await;
         match ready {

@@ -86,6 +86,7 @@ mod tests {
             participant: id_a,
             room_id: "room-1".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join");
@@ -94,6 +95,7 @@ mod tests {
             participant: id_b,
             room_id: "room-1".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join");
@@ -151,6 +153,7 @@ mod tests {
             participant: id_a,
             room_id: "room-ice".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join");
@@ -158,6 +161,7 @@ mod tests {
             participant: id_b,
             room_id: "room-ice".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join");
@@ -201,6 +205,7 @@ mod tests {
             participant: id_a,
             room_id: "room-leave".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join");
@@ -208,6 +213,7 @@ mod tests {
             participant: id_b,
             room_id: "room-leave".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join");
@@ -294,6 +300,7 @@ mod tests {
             participant: id_a,
             room_id: "alpha".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join alpha");
@@ -301,6 +308,7 @@ mod tests {
             participant: id_a,
             room_id: "beta".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join beta");
@@ -310,6 +318,7 @@ mod tests {
             participant: id_b,
             room_id: "alpha".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join alpha");
@@ -356,6 +365,7 @@ mod tests {
                 participant: id_b,
                 room_id: room.into(),
                 display_name: None,
+                token: None,
             })
             .await
             .expect("B join");
@@ -367,6 +377,7 @@ mod tests {
                 participant: id_a,
                 room_id: room.into(),
                 display_name: None,
+                token: None,
             })
             .await
             .expect("A join");
@@ -427,6 +438,7 @@ mod tests {
             participant: id_a,
             room_id: "init-room".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join");
@@ -447,6 +459,7 @@ mod tests {
             participant: id_b,
             room_id: "init-room".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join");
@@ -480,6 +493,7 @@ mod tests {
             participant: id_a,
             room_id: "alpha".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join alpha");
@@ -487,6 +501,7 @@ mod tests {
             participant: id_a,
             room_id: "beta".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join beta");
@@ -494,6 +509,7 @@ mod tests {
             participant: id_b,
             room_id: "alpha".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join alpha");
@@ -501,6 +517,7 @@ mod tests {
             participant: id_c,
             room_id: "beta".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("C join beta");
@@ -557,6 +574,7 @@ mod tests {
             participant: id_a,
             room_id: "screen-room".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("A join");
@@ -564,6 +582,7 @@ mod tests {
             participant: id_b,
             room_id: "screen-room".into(),
             display_name: None,
+            token: None,
         })
         .await
         .expect("B join");
