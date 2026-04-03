@@ -24,7 +24,6 @@ import {
   HEADER_CTR_LENGTH,
   E2EE_HEADER_LENGTH,
   TRAILER_LENGTH,
-  REPLAY_WINDOW_SIZE,
   initChainEntry,
   getEncryptionKey,
   getDecryptionKey,
@@ -126,7 +125,7 @@ async function encryptFrame(
 
     try {
       const ciphertext = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+        { name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: GCM_TAG_LENGTH },
         messageKey,
         payload,
       )
@@ -156,7 +155,7 @@ async function encryptFrame(
 async function decryptFrame(
   frame: RTCEncodedFrame,
   senderId: string,
-  isAudio: boolean,
+  _isAudio: boolean,
   controller: TransformStreamDefaultController<RTCEncodedFrame>,
 ) {
   const entries = senderChains.get(senderId)
@@ -218,7 +217,7 @@ async function decryptFrame(
         const iv = computeNonce(matchingEntry.baseSalt, ctr)
         try {
           const plaintext = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+            { name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: GCM_TAG_LENGTH },
             messageKey,
             ciphertext,
           )
@@ -245,7 +244,7 @@ async function decryptFrame(
             const iv = computeNonce(entry.baseSalt, ctr)
             try {
               const plaintext = await crypto.subtle.decrypt(
-                { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+                { name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer>, additionalData: aad as Uint8Array<ArrayBuffer>, tagLength: GCM_TAG_LENGTH },
                 cached,
                 ciphertext,
               )
