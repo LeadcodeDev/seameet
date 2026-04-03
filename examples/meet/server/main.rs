@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
-use seameet::sfu::{SfuConfig, SfuServer};
-use seameet::{run_connection, TransportListener, WsListener};
+use seameet::SeaMeetServer;
 use tracing::info;
 
 #[tokio::main]
@@ -16,23 +13,32 @@ async fn main() {
         )
         .init();
 
-    let config = SfuConfig {
-        udp_port: std::env::var("UDP_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10000),
-        public_ip: std::env::var("PUBLIC_IP").ok().and_then(|s| s.parse().ok()),
-        ..Default::default()
-    };
+    let udp_port = std::env::var("UDP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
 
-    let sfu = SfuServer::new(config).await.expect("SFU init");
-    let state = sfu.signaling_state();
+    let mut builder = SeaMeetServer::builder()
+        .ws_addr("0.0.0.0:3001")
+        .udp_port(udp_port);
 
-    let mut listener = WsListener::bind("0.0.0.0:3001").await.expect("bind WS");
-    info!("WS  → ws://localhost:3001");
-    info!("UDP → 0.0.0.0:{}", sfu.udp_local_addr().port());
-
-    while let Some(conn) = listener.accept().await {
-        tokio::spawn(run_connection(conn, Arc::clone(&state), Arc::clone(&sfu)));
+    if let Ok(ip) = std::env::var("PUBLIC_IP")
+        .and_then(|s| s.parse().map_err(|_| std::env::VarError::NotPresent))
+    {
+        builder = builder.public_ip(ip);
     }
+
+    let server = builder.build().await.expect("server init");
+
+    info!("WS  → ws://localhost:3001");
+    info!("UDP → 0.0.0.0:{}", server.udp_port());
+
+    let mut events = server.events();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            info!(?event);
+        }
+    });
+
+    server.run().await;
 }

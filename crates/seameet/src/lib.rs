@@ -101,6 +101,16 @@ pub use seameet_pipeline::{
 #[cfg(feature = "sfu")]
 pub use seameet_sfu as sfu;
 
+#[cfg(feature = "sfu")]
+pub mod server;
+#[cfg(feature = "sfu")]
+pub mod server_event;
+
+#[cfg(feature = "sfu")]
+pub use server::SeaMeetServer;
+#[cfg(feature = "sfu")]
+pub use server_event::ServerEvent;
+
 // ── High-level facade ───────────────────────────────────────────────────
 
 pub use room::{Room, RoomConfig, RoomHandle};
