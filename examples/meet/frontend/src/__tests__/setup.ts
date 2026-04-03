@@ -8,6 +8,10 @@ installMockWebSocket()
 installMockRTC()
 installMockMedia()
 
+// jsdom does not implement HTMLMediaElement.play() / pause()
+HTMLMediaElement.prototype.play = function () { return Promise.resolve() }
+HTMLMediaElement.prototype.pause = function () {}
+
 beforeEach(() => {
   resetMidCounter()
 })
