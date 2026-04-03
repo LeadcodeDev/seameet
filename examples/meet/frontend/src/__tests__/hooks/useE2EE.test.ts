@@ -81,12 +81,10 @@ describe('useE2EE', () => {
     expect(lastWorker).toBeNull()
   })
 
-  it('onPeerJoined broadcasts public key and rotates sender key', async () => {
+  it('onPeerJoined broadcasts public key (rotation deferred to key exchange)', async () => {
     const sig = createSignaling()
     const { result } = renderHook(() => useE2EE(defaultOptions({ signaling: sig as unknown as UseE2EEOptions['signaling'] })))
     await flushAsync()
-
-    const initialMsgCount = sig.sent.length
 
     await act(async () => {
       await result.current.onPeerJoined('peer-1')
@@ -97,9 +95,9 @@ describe('useE2EE', () => {
     const pubKeyMsgs = sig.sent.filter((m: any) => m.type === 'e2ee_public_key')
     expect(pubKeyMsgs.length).toBeGreaterThan(0)
 
-    // Should have set a new key in the worker (rotation)
+    // No rotation yet — only the initial setKey from mount
     const setKeys = lastWorker!.messages.filter(m => m.type === 'setKey')
-    expect(setKeys.length).toBeGreaterThanOrEqual(2) // initial + rotation
+    expect(setKeys.length).toBe(1) // initial only, rotation deferred
 
     // Peer state should exist
     expect(result.current.peerStates.has('peer-1')).toBe(true)

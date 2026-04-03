@@ -201,10 +201,53 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         keyId: 0,
         rawKey: senderKeyRawRef.current,
       })
+
+      // Derive shared secrets for any pubkeys received before keys were ready.
+      // The handleMessage callback stored them in peerPublicKeysRef but couldn't
+      // derive shared secrets because ecdhKeyPairRef was null at that point.
+      const pendingPeers: string[] = []
+      for (const [peerId, peerPubKey] of peerPublicKeysRef.current) {
+        if (sharedSecretsRef.current.has(peerId)) continue
+        const shared = await deriveSharedSecret(ecdhKeyPairRef.current.privateKey, peerPubKey)
+        sharedSecretsRef.current.set(peerId, shared)
+        const sn = await computeSafetyNumber(ecdhKeyPairRef.current.publicKey, peerPubKey)
+        safetyNumbersRef.current.set(peerId, sn)
+        pendingPeers.push(peerId)
+      }
+      updateSafetyNumbers()
+
+      // Broadcast public key. If not yet in the room (join not sent),
+      // the server will drop this — but onPeerJoined will re-broadcast
+      // when room_status arrives. If already in the room, this kicks off
+      // the key exchange with any peers waiting for our public key.
+      const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+      signalingRef.current.send({
+        type: 'e2ee_public_key',
+        from: participantId,
+        room_id: roomId,
+        public_key: pubKeyBase64,
+      } as SignalingMessage)
+
+      // Send our sender key to peers whose pubkeys arrived before init completed.
+      // Without this, the remote peer has our pubkey (and can send us their sender
+      // key) but never receives ours — causing asymmetric decryption failure.
+      for (const peerId of pendingPeers) {
+        const sharedSecret = sharedSecretsRef.current.get(peerId)
+        if (!sharedSecret || !senderKeyRawRef.current) continue
+        const encrypted = await encryptSenderKey(sharedSecret, senderKeyRawRef.current)
+        signalingRef.current.send({
+          type: 'e2ee_sender_key',
+          from: participantId,
+          to: peerId,
+          room_id: roomId,
+          encrypted_key: encrypted,
+          key_id: localKeyIdRef.current,
+        } as SignalingMessage)
+      }
     }
 
     init()
-  }, [enabled, participantId])
+  }, [enabled, participantId, roomId])
 
   // ── Send public key to room ────────────────────────────────────────
 
@@ -349,7 +392,14 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         // Reply with our own public key (they may not have it yet)
         await broadcastPublicKey()
 
-        // Send our sender key
+        // Send our current sender key immediately — no rotation here.
+        // Forward secrecy is already ensured: the new peer never had
+        // our previous sender key so they cannot decrypt historical
+        // frames. Rotating here would cause a race condition where one
+        // peer starts encrypting with the new key before the other has
+        // received it, leading to an asymmetric video freeze.
+        // Key rotation is handled by the DH ratchet (every 2 min) and
+        // on peer departure.
         await sendSenderKeyTo(senderId)
       }
     }
@@ -407,11 +457,12 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     if (!enabled) return
     peerStatesRef.current.set(peerId, { ready: false, keyId: -1 })
     updatePeerStates()
-    // Broadcast public key so the new peer can derive shared secret
+    // Broadcast public key so the new peer can derive shared secret.
+    // Sender key rotation is deferred to when we receive their e2ee_public_key,
+    // which confirms they actually use E2EE. Rotating here would cause a
+    // temporary video freeze for existing peers when a non-E2EE peer joins.
     await broadcastPublicKey()
-    // Rotate key so the new peer can't decrypt historical frames
-    await rotateSenderKey()
-  }, [enabled, broadcastPublicKey, rotateSenderKey, updatePeerStates])
+  }, [enabled, broadcastPublicKey, updatePeerStates])
 
   const onPeerLeft = useCallback(async (peerId: string) => {
     if (!enabled) return

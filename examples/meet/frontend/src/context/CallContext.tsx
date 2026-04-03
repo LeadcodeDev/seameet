@@ -223,7 +223,7 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     await webrtc.stopScreenShare()
   }, [media, webrtc])
 
-  // Track E2EE peer lifecycle via remotePeers changes
+  // Track E2EE peer lifecycle via remotePeers changes.
   const prevRemotePeerIdsRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     if (!e2ee.enabled) return
