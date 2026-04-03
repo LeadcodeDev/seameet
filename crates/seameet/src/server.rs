@@ -4,11 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use seameet_core::{ParticipantId, SeaMeetError};
+use seameet_sfu::{SfuConfig, SfuServer};
 use seameet_signaling::engine::{run_connection, SignalingHooks, SignalingState};
-use seameet_signaling::transport::TransportListener;
+use seameet_signaling::transport::{IncomingConnection, TransportListener};
 use seameet_signaling::ws_listener::WsListener;
 use seameet_signaling::SdpMessage;
-use seameet_sfu::{SfuConfig, SfuServer};
 use tokio::sync::{broadcast, RwLock};
 
 use crate::server_event::ServerEvent;
@@ -16,13 +16,25 @@ use crate::server_event::ServerEvent;
 // ── Closure type aliases ─────────────────────────────────────────────
 
 type AuthFn = Box<
-    dyn Fn(ParticipantId, String, Option<String>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+    dyn Fn(
+            ParticipantId,
+            String,
+            Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
 
-type RateCheckFn = Box<
-    dyn Fn(ParticipantId) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
+type RateCheckFn =
+    Box<dyn Fn(ParticipantId) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+type ConnectionFn = Arc<
+    dyn Fn(
+            IncomingConnection,
+            Arc<RwLock<SignalingState>>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
 >;
 
 // ── ClosureHooks<H> ─────────────────────────────────────────────────
@@ -50,7 +62,9 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
             let token_owned = token.map(|t| t.to_owned());
             f(participant, room_owned, token_owned).await
         } else {
-            self.inner.on_authenticate(participant, room_id, token).await
+            self.inner
+                .on_authenticate(participant, room_id, token)
+                .await
         };
 
         if let Err(ref reason) = result {
@@ -72,7 +86,9 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
         };
 
         if !allowed {
-            let _ = self.event_tx.send(ServerEvent::RateLimited { participant: pid });
+            let _ = self
+                .event_tx
+                .send(ServerEvent::RateLimited { participant: pid });
         }
 
         allowed
@@ -207,6 +223,7 @@ pub struct SeaMeetServerBuilder {
     max_room_id_len: Option<usize>,
     max_display_name_len: Option<usize>,
     event_capacity: usize,
+    connection_fn: Option<ConnectionFn>,
 }
 
 impl SeaMeetServerBuilder {
@@ -223,6 +240,7 @@ impl SeaMeetServerBuilder {
             max_room_id_len: None,
             max_display_name_len: None,
             event_capacity: 256,
+            connection_fn: None,
         }
     }
 
@@ -284,7 +302,9 @@ impl SeaMeetServerBuilder {
         F: Fn(ParticipantId, String, Option<String>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        self.auth_fn = Some(Box::new(move |pid, room, token| Box::pin(f(pid, room, token))));
+        self.auth_fn = Some(Box::new(move |pid, room, token| {
+            Box::pin(f(pid, room, token))
+        }));
         self
     }
 
@@ -294,6 +314,17 @@ impl SeaMeetServerBuilder {
         Fut: Future<Output = bool> + Send + 'static,
     {
         self.rate_fn = Some(Box::new(move |pid| Box::pin(f(pid))));
+        self
+    }
+
+    // ── Connection handler ─────────────────────────────────────────────
+
+    pub fn on_connection<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(IncomingConnection, Arc<RwLock<SignalingState>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.connection_fn = Some(Arc::new(move |conn, state| Box::pin(f(conn, state))));
         self
     }
 
@@ -324,24 +355,33 @@ impl SeaMeetServerBuilder {
             max_display_name_len: self.max_display_name_len,
         });
 
+        let connection_fn: ConnectionFn = match self.connection_fn {
+            Some(f) => f,
+            None => {
+                let hooks = Arc::clone(&hooks);
+                Arc::new(move |conn, state| {
+                    let hooks = Arc::clone(&hooks);
+                    Box::pin(async move { run_connection(conn, state, hooks).await })
+                })
+            }
+        };
+
         let listener = WsListener::bind(&self.ws_addr).await?;
 
         Ok(SeaMeetServer {
             listener,
             state,
-            hooks,
+            connection_fn,
             event_tx,
             udp_port,
         })
     }
 }
 
-// ── SeaMeetServer ────────────────────────────────────────────────────
-
 pub struct SeaMeetServer {
     listener: WsListener,
     state: Arc<RwLock<SignalingState>>,
-    hooks: Arc<ClosureHooks<SfuServer>>,
+    connection_fn: ConnectionFn,
     event_tx: broadcast::Sender<ServerEvent>,
     udp_port: u16,
 }
@@ -365,11 +405,10 @@ impl SeaMeetServer {
     /// listener is closed.
     pub async fn run(mut self) {
         while let Some(conn) = self.listener.accept().await {
-            tokio::spawn(run_connection(
-                conn,
-                Arc::clone(&self.state),
-                Arc::clone(&self.hooks),
-            ));
+            let handler = Arc::clone(&self.connection_fn);
+            let state = Arc::clone(&self.state);
+
+            tokio::spawn(async move { handler(conn, state).await });
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::env::{var, VarError};
+
 use seameet::SeaMeetServer;
 use tracing::info;
 
@@ -22,9 +24,7 @@ async fn main() {
         .ws_addr("0.0.0.0:3001")
         .udp_port(udp_port);
 
-    if let Ok(ip) = std::env::var("PUBLIC_IP")
-        .and_then(|s| s.parse().map_err(|_| std::env::VarError::NotPresent))
-    {
+    if let Ok(ip) = var("PUBLIC_IP").and_then(|s| s.parse().map_err(|_| VarError::NotPresent)) {
         builder = builder.public_ip(ip);
     }
 
