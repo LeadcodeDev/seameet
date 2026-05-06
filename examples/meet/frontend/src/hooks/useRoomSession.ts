@@ -112,8 +112,16 @@ export function useRoomSession(
     const httpBase = options.httpUrl ?? DEFAULT_HTTP_URL
     const url = `${httpBase}/rooms/${encodeURIComponent(roomId)}/participants`
     const dedupKey = `${roomId}|${displayName}|${attempt}`
-    const controller = new AbortController()
     let cancelled = false
+
+    // Important: do NOT abort the fetch on cleanup. Under React StrictMode
+    // the effect runs twice; both runs share the same in-flight Promise via
+    // `inFlightRef`. Aborting on first cleanup would reject the shared
+    // promise before the second mount can attach its handlers, leaving the
+    // UI stuck on `creating`. The `cancelled` flag below is enough to
+    // prevent stale state updates from a previous attempt; the request
+    // itself is allowed to complete and populate the session cache so the
+    // second mount's `readCached()` short-circuits.
 
     let promise = inFlightRef.current.get(dedupKey)
     if (!promise) {
@@ -126,7 +134,6 @@ export function useRoomSession(
           method: 'POST',
           headers,
           body: JSON.stringify({ display_name: displayName }),
-          signal: controller.signal,
         })
         if (!resp.ok) {
           let message = `HTTP ${resp.status}`
@@ -155,7 +162,6 @@ export function useRoomSession(
       })
       .catch((err: unknown) => {
         if (cancelled) return
-        if (err instanceof DOMException && err.name === 'AbortError') return
         const message = err instanceof Error ? err.message : 'unknown error'
         setError(message)
         setStatus('error')
@@ -166,7 +172,6 @@ export function useRoomSession(
 
     return () => {
       cancelled = true
-      controller.abort()
     }
     // We intentionally exclude options.authToken / options.httpUrl from
     // deps — changing those mid-room would just keep the existing session.
