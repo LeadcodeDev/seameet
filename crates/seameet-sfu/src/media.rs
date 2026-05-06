@@ -155,6 +155,7 @@ pub async fn run_media(
     let mut source_slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
     let mut last_pli = Instant::now();
     let mut last_bwe_notify = Instant::now();
+    let mut last_remote_peer_count: usize = 0;
     // Active speaker detection: exponential moving average of audio level per peer.
     let mut audio_levels: HashMap<ParticipantId, f32> = HashMap::new();
     let mut last_speaker_broadcast = Instant::now();
@@ -517,6 +518,31 @@ pub async fn run_media(
                                 "requested renegotiation for more slots"
                             );
                         }
+                        // When a new peer joins, force this peer's encoder to emit a
+                        // fresh keyframe. The new peer's PLI request may arrive before
+                        // its WebRTC is connected (so the resulting keyframe is dropped),
+                        // and source_keyframe_pending only retries for 3 s. Without this,
+                        // the first joiner's video can stay invisible to a late joiner.
+                        if remote_peer_count > last_remote_peer_count && media_started {
+                            if let Some(mid) = own_video_mid {
+                                let mut api = rtc.direct_api();
+                                if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                    rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                                    info!(
+                                        participant = %pid,
+                                        remote_peer_count,
+                                        "PLI on peer-count increase"
+                                    );
+                                }
+                            }
+                            if let Some(mid) = own_screen_mid {
+                                let mut api = rtc.direct_api();
+                                if let Some(rx) = api.stream_rx_by_mid(mid, None) {
+                                    rx.request_keyframe(str0m::media::KeyframeRequestKind::Pli);
+                                }
+                            }
+                        }
+                        last_remote_peer_count = remote_peer_count;
                     }
                     None => break,
                 }
