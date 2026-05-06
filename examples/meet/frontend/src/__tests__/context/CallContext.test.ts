@@ -235,4 +235,53 @@ describe('CallContext', () => {
 
     expect(hook.result.current.signalingState).toBe('open')
   })
+
+  it('reconnecting becomes true after the WS drops post-open', async () => {
+    const { hook, ws } = await setupCall()
+    expect(hook.result.current.signalingState).toBe('open')
+    expect(hook.result.current.reconnecting).toBe(false)
+
+    await act(async () => {
+      ws.close()
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.signalingState).not.toBe('open')
+    expect(hook.result.current.reconnecting).toBe(true)
+  })
+
+  it('inbound error 401 sets fatalError and purges the cached session', async () => {
+    sessionStorage.setItem(
+      'seameet-session:test-room:Alice',
+      JSON.stringify({ token: 'stale', participantId: 'p1' })
+    )
+
+    const { hook, ws } = await setupCall()
+    expect(hook.result.current.fatalError).toBeNull()
+
+    await act(async () => {
+      ws.serverPush({ type: 'error', code: 401, message: 'token expired' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token expired' })
+    expect(sessionStorage.getItem('seameet-session:test-room:Alice')).toBeNull()
+  })
+
+  it('inbound error 403 surfaces fatalError but keeps the session cache', async () => {
+    sessionStorage.setItem(
+      'seameet-session:test-room:Alice',
+      JSON.stringify({ token: 'still-valid', participantId: 'p1' })
+    )
+
+    const { hook, ws } = await setupCall()
+
+    await act(async () => {
+      ws.serverPush({ type: 'error', code: 403, message: 'e2ee_required' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.fatalError).toEqual({ code: 403, message: 'e2ee_required' })
+    expect(sessionStorage.getItem('seameet-session:test-room:Alice')).not.toBeNull()
+  })
 })

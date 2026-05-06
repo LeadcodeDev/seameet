@@ -8,10 +8,50 @@ import { ChatPanel } from '@/components/ChatPanel'
 import { useRoomSession } from '@/hooks/useRoomSession'
 
 function RoomContent() {
-  const { chatMessages, sendChatMessage, participantId, mediaError, roomId } = useCall()
+  const navigate = useNavigate()
+  const {
+    chatMessages,
+    sendChatMessage,
+    participantId,
+    mediaError,
+    roomId,
+    reconnecting,
+    fatalError,
+    leave,
+  } = useCall()
   const [chatOpen, setChatOpen] = useState(false)
 
   const toggleChat = useCallback(() => setChatOpen(prev => !prev), [])
+
+  // Token expired or auth was rejected — bounce back to the lobby so the
+  // session is re-minted from scratch with a fresh REST POST.
+  if (fatalError && fatalError.code === 401) {
+    return (
+      <div className="h-dvh flex items-center justify-center bg-background">
+        <div className="max-w-md w-full p-6 rounded-lg border bg-card text-card-foreground space-y-4 text-center">
+          <div className="text-lg font-medium text-destructive">
+            Session expirée
+          </div>
+          <div className="text-sm text-muted-foreground">
+            Votre jeton de session a expiré. Reconnectez-vous pour rejoindre la
+            room.
+          </div>
+          <div className="flex gap-2 justify-center">
+            <button
+              data-testid="btn-relogin"
+              className="px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
+              onClick={() => {
+                leave()
+                navigate(`/${roomId}`)
+              }}
+            >
+              Reconnexion
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="h-dvh flex flex-col">
@@ -19,6 +59,26 @@ function RoomContent() {
       {mediaError && (
         <div className="bg-destructive/10 border-b border-destructive/20 px-4 py-2 text-sm text-destructive">
           Camera/microphone unavailable: {mediaError}
+        </div>
+      )}
+
+      {/* Reconnect banner */}
+      {reconnecting && (
+        <div
+          data-testid="reconnect-banner"
+          className="bg-amber-500/10 border-b border-amber-500/30 px-4 py-2 text-sm text-amber-700 dark:text-amber-400 text-center"
+        >
+          Connexion perdue, tentative de reconnexion…
+        </div>
+      )}
+
+      {/* Other fatal signalling errors (403 e2ee_required, etc.) */}
+      {fatalError && fatalError.code !== 401 && (
+        <div
+          data-testid="fatal-error-banner"
+          className="bg-destructive/10 border-b border-destructive/20 px-4 py-2 text-sm text-destructive text-center"
+        >
+          Erreur {fatalError.code} : {fatalError.message}
         </div>
       )}
 

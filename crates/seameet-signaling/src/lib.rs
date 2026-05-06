@@ -665,6 +665,119 @@ mod tests {
         assert!(got_error, "expected 403 e2ee_required before deadline");
     }
 
+    /// Same participant reconnecting with a fresh WebSocket must not be
+    /// removed from the room by the original connection's cleanup path.
+    /// This is the M3 invariant: identity survives a transient WS drop.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_reconnect_preserves_room_membership() {
+        let url = start_server().await;
+        let id_a = ParticipantId::random();
+        let id_b = ParticipantId::random();
+
+        // Peer B joins and stays connected to observe A's reconnect.
+        let mut b = WsSignaling::connect(&url).await.expect("connect B");
+        b.send(SdpMessage::Join {
+            participant: id_b,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("B join");
+
+        // First A connection.
+        let a1 = WsSignaling::connect(&url).await.expect("connect A1");
+        a1.send(SdpMessage::Join {
+            participant: id_a,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("A1 join");
+
+        // Wait until B has observed A in the room before swapping connections.
+        let saw_a = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = b.recv().await.expect("recv on B");
+                if let SdpMessage::RoomStatus {
+                    room_id,
+                    participants,
+                    ..
+                } = &msg
+                {
+                    if room_id == "reconnect-room"
+                        && participants.iter().any(|p| p.id == id_a)
+                    {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B to see A1 join");
+        assert!(saw_a);
+
+        // Second A connection arrives before A1 closes — common during a
+        // brief network blip on mobile.
+        let a2 = WsSignaling::connect(&url).await.expect("connect A2");
+        a2.send(SdpMessage::Join {
+            participant: id_a,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("A2 join");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now drop the original connection. Its cleanup must detect that a
+        // newer generation has taken over and skip removing A from the room.
+        a1.close().await.expect("A1 close");
+        drop(a1);
+
+        // After A1's stale cleanup has had time to run, every subsequent
+        // RoomStatus that B receives MUST still contain A. We watch a
+        // window of ~500ms after the drop.
+        let result: Result<Result<(), &'static str>, _> =
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let msg = b.recv().await.expect("recv on B");
+                    if let SdpMessage::RoomStatus {
+                        room_id,
+                        participants,
+                        ..
+                    } = &msg
+                    {
+                        if room_id == "reconnect-room"
+                            && !participants.iter().any(|p| p.id == id_a)
+                        {
+                            return Err("A was removed from room after A1 closed");
+                        }
+                    }
+                }
+            })
+            .await;
+
+        if let Ok(Err(e)) = result {
+            panic!("{e}");
+        }
+        // `Err(timeout)` means we observed no "A missing" snapshot in the
+        // window — that's the success case.
+
+        // A2 should still be functional — send a message to verify.
+        a2.send(SdpMessage::Offer {
+            from: id_a,
+            to: None,
+            room_id: "reconnect-room".into(),
+            sdp: "v=0\r\n".into(),
+        })
+        .await
+        .expect("A2 still writable after A1 cleanup");
+    }
+
     /// A peer that publishes its E2EE public key inside the deadline keeps
     /// the connection alive past it.
     #[cfg(feature = "tungstenite")]
