@@ -48,6 +48,8 @@ pub(crate) struct ClosureHooks<H: SignalingHooks> {
     max_chat_history: Option<usize>,
     max_room_id_len: Option<usize>,
     max_display_name_len: Option<usize>,
+    require_e2ee: bool,
+    e2ee_join_timeout: Option<std::time::Duration>,
 }
 
 impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
@@ -178,6 +180,15 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
         self.max_display_name_len
             .unwrap_or_else(|| self.inner.max_display_name_len())
     }
+
+    fn require_e2ee(&self) -> bool {
+        self.require_e2ee
+    }
+
+    fn e2ee_join_timeout(&self) -> std::time::Duration {
+        self.e2ee_join_timeout
+            .unwrap_or_else(|| self.inner.e2ee_join_timeout())
+    }
 }
 
 // ── SeaMeetServerBuilder ─────────────────────────────────────────────
@@ -196,6 +207,8 @@ pub struct SeaMeetServerBuilder {
     max_display_name_len: Option<usize>,
     event_capacity: usize,
     connection_fn: Option<ConnectionFn>,
+    require_e2ee: bool,
+    e2ee_join_timeout: Option<std::time::Duration>,
 }
 
 impl SeaMeetServerBuilder {
@@ -214,6 +227,8 @@ impl SeaMeetServerBuilder {
             max_display_name_len: None,
             event_capacity: 256,
             connection_fn: None,
+            require_e2ee: false,
+            e2ee_join_timeout: None,
         }
     }
 
@@ -290,6 +305,23 @@ impl SeaMeetServerBuilder {
         self
     }
 
+    /// Require end-to-end encryption for every participant. When enabled,
+    /// the server enforces that each peer publishes an `e2ee_public_key`
+    /// within [`Self::e2ee_join_timeout`] of their `Join`. Peers that
+    /// miss the deadline are disconnected with `403 e2ee_required`.
+    pub fn require_e2ee(mut self, required: bool) -> Self {
+        self.require_e2ee = required;
+        self
+    }
+
+    /// Override the grace period peers have to publish their E2EE public
+    /// key after `Join`. Defaults to 5 seconds. Only consulted when
+    /// [`Self::require_e2ee`] is true.
+    pub fn e2ee_join_timeout(mut self, dur: std::time::Duration) -> Self {
+        self.e2ee_join_timeout = Some(dur);
+        self
+    }
+
     /// Explicitly opt out of authentication. Use this only for local
     /// development, tests, or trusted-network deployments.
     ///
@@ -341,6 +373,9 @@ impl SeaMeetServerBuilder {
 
         let sfu = SfuServer::new(sfu_config).await?;
         let state = sfu.signaling_state();
+        if self.require_e2ee {
+            state.write().await.set_e2ee_required(true);
+        }
         let udp_port = sfu.udp_local_addr().port();
 
         let (event_tx, _) = broadcast::channel::<ServerEvent>(self.event_capacity);
@@ -354,6 +389,8 @@ impl SeaMeetServerBuilder {
             max_chat_history: self.max_chat_history,
             max_room_id_len: self.max_room_id_len,
             max_display_name_len: self.max_display_name_len,
+            require_e2ee: self.require_e2ee,
+            e2ee_join_timeout: self.e2ee_join_timeout,
         });
 
         let connection_fn: ConnectionFn = match self.connection_fn {

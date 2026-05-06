@@ -118,7 +118,8 @@ async fn main() {
     // ── SFU builder ────────────────────────────────────────────────────
     let mut builder = SeaMeetServer::builder()
         .ws_addr("0.0.0.0:3001")
-        .udp_port(udp_port);
+        .udp_port(udp_port)
+        .require_e2ee(true);
 
     if let Ok(ip) = var("PUBLIC_IP").and_then(|s| s.parse().map_err(|_| VarError::NotPresent)) {
         builder = builder.public_ip(ip);

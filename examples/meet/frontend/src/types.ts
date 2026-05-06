@@ -26,6 +26,7 @@ export type SignalingMessage =
         screen_sharing: boolean;
         e2ee?: boolean;
       }>;
+      e2ee_required?: boolean;
     }
   | { type: 'e2ee_public_key'; from: string; room_id: string; public_key: string }
   | { type: 'e2ee_sender_key'; from: string; to: string; room_id: string; encrypted_key: string; key_id: number }

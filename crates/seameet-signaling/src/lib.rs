@@ -231,6 +231,7 @@ mod tests {
                 if let SdpMessage::RoomStatus {
                     room_id,
                     participants,
+                    ..
                 } = &msg
                 {
                     if room_id == "room-leave" && !participants.iter().any(|p| p.id == id_a) {
@@ -246,6 +247,7 @@ mod tests {
             SdpMessage::RoomStatus {
                 room_id,
                 participants,
+                ..
             } => {
                 assert_eq!(room_id, "room-leave");
                 assert!(
@@ -396,6 +398,7 @@ mod tests {
                 Ok(Ok(SdpMessage::RoomStatus {
                     room_id,
                     participants,
+                    ..
                 })) => {
                     if !participants.iter().any(|p| p.id == id_a) {
                         leave_rooms.insert(room_id);
@@ -604,6 +607,98 @@ mod tests {
                 assert_eq!(track_id, 99);
             }
             other => panic!("expected ScreenShareStarted, got {other:?}"),
+        }
+    }
+
+    /// Starts a server that requires E2EE with a short (200ms) deadline so
+    /// the test runs quickly. Returns the `ws://` URL.
+    #[cfg(feature = "tungstenite")]
+    async fn start_e2ee_server(timeout: Duration) -> String {
+        let server = RoomServer::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .require_e2ee(true)
+            .with_e2ee_join_timeout(timeout);
+        let addr = server.local_addr().expect("local_addr");
+        server.run();
+        format!("ws://{addr}")
+    }
+
+    /// A peer that joins but never publishes its E2EE public key must be
+    /// disconnected with a 403 `e2ee_required` error.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_e2ee_required_timeout_disconnects() {
+        let url = start_e2ee_server(Duration::from_millis(200)).await;
+        let id = ParticipantId::random();
+
+        let mut ws = WsSignaling::connect(&url).await.expect("connect");
+        ws.send(SdpMessage::Join {
+            participant: id,
+            room_id: "e2ee-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("join");
+
+        // Wait past the deadline. Expect an Error message from the server.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let mut got_error = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, ws.recv()).await {
+                Ok(Ok(SdpMessage::Error { code, message })) => {
+                    assert_eq!(code, 403);
+                    assert_eq!(message, "e2ee_required");
+                    got_error = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(got_error, "expected 403 e2ee_required before deadline");
+    }
+
+    /// A peer that publishes its E2EE public key inside the deadline keeps
+    /// the connection alive past it.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_e2ee_required_handshake_disarms_timer() {
+        let url = start_e2ee_server(Duration::from_millis(200)).await;
+        let id = ParticipantId::random();
+
+        let mut ws = WsSignaling::connect(&url).await.expect("connect");
+        ws.send(SdpMessage::Join {
+            participant: id,
+            room_id: "e2ee-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("join");
+
+        ws.send(SdpMessage::E2eePublicKey {
+            from: id,
+            room_id: "e2ee-room".into(),
+            public_key: "test-pubkey".into(),
+        })
+        .await
+        .expect("e2ee public key");
+
+        // Past the deadline, no Error should arrive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let res = tokio::time::timeout(Duration::from_millis(50), ws.recv()).await;
+        match res {
+            Ok(Ok(SdpMessage::Error { message, .. })) if message == "e2ee_required" => {
+                panic!("connection was killed despite publishing e2ee_public_key");
+            }
+            _ => {}
         }
     }
 }

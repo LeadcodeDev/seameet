@@ -183,6 +183,12 @@ pub enum SdpMessage {
         room_id: String,
         /// Status of every participant in the room.
         participants: Vec<ParticipantStatus>,
+        /// Server-side enforcement flag. When true, the SFU will disconnect
+        /// any participant that does not emit an `e2ee_public_key` within
+        /// the join window. Clients should refuse to render media for
+        /// peers without E2EE state when this is true.
+        #[serde(default)]
+        e2ee_required: bool,
     },
     /// E2EE: broadcasts a participant's ECDH public key to the room.
     E2eePublicKey {
@@ -529,6 +535,7 @@ mod tests {
                     e2ee: true,
                 },
             ],
+            e2ee_required: false,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("\"type\":\"room_status\""));
