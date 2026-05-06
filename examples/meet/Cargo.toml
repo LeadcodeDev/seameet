@@ -9,6 +9,14 @@ path = "server/main.rs"
 
 [dependencies]
 seameet             = { path = "../../crates/seameet", features = ["tungstenite", "sfu"] }
+seameet-core        = { path = "../../crates/seameet-core" }
 tokio               = { workspace = true }
 tracing             = { workspace = true }
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+uuid                = { workspace = true }
+axum                = "0.7"
+tower               = "0.5"
+tower-http          = { version = "0.6", features = ["trace", "cors"] }
+jsonwebtoken        = "9"

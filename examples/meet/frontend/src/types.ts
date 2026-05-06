@@ -1,5 +1,5 @@
 export type SignalingMessage =
-  | { type: 'join'; participant: string; room_id: string; display_name?: string }
+  | { type: 'join'; participant: string; room_id: string; display_name?: string; token?: string }
   | { type: 'leave'; participant: string; room_id: string }
   | { type: 'ready'; room_id: string; initiator: boolean; peers: string[]; display_names?: Record<string, string> }
   | { type: 'offer'; from: string; to: string | null; room_id: string; sdp: string }

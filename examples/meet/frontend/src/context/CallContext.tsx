@@ -40,13 +40,14 @@ interface CallProviderProps {
   participantId: string
   displayName: string
   roomId: string
+  sessionToken: string
   initialAudioEnabled?: boolean
   initialVideoEnabled?: boolean
   initialE2EEEnabled?: boolean
   children: ReactNode
 }
 
-export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
+export function CallProvider({ participantId, displayName, roomId, sessionToken, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -154,12 +155,12 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     if (signaling.state === 'open' && media.mediaReady && !joinedRef.current) {
       joinedRef.current = true
       console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)}`)
-      signaling.join(participantId, roomId, displayName)
+      signaling.join(participantId, roomId, displayName, sessionToken)
       // Signal current mute state (correct on first join and on reconnection)
       signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
       signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
     }
-  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName])
+  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName, sessionToken])
 
   // Reset joinedRef when signaling reconnects
   useEffect(() => {

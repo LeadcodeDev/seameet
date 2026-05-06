@@ -1,7 +1,9 @@
 import type { Page, Locator } from '@playwright/test'
 import { expect } from '@playwright/test'
+import { mockRoomSession } from './session'
 
 export async function joinRoom(page: Page, roomCode: string, displayName: string) {
+  await mockRoomSession(page)
   await page.goto('/')
   await page.fill('[data-testid="input-name"]', displayName)
   await page.fill('[data-testid="input-room-code"]', roomCode)
@@ -16,6 +18,7 @@ export async function joinRoomWithMedia(
   displayName: string,
   options: { camera?: boolean; mic?: boolean; e2ee?: boolean } = {}
 ) {
+  await mockRoomSession(page)
   await page.goto('/')
   await page.fill('[data-testid="input-name"]', displayName)
   await page.fill('[data-testid="input-room-code"]', roomCode)

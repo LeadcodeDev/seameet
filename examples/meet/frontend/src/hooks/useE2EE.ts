@@ -221,6 +221,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       // when room_status arrives. If already in the room, this kicks off
       // the key exchange with any peers waiting for our public key.
       const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+      console.log(`[E2EE][diag] init() broadcasting pubkey, pendingPeers=${pendingPeers.length}`)
       signalingRef.current.send({
         type: 'e2ee_public_key',
         from: participantId,
@@ -254,6 +255,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   const broadcastPublicKey = useCallback(async () => {
     if (!enabled || !ecdhKeyPairRef.current) return
     const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+    console.log(`[E2EE][diag] broadcastPublicKey from=${participantId.slice(0, 8)}`)
     signalingRef.current.send({
       type: 'e2ee_public_key',
       from: participantId,
@@ -267,9 +269,13 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   const sendSenderKeyTo = useCallback(async (peerId: string) => {
     const sharedSecret = sharedSecretsRef.current.get(peerId)
     const senderKeyRaw = senderKeyRawRef.current
-    if (!sharedSecret || !senderKeyRaw) return
+    if (!sharedSecret || !senderKeyRaw) {
+      console.warn(`[E2EE][diag] sendSenderKeyTo(${peerId.slice(0, 8)}) skipped — sharedSecret=${!!sharedSecret} senderKeyRaw=${!!senderKeyRaw}`)
+      return
+    }
 
     const encrypted = await encryptSenderKey(sharedSecret, senderKeyRaw)
+    console.log(`[E2EE][diag] sending sender key → ${peerId.slice(0, 8)}, keyId=${localKeyIdRef.current}, from=${participantId.slice(0, 8)}`)
     signalingRef.current.send({
       type: 'e2ee_sender_key',
       from: participantId,
