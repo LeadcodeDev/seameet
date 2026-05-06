@@ -282,6 +282,36 @@ impl SdpMessage {
             Self::Error { .. } => None,
         }
     }
+
+    /// Stable string tag for the variant — matches the `type` discriminator
+    /// produced by serde. Cheap to call, suitable for log fields.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Join { .. } => "join",
+            Self::Leave { .. } => "leave",
+            Self::Offer { .. } => "offer",
+            Self::Answer { .. } => "answer",
+            Self::IceCandidate { .. } => "ice_candidate",
+            Self::Ready { .. } => "ready",
+            Self::PeerJoined { .. } => "peer_joined",
+            Self::PeerLeft { .. } => "peer_left",
+            Self::ScreenShareStarted { .. } => "screen_share_started",
+            Self::ScreenShareStopped { .. } => "screen_share_stopped",
+            Self::MuteAudio { .. } => "mute_audio",
+            Self::UnmuteAudio { .. } => "unmute_audio",
+            Self::MuteVideo { .. } => "mute_video",
+            Self::UnmuteVideo { .. } => "unmute_video",
+            Self::VideoConfigChanged { .. } => "video_config_changed",
+            Self::RequestRenegotiation { .. } => "request_renegotiation",
+            Self::RoomStatus { .. } => "room_status",
+            Self::E2eePublicKey { .. } => "e2ee_public_key",
+            Self::E2eeSenderKey { .. } => "e2ee_sender_key",
+            Self::E2eeKeyRotation { .. } => "e2ee_key_rotation",
+            Self::ChatMessage { .. } => "chat_message",
+            Self::ActiveSpeaker { .. } => "active_speaker",
+            Self::Error { .. } => "error",
+        }
+    }
 }
 
 #[cfg(test)]

@@ -854,7 +854,7 @@ pub async fn run_connection<H: SignalingHooks>(
 
         // ── Rate limit check ───────────────────────────────────────────
         if !hooks.on_rate_check(pid).await {
-            warn!(participant = %pid, "rate limited");
+            warn!(participant = %pid, kind = sdp.kind(), "rate limited");
             continue;
         }
 

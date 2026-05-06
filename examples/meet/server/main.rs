@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::http::{router, AppState, AuthOutcome, AuthProvider};
 use crate::session::SessionState;
 
-const RATE_LIMIT_MSGS: u32 = 60;
+const RATE_LIMIT_MSGS: u32 = 200;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
 const PURGE_INTERVAL: Duration = Duration::from_secs(5);
 

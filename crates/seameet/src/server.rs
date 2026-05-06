@@ -128,10 +128,9 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
             _ => {}
         }
 
-        let message_type = message_type_name(sdp);
         let _ = self.event_tx.send(ServerEvent::MessageReceived {
             participant: pid,
-            message_type: message_type.to_owned(),
+            message_type: sdp.kind().to_owned(),
         });
 
         suppressed
@@ -178,34 +177,6 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
     fn max_display_name_len(&self) -> usize {
         self.max_display_name_len
             .unwrap_or_else(|| self.inner.max_display_name_len())
-    }
-}
-
-fn message_type_name(sdp: &SdpMessage) -> &'static str {
-    match sdp {
-        SdpMessage::Join { .. } => "join",
-        SdpMessage::Leave { .. } => "leave",
-        SdpMessage::Offer { .. } => "offer",
-        SdpMessage::Answer { .. } => "answer",
-        SdpMessage::IceCandidate { .. } => "ice_candidate",
-        SdpMessage::Ready { .. } => "ready",
-        SdpMessage::PeerJoined { .. } => "peer_joined",
-        SdpMessage::PeerLeft { .. } => "peer_left",
-        SdpMessage::ScreenShareStarted { .. } => "screen_share_started",
-        SdpMessage::ScreenShareStopped { .. } => "screen_share_stopped",
-        SdpMessage::MuteAudio { .. } => "mute_audio",
-        SdpMessage::UnmuteAudio { .. } => "unmute_audio",
-        SdpMessage::MuteVideo { .. } => "mute_video",
-        SdpMessage::UnmuteVideo { .. } => "unmute_video",
-        SdpMessage::VideoConfigChanged { .. } => "video_config_changed",
-        SdpMessage::RequestRenegotiation { .. } => "request_renegotiation",
-        SdpMessage::RoomStatus { .. } => "room_status",
-        SdpMessage::E2eePublicKey { .. } => "e2ee_public_key",
-        SdpMessage::E2eeSenderKey { .. } => "e2ee_sender_key",
-        SdpMessage::E2eeKeyRotation { .. } => "e2ee_key_rotation",
-        SdpMessage::ChatMessage { .. } => "chat_message",
-        SdpMessage::ActiveSpeaker { .. } => "active_speaker",
-        SdpMessage::Error { .. } => "error",
     }
 }
 
