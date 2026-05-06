@@ -24,6 +24,12 @@ interface CallContextValue {
   localScreenStream: MediaStream | null
   connectionState: RTCPeerConnectionState
   signalingState: 'connecting' | 'open' | 'closed'
+  /** True after the WebSocket has been open at least once and is now
+   *  re-establishing — used to render the "Reconnecting…" banner. */
+  reconnecting: boolean
+  /** Latest fatal signalling error from the SFU (e.g. 401 expired token,
+   *  403 e2ee_required). Null when none. */
+  fatalError: { code: number; message: string } | null
   leave: () => void
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, E2EEPeerState>
@@ -52,6 +58,8 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
   const joinedRef = useRef(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
+  const [fatalError, setFatalError] = useState<{ code: number; message: string } | null>(null)
+  const everOpenRef = useRef(false)
 
   // Ref-based message routing: useSignaling → useWebRTC
   const webrtcHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
@@ -95,6 +103,21 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
       // Handle active speaker
       if (msg.type === 'active_speaker') {
         setActiveSpeakerId(msg.speaker)
+        return
+      }
+      // Surface fatal signalling errors. 401 means the cached session token
+      // has expired or no longer matches the bound participant — purge it
+      // from sessionStorage so the next /room visit re-mints a fresh one.
+      if (msg.type === 'error') {
+        console.warn(`[CallContext] signaling error ${msg.code}: ${msg.message}`)
+        if (msg.code === 401) {
+          try {
+            sessionStorage.removeItem(`seameet-session:${roomId}:${displayName}`)
+          } catch {
+            // sessionStorage might be disabled — best-effort.
+          }
+        }
+        setFatalError({ code: msg.code, message: msg.message })
         return
       }
       webrtcHandlerRef.current(msg)
@@ -166,6 +189,9 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
   useEffect(() => {
     if (signaling.state === 'closed') {
       joinedRef.current = false
+    }
+    if (signaling.state === 'open') {
+      everOpenRef.current = true
     }
   }, [signaling.state])
 
@@ -300,6 +326,8 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
     localScreenStream: webrtc.localScreenStream,
     connectionState: webrtc.connectionState,
     signalingState: signaling.state,
+    reconnecting: everOpenRef.current && signaling.state !== 'open',
+    fatalError,
     leave,
     e2eeEnabled: e2ee.enabled,
     e2eePeerStates: e2ee.peerStates,
