@@ -260,8 +260,16 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
             key_id: result.keyId,
           } as SignalingMessage)
         } else {
-          // Fallback to plaintext if encryption fails
-          signaling.sendChatMessage(participantId, roomId, content, displayName)
+          console.error('[chat] encryption failed; message NOT sent (no plaintext fallback)')
+          const ts = Date.now()
+          setChatMessages(prev => [...prev, {
+            id: `__system-${ts}`,
+            from: '__system',
+            displayName: 'system',
+            content: 'Message non envoyé : échec du chiffrement E2EE.',
+            timestamp: ts,
+            system: true,
+          }])
         }
       })
     } else {
