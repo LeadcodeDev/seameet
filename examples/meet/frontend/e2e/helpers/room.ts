@@ -14,7 +14,7 @@ export async function joinRoomWithMedia(
   page: Page,
   roomCode: string,
   displayName: string,
-  options: { camera?: boolean; mic?: boolean } = {}
+  options: { camera?: boolean; mic?: boolean; e2ee?: boolean } = {}
 ) {
   await page.goto('/')
   await page.fill('[data-testid="input-name"]', displayName)
@@ -30,8 +30,27 @@ export async function joinRoomWithMedia(
     await page.click('[data-testid="lobby-toggle-mic"]')
   }
 
+  // E2EE defaults to OFF in lobby — toggle if requested ON
+  if (options.e2ee) {
+    await page.click('[data-testid="lobby-toggle-e2ee"]')
+  }
+
   await page.click('[data-testid="btn-join"]')
   await page.waitForURL(`**/room/${roomCode}`)
+}
+
+/** Join room with E2EE enabled, camera ON, mic OFF. */
+export async function joinRoomE2EE(
+  page: Page,
+  roomCode: string,
+  displayName: string,
+  options: { camera?: boolean; mic?: boolean } = {}
+) {
+  await joinRoomWithMedia(page, roomCode, displayName, {
+    camera: options.camera ?? true,
+    mic: options.mic ?? false,
+    e2ee: true,
+  })
 }
 
 /** Wait for a <video> element to have a real video stream (videoWidth > 0) */
@@ -134,4 +153,71 @@ export async function expectScreenShareVisible(page: Page, name: string, timeout
 export async function expectScreenShareGone(page: Page, name: string, timeout = 10_000) {
   const tile = getScreenShareTile(page, name)
   await expect(tile).toHaveCount(0, { timeout })
+}
+
+/** Read the actual <video> element size for a remote participant's tile. */
+export async function getRemoteVideoSize(
+  page: Page,
+  remoteName: string
+): Promise<{ width: number; height: number; muted: boolean | null }> {
+  return page.evaluate((name) => {
+    const tile = document.querySelector(`[data-testid="video-tile"][data-participant="${name}"]`)
+    if (!tile) return { width: 0, height: 0, muted: null }
+    const video = tile.querySelector('[data-testid="video-element"]') as HTMLVideoElement | null
+    if (!video) return { width: 0, height: 0, muted: null }
+    const stream = (video.srcObject as MediaStream | null) ?? null
+    const track = stream?.getVideoTracks()[0]
+    return {
+      width: video.videoWidth,
+      height: video.videoHeight,
+      muted: track ? track.muted : null,
+    }
+  }, remoteName)
+}
+
+/**
+ * Poll until the remote participant's <video> element has decoded a real frame
+ * (videoWidth > 0). The strongest signal that E2EE decryption + decoding works.
+ */
+export async function expectRemoteVideoPlaying(page: Page, remoteName: string, timeout = 20_000) {
+  await expect
+    .poll(
+      async () => {
+        const size = await getRemoteVideoSize(page, remoteName)
+        return size.width > 0 && size.height > 0
+      },
+      { timeout, message: `expected ${remoteName}'s remote video to start decoding on this page` }
+    )
+    .toBe(true)
+}
+
+/**
+ * Assert full-mesh video visibility: every viewer sees every other participant's
+ * decoded video. Use this for trio/quad/quint cross-checks.
+ */
+export async function expectFullMeshVideo(
+  participants: Array<{ page: Page; name: string }>,
+  timeout = 25_000
+) {
+  for (const viewer of participants) {
+    for (const subject of participants) {
+      if (viewer.name === subject.name) continue
+      await expectRemoteVideoPlaying(viewer.page, subject.name, timeout)
+    }
+  }
+}
+
+/**
+ * Measure time between "now" and the first decoded frame of remoteName on page.
+ * Returns elapsed milliseconds. Caller should call this immediately after the
+ * action that should produce the video (e.g. right after a late join).
+ */
+export async function measureTimeToVideo(
+  page: Page,
+  remoteName: string,
+  timeout = 10_000
+): Promise<number> {
+  const start = Date.now()
+  await expectRemoteVideoPlaying(page, remoteName, timeout)
+  return Date.now() - start
 }
