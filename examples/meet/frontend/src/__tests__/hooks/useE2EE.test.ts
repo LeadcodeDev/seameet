@@ -104,7 +104,7 @@ describe('useE2EE', () => {
     expect(result.current.peerStates.get('peer-1')!.ready).toBe(false)
   })
 
-  it('onPeerLeft removes peer state and rotates key', async () => {
+  it('onPeerLeft removes peer state without rotating the sender key', async () => {
     const sig = createSignaling()
     const { result } = renderHook(() => useE2EE(defaultOptions({ signaling: sig as unknown as UseE2EEOptions['signaling'] })))
     await flushAsync()
@@ -130,9 +130,10 @@ describe('useE2EE', () => {
     expect(removeKeys.length).toBe(1)
     expect(removeKeys[0].participantId).toBe('peer-1')
 
-    // Should have rotated key (new setKey)
+    // Forward secrecy is provided by the periodic DH ratchet, not by
+    // per-departure rotation. Leaving must NOT trigger a new setKey.
     const setKeysAfter = lastWorker!.messages.filter(m => m.type === 'setKey').length
-    expect(setKeysAfter).toBeGreaterThan(setKeysBefore)
+    expect(setKeysAfter).toBe(setKeysBefore)
   })
 
   it('encryptChat returns ciphertext when enabled', async () => {

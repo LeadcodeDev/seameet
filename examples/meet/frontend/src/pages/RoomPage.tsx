@@ -136,7 +136,7 @@ export default function RoomPage() {
         roomId={code}
         initialAudioEnabled={lobbyState?.micOn}
         initialVideoEnabled={lobbyState?.cameraOn}
-        initialE2EEEnabled={lobbyState?.e2eeOn}
+        initialE2EEEnabled={true}
       >
         <RoomContent />
       </CallProvider>

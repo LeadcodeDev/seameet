@@ -11,7 +11,7 @@ export async function joinRoom(page: Page, roomCode: string, displayName: string
   await page.waitForURL(`**/room/${roomCode}`)
 }
 
-/** Join room with camera/mic pre-configured from lobby */
+/** Join room with camera/mic pre-configured from lobby. E2EE is always on. */
 export async function joinRoomWithMedia(
   page: Page,
   roomCode: string,
@@ -33,16 +33,16 @@ export async function joinRoomWithMedia(
     await page.click('[data-testid="lobby-toggle-mic"]')
   }
 
-  // E2EE defaults to OFF in lobby — toggle if requested ON
-  if (options.e2ee) {
-    await page.click('[data-testid="lobby-toggle-e2ee"]')
-  }
+  // E2EE is mandatory server-side; the lobby toggle no longer exists.
+  // The `options.e2ee` flag is accepted for backward compatibility but
+  // has no effect — every join is encrypted.
+  void options.e2ee
 
   await page.click('[data-testid="btn-join"]')
   await page.waitForURL(`**/room/${roomCode}`)
 }
 
-/** Join room with E2EE enabled, camera ON, mic OFF. */
+/** Join room with camera ON, mic OFF. E2EE is always on. */
 export async function joinRoomE2EE(
   page: Page,
   roomCode: string,
@@ -52,7 +52,6 @@ export async function joinRoomE2EE(
   await joinRoomWithMedia(page, roomCode, displayName, {
     camera: options.camera ?? true,
     mic: options.mic ?? false,
-    e2ee: true,
   })
 }
 

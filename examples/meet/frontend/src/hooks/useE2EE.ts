@@ -286,38 +286,6 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     } as SignalingMessage)
   }, [participantId, roomId])
 
-  // ── Rotate sender key (generate new, distribute to all peers) ──────
-
-  const rotateSenderKey = useCallback(async () => {
-    if (!enabled || !senderKeyRawRef.current) return
-    const newKeyId = localKeyIdRef.current + 1
-    senderKeyRawRef.current = await generateSenderKey()
-    localKeyIdRef.current = newKeyId
-    setLocalKeyId(newKeyId)
-
-    // Update worker with new key
-    workerRef.current?.postMessage({
-      type: 'setKey',
-      participantId,
-      keyId: newKeyId,
-      rawKey: senderKeyRawRef.current,
-    })
-
-    // Purge old keys after a delay (allow in-transit frames)
-    setTimeout(() => {
-      workerRef.current?.postMessage({
-        type: 'purgeOldKeys',
-        participantId,
-        keepKeyId: newKeyId,
-      })
-    }, 5000)
-
-    // Send new key to all peers
-    for (const peerId of sharedSecretsRef.current.keys()) {
-      await sendSenderKeyTo(peerId)
-    }
-  }, [enabled, participantId, sendSenderKeyTo])
-
   // ── DH Ratchet (every 2 minutes) ─────────────────────────────────
   //
   // Provides Post-Compromise Security (PCS) by injecting fresh entropy.
@@ -483,9 +451,10 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     // Remove departed peer's keys from worker
     workerRef.current?.postMessage({ type: 'removeKeys', participantId: peerId })
 
-    // Rotate key so the departed peer can't decrypt future frames
-    await rotateSenderKey()
-  }, [enabled, rotateSenderKey, updatePeerStates, updateSafetyNumbers])
+    // No sender-key rotation on departure: the periodic DH ratchet (every 2
+    // minutes) provides forward secrecy without the per-departure freeze that
+    // hit existing peers when a tile left mid-call. See M2 in the spec.
+  }, [enabled, updatePeerStates, updateSafetyNumbers])
 
   // ── Chat encryption / decryption ──────────────────────────────────
 
