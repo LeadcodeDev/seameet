@@ -158,6 +158,8 @@ For production use, `SeaMeetServer` wraps the SFU into a ready-to-run server wit
 
 The builder exposes hooks for authentication, rate limiting, and custom connection handling. Server events (peer connect/disconnect, room create/destroy, auth rejection) are emitted on a broadcast channel.
 
+> **Authentication is required.** `build()` returns an error unless you call `on_authenticate(...)` or explicitly opt out for local development with `allow_unauthenticated_joins()` (which logs a loud warning at startup). See the [Security model](#security-model) section for the full picture.
+
 ```rust
 use seameet::SeaMeetServer;
 
@@ -231,6 +233,55 @@ Browser                   WsListener              SignalingEngine            Sfu
   │                          │                          │──────────────────────→│
 ```
 
+## Security model
+
+seameet is a **set of building blocks** for video conferencing — the binary and the crates ship with no opinion about your identity provider, your TLS termination, or your rate-limit policy. Every integrator must wire those in. This section makes the boundaries explicit so you don't ship something open by accident.
+
+### Threat model
+
+We assume four kinds of adversary and design accordingly:
+
+| Adversary | What they try | What seameet does about it | What you must do |
+|---|---|---|---|
+| External attacker | Join a room they don't own; flood the SFU. | `build()` refuses to start without an auth policy; `on_rate_check` hook available. | Implement `on_authenticate` (JWT, OAuth, …) and `on_rate_check`. Terminate TLS upstream. |
+| Malicious peer | Impersonate another participant, inject media frames. | E2EE AAD binds frames to a `sender_id` (cross-sender forgery fails). | Verify safety numbers out-of-band when the threat is real. |
+| Honest-but-curious SFU operator | Read media; build a social graph. | Media is E2EE (AES-256-GCM, ECDH P-256, HKDF ratchet). | Enable E2EE in the client. Understand metadata leakage (below). |
+| Compromised signaling / MITM | Substitute peers' E2EE public keys. | Safety numbers (SHA-256 of pinned public keys) computed client-side. | Surface safety numbers in your UI and require user verification for high-stakes calls. |
+
+### What E2EE protects — and what it doesn't
+
+**Protected:** audio frame contents, video frame contents (apart from codec headers), chat message contents (when E2EE is enabled).
+
+**Not protected** — the SFU operator can still observe:
+- the participant graph (who is in which room with whom);
+- presence and join/leave events;
+- per-frame size and inter-arrival timing (reveals voice activity, codec bitrate);
+- mute/unmute state, screen-share start/stop (sent in plaintext via signaling);
+- `display_name` (sent in plaintext on `chat_message` for UI rendering).
+
+### Known limits to document to your users
+
+- **Insider impersonation.** All peers in a room share the same symmetric `senderKey` per participant. A peer who obtains another peer's key (e.g. via a compromised endpoint) can encrypt frames that pass MAC validation. There is no per-frame signing key today; this is a deliberate design choice we may revisit.
+- **Key rotation grace window.** When a peer leaves, the rotation is best-effort with a 5-second window during which in-flight frames remain decryptable.
+- **No rotation on join.** A joining peer cannot decrypt past frames (they never had the old key) but is not given a fresh key generation; rotation happens on the regular DH ratchet (every 2 minutes) instead.
+- **E2EE is opt-in in the demo.** The lobby toggle defaults to off so first-time users can troubleshoot media issues without crypto in the way; flip the default before shipping to end users.
+
+## Production checklist
+
+Use this list before exposing seameet to anyone outside your local machine.
+
+- [ ] **Authentication.** Implement `on_authenticate` to verify a real token (JWT, OAuth introspection, your session store). Treat `allow_unauthenticated_joins()` as `--dangerous-dev-mode`.
+- [ ] **Rate limiting.** Implement `on_rate_check`. The example uses an in-memory token bucket that does not survive restarts and does not coordinate across instances — wire it to Redis or your existing limiter in production.
+- [ ] **TLS termination upstream.** seameet listens in plain `ws://`. Put nginx, Caddy, or your cloud load balancer in front and serve `wss://`. Forward the original client IP via `X-Forwarded-For` for your auth/rate-limit logic.
+- [ ] **CORS & origin validation.** Restrict the WebSocket Origin header at the reverse proxy.
+- [ ] **Bound the SDP / ICE size at the proxy.** seameet does not yet enforce a hard maximum on offer/answer payloads — cap WebSocket frame size in your proxy.
+- [ ] **Audit trail.** Subscribe to `server.events()` and ship the stream to your log aggregator. Track `AuthRejected`, `RateLimited`, `PeerConnected`, `RoomCreated`/`Destroyed` at minimum.
+- [ ] **Logging hygiene.** Set `RUST_LOG` to `info` or higher in production. Tokens may appear in `warn`-level logs when rejected; redact them in your log pipeline if you cannot lower the level.
+- [ ] **Public IP / NAT.** Set `PUBLIC_IP` if the host is behind NAT, or ICE will fail for some peers.
+- [ ] **Resource ceilings.** seameet enforces per-room limits (`max_room_members`, `max_chat_history`); plan a global ceiling on the number of rooms at the application layer.
+- [ ] **E2EE on by default** for end-user-facing deployments. The example's lobby toggle ships off — flip it.
+- [ ] **Safety-number UX.** Decide whether your users need to verify safety numbers and surface them prominently if so.
+
 ## Demo app
 
 A complete video-conferencing application lives in `examples/meet/` with a React + TypeScript frontend and the Rust SFU server.
@@ -264,11 +315,12 @@ docker run -p 5173:5173 seameet-frontend
 
 Environment variables for the server:
 
-| Variable    | Default                 | Description                                        |
-| ----------- | ----------------------- | -------------------------------------------------- |
-| `UDP_PORT`  | `10000`                 | UDP port for RTP media                             |
-| `PUBLIC_IP` | auto-detect             | Public IP for ICE candidates (required behind NAT) |
-| `RUST_LOG`  | `meet=debug,str0m=warn` | Log filter                                         |
+| Variable             | Default                | Description                                                                                  |
+| -------------------- | ---------------------- | -------------------------------------------------------------------------------------------- |
+| `UDP_PORT`           | `10000`                | UDP port for RTP media                                                                       |
+| `PUBLIC_IP`          | auto-detect            | Public IP for ICE candidates (required behind NAT)                                           |
+| `SEAMEET_AUTH_TOKEN` | unset                  | Shared-secret expected in the `Join` message. **If unset, the server starts in OPEN mode.**  |
+| `RUST_LOG`           | `meet=info,str0m=warn` | Log filter                                                                                   |
 
 ## Feature flags
 

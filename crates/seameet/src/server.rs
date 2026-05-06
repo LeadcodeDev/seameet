@@ -218,6 +218,7 @@ pub struct SeaMeetServerBuilder {
     bwe_kbps: Option<u32>,
     auth_fn: Option<AuthFn>,
     rate_fn: Option<RateCheckFn>,
+    allow_unauth_joins: bool,
     max_room_members: Option<usize>,
     max_chat_history: Option<usize>,
     max_room_id_len: Option<usize>,
@@ -235,6 +236,7 @@ impl SeaMeetServerBuilder {
             bwe_kbps: None,
             auth_fn: None,
             rate_fn: None,
+            allow_unauth_joins: false,
             max_room_members: None,
             max_chat_history: None,
             max_room_id_len: None,
@@ -317,6 +319,17 @@ impl SeaMeetServerBuilder {
         self
     }
 
+    /// Explicitly opt out of authentication. Use this only for local
+    /// development, tests, or trusted-network deployments.
+    ///
+    /// `build()` refuses to construct a server without either
+    /// `on_authenticate` or this opt-in, to avoid silently shipping
+    /// open rooms. When this flag is set, `build()` logs a loud warning.
+    pub fn allow_unauthenticated_joins(mut self) -> Self {
+        self.allow_unauth_joins = true;
+        self
+    }
+
     // ── Connection handler ─────────────────────────────────────────────
 
     pub fn on_connection<F, Fut>(mut self, f: F) -> Self
@@ -331,6 +344,23 @@ impl SeaMeetServerBuilder {
     // ── Build ────────────────────────────────────────────────────────
 
     pub async fn build(self) -> Result<SeaMeetServer, SeaMeetError> {
+        if self.auth_fn.is_none() && !self.allow_unauth_joins {
+            return Err(SeaMeetError::Signaling(
+                "no authentication policy configured: call \
+                 SeaMeetServerBuilder::on_authenticate(...) or, for local \
+                 development only, ::allow_unauthenticated_joins()"
+                    .to_owned(),
+            ));
+        }
+        if self.auth_fn.is_none() {
+            tracing::warn!(
+                ws_addr = %self.ws_addr,
+                "SeaMeetServer starting WITHOUT authentication \
+                 (allow_unauthenticated_joins). Any client can join any room. \
+                 Do not use this in production."
+            );
+        }
+
         let sfu_config = SfuConfig {
             udp_port: self.udp_port,
             public_ip: self.public_ip,

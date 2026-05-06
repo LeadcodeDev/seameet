@@ -9,6 +9,7 @@ export interface ChatMessage {
   content: string
   timestamp: number
   encrypted?: boolean
+  system?: boolean
 }
 
 interface ChatPanelProps {
@@ -56,6 +57,15 @@ export function ChatPanel({ messages, onSend, onClose, participantId }: ChatPane
           <p className="text-sm text-gray-500 text-center mt-8">No messages yet</p>
         )}
         {messages.map((msg) => {
+          if (msg.system) {
+            return (
+              <div key={msg.id} className="flex justify-center">
+                <span className="text-[11px] text-amber-400/80 italic px-2 py-1">
+                  {msg.content}
+                </span>
+              </div>
+            )
+          }
           const isOwn = msg.from === participantId
           return (
             <div key={msg.id} className={`flex flex-col ${isOwn ? 'items-end' : 'items-start'}`}>
