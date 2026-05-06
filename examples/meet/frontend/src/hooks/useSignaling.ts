@@ -10,7 +10,7 @@ export interface UseSignalingReturn {
   send: (msg: SignalingMessage) => void
   state: 'connecting' | 'open' | 'closed'
   close: () => void
-  join: (participantId: string, roomId: string, displayName?: string) => void
+  join: (participantId: string, roomId: string, displayName?: string, token?: string) => void
   sendOffer: (from: string, roomId: string, sdp: string) => void
   sendAnswer: (from: string, to: string, roomId: string, sdp: string) => void
   sendIceCandidate: (from: string, to: string, roomId: string, candidate: RTCIceCandidate) => void
@@ -98,12 +98,13 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
     }
   }, [])
 
-  const join = useCallback((participantId: string, roomId: string, displayName?: string) => {
+  const join = useCallback((participantId: string, roomId: string, displayName?: string, token?: string) => {
     send({
       type: 'join',
       participant: participantId,
       room_id: roomId,
       display_name: displayName,
+      token,
     })
   }, [send])
 
