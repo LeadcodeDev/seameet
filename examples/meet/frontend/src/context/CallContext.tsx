@@ -6,6 +6,7 @@ import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
 import { useE2EE, type E2EEPeerState } from '@/hooks/useE2EE'
 import type { ChatMessage } from '@/components/ChatPanel'
 import type { SignalingMessage } from '@/types'
+import { pushRecentSpeaker } from '@/lib/roomMode'
 
 interface CallContextValue {
   participantId: string
@@ -37,6 +38,10 @@ interface CallContextValue {
   chatMessages: ChatMessage[]
   sendChatMessage: (content: string) => void
   activeSpeakerId: string | null
+  /** Most-recent-first list of speakers, capped — used by VideoGrid to
+   *  decide who keeps live video when the room is too large to render
+   *  every tile. */
+  recentSpeakers: string[]
   mediaError: string | null
 }
 
@@ -58,6 +63,7 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
   const joinedRef = useRef(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
+  const [recentSpeakers, setRecentSpeakers] = useState<string[]>([])
   const [fatalError, setFatalError] = useState<{ code: number; message: string } | null>(null)
   const everOpenRef = useRef(false)
 
@@ -103,6 +109,7 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
       // Handle active speaker
       if (msg.type === 'active_speaker') {
         setActiveSpeakerId(msg.speaker)
+        setRecentSpeakers(prev => pushRecentSpeaker(prev, msg.speaker))
         return
       }
       // Surface fatal signalling errors. 401 means the cached session token
@@ -335,6 +342,7 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
     chatMessages,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,
+    recentSpeakers,
     mediaError: media.error,
   }
 
