@@ -17,6 +17,7 @@ export function VideoGrid() {
     activeSpeakerId,
     recentSpeakers,
     participantId,
+    verificationStatus,
   } = useCall()
 
   const peers = useMemo(() => Array.from(remotePeers.values()), [remotePeers])
@@ -69,6 +70,7 @@ export function VideoGrid() {
               videoEnabled={!e2eeEnabled && speakerPeer.e2ee ? false : !speakerPeer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(speakerPeer.id)?.ready}
               isActiveSpeaker
+              verification={verificationStatus(speakerPeer.id)}
             />
           ) : null}
         </div>
@@ -114,6 +116,7 @@ export function VideoGrid() {
                   audioEnabled={!peer.audioMuted}
                   videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
                   e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
+                  verification={verificationStatus(peer.id)}
                 />
               </div>
               {peer.screenStream && (
@@ -178,6 +181,7 @@ export function VideoGrid() {
               audioEnabled={!peer.audioMuted}
               videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
+              verification={verificationStatus(peer.id)}
             />
             {peer.screenStream && (
               <VideoTile
@@ -231,6 +235,7 @@ export function VideoGrid() {
               videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
               isActiveSpeaker={peer.id === activeSpeakerId}
+              verification={verificationStatus(peer.id)}
             />
             {peer.screenStream && (
               <VideoTile

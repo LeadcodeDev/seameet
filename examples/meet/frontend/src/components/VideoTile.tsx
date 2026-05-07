@@ -1,6 +1,8 @@
 import { useRef, useEffect, memo } from 'react'
-import { MicOff, ShieldCheck } from 'lucide-react'
+import { MicOff, ShieldCheck, AlertTriangle } from 'lucide-react'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+
+type VerificationStatus = 'unverified' | 'verified' | 'changed'
 
 interface VideoTileProps {
   stream: MediaStream | null
@@ -11,6 +13,7 @@ interface VideoTileProps {
   isScreenShare?: boolean
   e2eeActive?: boolean
   isActiveSpeaker?: boolean
+  verification?: VerificationStatus
 }
 
 function getInitials(name: string): string {
@@ -23,7 +26,7 @@ function getInitials(name: string): string {
     .toUpperCase()
 }
 
-export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker }: VideoTileProps) {
+export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker, verification }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -58,7 +61,8 @@ export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioE
       data-testid="video-tile"
       data-participant={name}
       data-video={showVideo ? 'on' : 'off'}
-      className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''} ${isActiveSpeaker ? 'ring-2 ring-green-500' : ''}`}
+      data-verification={verification ?? 'unverified'}
+      className={`relative rounded-lg overflow-hidden bg-[#3c4043] flex items-center justify-center ${isScreenShare ? 'ring-2 ring-blue-500/50' : ''} ${isActiveSpeaker ? 'ring-2 ring-green-500' : ''} ${verification === 'changed' ? 'ring-2 ring-red-500' : ''}`}
     >
       {/* Video element */}
       <video
@@ -86,10 +90,22 @@ export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioE
         </div>
       )}
 
-      {/* E2EE indicator */}
+      {/* E2EE indicator (becomes a verified-badge once the user has confirmed
+          the safety number; flips to a warning if it ever changes since). */}
       {e2eeActive && (
-        <div className="absolute top-2 left-2 bg-black/60 rounded-full p-1">
-          <ShieldCheck className="w-3 h-3 text-green-400" />
+        <div
+          data-testid="verification-indicator"
+          className={`absolute top-2 left-2 bg-black/60 rounded-full p-1 ${
+            verification === 'changed' ? 'ring-1 ring-red-500' : ''
+          }`}
+        >
+          {verification === 'changed' ? (
+            <AlertTriangle className="w-3 h-3 text-red-400" />
+          ) : (
+            <ShieldCheck
+              className={`w-3 h-3 ${verification === 'verified' ? 'text-emerald-300' : 'text-green-400'}`}
+            />
+          )}
         </div>
       )}
 
