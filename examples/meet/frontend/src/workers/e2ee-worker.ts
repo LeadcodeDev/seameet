@@ -66,6 +66,29 @@ const senderChains = new Map<string, ChainEntry[]>()
 const frameCounters = new Map<string, number>()
 const replayWindows = new Map<string, ReplayWindow>()
 
+// Fail-closed signaling: when the worker drops a frame because no key is yet
+// installed for a given participant, post `e2ee_not_ready` to the main thread
+// once per (operation, participantId) so the UI can render an overlay. The
+// notification re-arms when a setKey for that participant arrives, so that a
+// subsequent drop after key removal emits a new event.
+const notReadyNotified = new Set<string>()
+
+function notifyNotReady(operation: 'encrypt' | 'decrypt', participantId: string) {
+  const tag = `${operation}:${participantId}`
+  if (notReadyNotified.has(tag)) return
+  notReadyNotified.add(tag)
+  ;(self as unknown as Worker).postMessage({
+    type: 'e2ee_not_ready',
+    operation,
+    participantId,
+  })
+}
+
+function clearNotReady(participantId: string) {
+  notReadyNotified.delete(`encrypt:${participantId}`)
+  notReadyNotified.delete(`decrypt:${participantId}`)
+}
+
 // ── Per-participant mutex ─────────────────────────────────────────────
 // Audio and video TransformStreams share the same chain entry per participant.
 // Without serialization, their async transform() callbacks interleave at
@@ -91,7 +114,9 @@ async function encryptFrame(
 ) {
   const entries = senderChains.get(participantId)
   if (!entries || entries.length === 0) {
-    controller.enqueue(frame)
+    // Fail-closed: never emit a plaintext frame on the wire if our local
+    // sender key is not yet installed. Drop the frame and signal the UI.
+    notifyNotReady('encrypt', participantId)
     return
   }
 
@@ -144,8 +169,9 @@ async function encryptFrame(
       frame.data = output.buffer
       controller.enqueue(frame)
     } catch (e) {
-      console.error('[E2EE Worker] encrypt error:', e)
-      controller.enqueue(frame)
+      // Fail-closed: never emit plaintext on encrypt failure. Drop the frame.
+      console.error('[E2EE Worker] encrypt error (frame dropped):', e)
+      notifyNotReady('encrypt', participantId)
     }
   })
 }
@@ -162,7 +188,9 @@ async function decryptFrame(
   if (!entries || entries.length === 0) {
     // No key yet for this sender — drop the frame rather than passing
     // encrypted data to the decoder (which would corrupt its state and
-    // cause a permanent freeze even after the key arrives).
+    // cause a permanent freeze even after the key arrives). Notify the
+    // UI so it can render a "waiting for E2EE handshake" overlay.
+    notifyNotReady('decrypt', senderId)
     return
   }
 
@@ -324,6 +352,9 @@ self.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
     const entries = senderChains.get(msg.participantId) ?? []
     entries.push(entry)
     senderChains.set(msg.participantId, entries)
+    // Re-arm not-ready notifications: a future drop for this participant
+    // (e.g. after key removal) should emit a fresh signal.
+    clearNotReady(msg.participantId)
     console.log(`[E2EE Worker] setKey for ${msg.participantId.slice(0, 8)}, keyId=${msg.keyId} (KDF-chain, AES-256)`)
   }
 

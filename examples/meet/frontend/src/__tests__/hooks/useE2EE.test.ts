@@ -7,15 +7,26 @@ import { useE2EE, type UseE2EEOptions } from '@/hooks/useE2EE'
 class MockWorker {
   messages: Array<{ type: string; [key: string]: unknown }> = []
   onmessage: ((ev: MessageEvent) => void) | null = null
+  private listeners: Array<(ev: MessageEvent) => void> = []
 
   postMessage(data: unknown): void {
     this.messages.push(data as { type: string; [key: string]: unknown })
   }
 
   terminate(): void {}
-  addEventListener(): void {}
-  removeEventListener(): void {}
+  addEventListener(_type: string, listener: (ev: MessageEvent) => void): void {
+    this.listeners.push(listener)
+  }
+  removeEventListener(_type: string, listener: (ev: MessageEvent) => void): void {
+    this.listeners = this.listeners.filter(l => l !== listener)
+  }
   dispatchEvent(): boolean { return true }
+
+  /** Test helper: simulate the worker posting a message back to the main thread. */
+  emit(data: unknown): void {
+    const ev = { data } as MessageEvent
+    for (const l of this.listeners) l(ev)
+  }
 }
 
 let lastWorker: MockWorker | null = null
@@ -290,5 +301,76 @@ describe('useE2EE', () => {
     // request_keyframe should have been signaled to PLI the peer's encoder
     const pliMsg = sig.sent.find((m: any) => m.type === 'request_keyframe' && m.target === 'peer-1')
     expect(pliMsg).toBeDefined()
+  })
+
+  // M3 fail-closed: worker drops frames and posts e2ee_not_ready when no key
+  // is installed. The hook must surface that into `e2eeNotReady` and clear
+  // it when the corresponding key arrives.
+  it('surfaces e2ee_not_ready from the worker for a peer and clears it when sender key arrives', async () => {
+    const sig = createSignaling()
+    const { result } = renderHook(() => useE2EE(defaultOptions({
+      participantId: 'local-id',
+      signaling: sig as unknown as UseE2EEOptions['signaling'],
+    })))
+    await flushAsync()
+
+    expect(result.current.e2eeNotReady.peers.has('peer-x')).toBe(false)
+
+    await act(async () => {
+      lastWorker!.emit({
+        type: 'e2ee_not_ready',
+        operation: 'decrypt',
+        participantId: 'peer-x',
+      })
+    })
+    await flushAsync()
+
+    expect(result.current.e2eeNotReady.peers.has('peer-x')).toBe(true)
+
+    // Now simulate the peer's pubkey + sender_key handshake completing —
+    // the not-ready flag must clear.
+    const peerKeyPair = await crypto.subtle.generateKey(
+      { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'],
+    )
+    const localPubKeyMsg = sig.sent.find((m: any) => m.type === 'e2ee_public_key' && m.from === 'local-id') as any
+    const localPubKeyBytes = Uint8Array.from(atob(localPubKeyMsg.public_key), c => c.charCodeAt(0))
+    const localPubKey = await crypto.subtle.importKey(
+      'raw', localPubKeyBytes, { name: 'ECDH', namedCurve: 'P-256' }, true, [],
+    )
+    const peerSharedSecret = await crypto.subtle.deriveKey(
+      { name: 'ECDH', public: localPubKey }, peerKeyPair.privateKey,
+      { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'],
+    )
+    const fakeSenderKey = crypto.getRandomValues(new Uint8Array(32))
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const ct = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, tagLength: 128 }, peerSharedSecret, fakeSenderKey,
+    )
+    const packed = new Uint8Array(12 + ct.byteLength)
+    packed.set(iv, 0)
+    packed.set(new Uint8Array(ct), 12)
+    const encryptedSenderKey = btoa(String.fromCharCode(...packed))
+    const peerPubKeyRaw = new Uint8Array(await crypto.subtle.exportKey('raw', peerKeyPair.publicKey))
+    const peerPubKeyBase64 = btoa(String.fromCharCode(...peerPubKeyRaw))
+
+    await act(async () => {
+      await result.current.handleMessage({
+        type: 'e2ee_public_key',
+        from: 'peer-x',
+        room_id: 'room-1',
+        public_key: peerPubKeyBase64,
+      } as any)
+      await result.current.handleMessage({
+        type: 'e2ee_sender_key',
+        from: 'peer-x',
+        to: 'local-id',
+        room_id: 'room-1',
+        encrypted_key: encryptedSenderKey,
+        key_id: 0,
+      } as any)
+    })
+    await flushAsync()
+
+    expect(result.current.e2eeNotReady.peers.has('peer-x')).toBe(false)
   })
 })

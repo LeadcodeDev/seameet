@@ -37,6 +37,13 @@ export interface UseE2EEReturn {
   decryptChat: (from: string, ciphertext: string, keyId: number) => Promise<string | null>
   /** Per-peer safety numbers for identity verification (hex fingerprints). */
   safetyNumbers: Map<string, string>
+  /**
+   * Frames the worker had to drop because a key was not yet installed.
+   * `local` is true when our own outbound encryption was blocked (handshake
+   * not finished). `peers` lists peer IDs whose inbound frames we could not
+   * decrypt yet. The UI should render a "waiting for E2EE" overlay accordingly.
+   */
+  e2eeNotReady: { local: boolean; peers: Set<string> }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -163,6 +170,12 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   // in-flight e2ee_public_key handler from the same peer.
   const pendingSenderKeysRef = useRef<Map<string, Array<{ encrypted_key: string; key_id: number }>>>(new Map())
 
+  // Fail-closed reporting: tiles whose video frames the worker had to drop
+  // because no key is installed yet.
+  const [e2eeNotReady, setE2eeNotReady] = useState<{ local: boolean; peers: Set<string> }>(
+    () => ({ local: false, peers: new Set() }),
+  )
+
   const signalingRef = useRef(signaling)
   signalingRef.current = signaling
 
@@ -186,11 +199,34 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     const worker = new Worker(new URL('../workers/e2ee-worker.ts', import.meta.url), { type: 'module' })
     workerRef.current = worker
 
+    const onWorkerMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; operation?: 'encrypt' | 'decrypt'; participantId?: string }
+      if (data?.type !== 'e2ee_not_ready') return
+      const op = data.operation
+      const pid = data.participantId
+      if (!op || !pid) return
+      setE2eeNotReady(prev => {
+        if (op === 'encrypt' && pid === participantId) {
+          if (prev.local) return prev
+          return { ...prev, local: true }
+        }
+        if (op === 'decrypt') {
+          if (prev.peers.has(pid)) return prev
+          const peers = new Set(prev.peers)
+          peers.add(pid)
+          return { ...prev, peers }
+        }
+        return prev
+      })
+    }
+    worker.addEventListener('message', onWorkerMessage)
+
     return () => {
+      worker.removeEventListener('message', onWorkerMessage)
       worker.terminate()
       workerRef.current = null
     }
-  }, [enabled])
+  }, [enabled, participantId])
 
   // ── Key Generation on Mount ────────────────────────────────────────
   //
@@ -221,6 +257,10 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         keyId: 0,
         rawKey: senderKeyRawRef.current,
       })
+
+      // Local sender key is now installed — clear the fail-closed local flag
+      // so the UI removes any "E2EE not ready" overlay on our own tile.
+      setE2eeNotReady(prev => (prev.local ? { ...prev, local: false } : prev))
 
       keysReadyRef.current = true
       setKeysReady(true)
@@ -412,6 +452,14 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
 
       peerStatesRef.current.set(senderId, { ready: true, keyId })
       updatePeerStates()
+      // Sender key for this peer is now in the worker — clear the
+      // fail-closed overlay flag for this peer.
+      setE2eeNotReady(prev => {
+        if (!prev.peers.has(senderId)) return prev
+        const peers = new Set(prev.peers)
+        peers.delete(senderId)
+        return { ...prev, peers }
+      })
       console.log(`[E2EE] sender key received from ${senderId.slice(0, 8)}, keyId=${keyId}`)
 
       // Ask the SFU to PLI this peer's encoder. Until the worker had this
@@ -533,8 +581,15 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     sharedSecretsRef.current.delete(peerId)
     peerSenderKeysRef.current.delete(peerId)
     safetyNumbersRef.current.delete(peerId)
+    pendingSenderKeysRef.current.delete(peerId)
     updatePeerStates()
     updateSafetyNumbers()
+    setE2eeNotReady(prev => {
+      if (!prev.peers.has(peerId)) return prev
+      const peers = new Set(prev.peers)
+      peers.delete(peerId)
+      return { ...prev, peers }
+    })
 
     // Remove departed peer's keys from worker
     workerRef.current?.postMessage({ type: 'removeKeys', participantId: peerId })
@@ -600,5 +655,6 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     encryptChat,
     decryptChat,
     safetyNumbers,
+    e2eeNotReady,
   }
 }

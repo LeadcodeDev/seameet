@@ -36,6 +36,12 @@ interface CallContextValue {
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, E2EEPeerState>
   e2eeSafetyNumbers: Map<string, string>
+  /** Tiles whose video frames the worker is currently dropping because no
+   *  E2EE key is installed yet. `local` is true when our own outbound
+   *  encryption is blocked; `peers` lists peer ids whose inbound frames we
+   *  cannot decrypt yet. The UI renders a "waiting for E2EE" overlay on
+   *  matching tiles. */
+  e2eeNotReady: { local: boolean; peers: Set<string> }
   chatMessages: ChatMessage[]
   sendChatMessage: (content: string) => void
   activeSpeakerId: string | null
@@ -349,6 +355,7 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
     e2eeEnabled: e2ee.enabled,
     e2eePeerStates: e2ee.peerStates,
     e2eeSafetyNumbers: e2ee.safetyNumbers,
+    e2eeNotReady: e2ee.e2eeNotReady,
     chatMessages,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,
