@@ -1,18 +1,24 @@
+mod auth_jwks;
 mod http;
 mod session;
 
 use std::collections::HashMap;
 use std::env::{var, VarError};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use seameet::{ParticipantId, SeaMeetServer};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use uuid::Uuid;
 
+use crate::auth_jwks::{JwksAuth, JwksConfig, DEFAULT_PID_NAMESPACE};
 use crate::http::{router, AppState, AuthOutcome, AuthProvider};
 use crate::session::SessionState;
+
+const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 const RATE_LIMIT_MSGS: u32 = 200;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
@@ -31,6 +37,26 @@ impl AuthProvider for OpenAuth {
     ) -> AuthOutcome {
         AuthOutcome::Anonymous
     }
+}
+
+/// Build a JwksAuth from env vars if `SEAMEET_JWKS_URL`,
+/// `SEAMEET_OIDC_ISSUER`, and `SEAMEET_OIDC_AUDIENCE` are all set. Returns
+/// `None` when any required value is missing — the caller falls back to the
+/// shared-secret or open provider.
+fn build_jwks_auth() -> Option<JwksAuth> {
+    let jwks_url = var("SEAMEET_JWKS_URL").ok().filter(|s| !s.is_empty())?;
+    let issuer = var("SEAMEET_OIDC_ISSUER").ok().filter(|s| !s.is_empty())?;
+    let audience = var("SEAMEET_OIDC_AUDIENCE").ok().filter(|s| !s.is_empty())?;
+    let pid_namespace = var("SEAMEET_PID_NAMESPACE")
+        .ok()
+        .and_then(|s| Uuid::from_str(s.trim()).ok())
+        .unwrap_or(DEFAULT_PID_NAMESPACE);
+    Some(JwksAuth::new(JwksConfig {
+        issuer,
+        audience,
+        jwks_url,
+        pid_namespace,
+    }))
 }
 
 /// Shared-secret auth: the bearer token must match `SEAMEET_AUTH_TOKEN`.
@@ -101,17 +127,29 @@ async fn main() {
     let sessions = SessionState::new(&session_secret);
 
     // ── Auth provider selection ────────────────────────────────────────
-    let auth: Arc<dyn AuthProvider> = match var("SEAMEET_AUTH_TOKEN") {
-        Ok(expected) if !expected.is_empty() => {
-            info!("auth: shared-secret enabled via SEAMEET_AUTH_TOKEN");
-            Arc::new(SharedSecretAuth { expected })
-        }
-        _ => {
-            warn!(
-                "SEAMEET_AUTH_TOKEN not set; running in OPEN mode. \
-                 Do not expose this on a public network."
-            );
-            Arc::new(OpenAuth)
+    let auth: Arc<dyn AuthProvider> = if let Some(jwks_auth) = build_jwks_auth() {
+        info!(
+            issuer = %jwks_auth.config().issuer,
+            audience = %jwks_auth.config().audience,
+            jwks_url = %jwks_auth.config().jwks_url,
+            "auth: JWKS (OIDC) provider enabled",
+        );
+        let arc = Arc::new(jwks_auth);
+        Arc::clone(&arc).spawn_refresh_loop(JWKS_REFRESH_INTERVAL);
+        arc
+    } else {
+        match var("SEAMEET_AUTH_TOKEN") {
+            Ok(expected) if !expected.is_empty() => {
+                info!("auth: shared-secret enabled via SEAMEET_AUTH_TOKEN");
+                Arc::new(SharedSecretAuth { expected })
+            }
+            _ => {
+                warn!(
+                    "SEAMEET_AUTH_TOKEN not set; running in OPEN mode. \
+                     Do not expose this on a public network."
+                );
+                Arc::new(OpenAuth)
+            }
         }
     };
 
