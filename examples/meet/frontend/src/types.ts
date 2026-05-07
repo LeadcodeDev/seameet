@@ -15,6 +15,7 @@ export type SignalingMessage =
   | { type: 'unmute_video'; from: string; room_id: string }
   | { type: 'video_config_changed'; from: string; room_id: string; width: number; height: number; fps: number }
   | { type: 'request_renegotiation'; room_id: string; needed_slots: number }
+  | { type: 'request_keyframe'; from: string; target: string; room_id: string }
   | {
       type: 'room_status';
       room_id: string;
