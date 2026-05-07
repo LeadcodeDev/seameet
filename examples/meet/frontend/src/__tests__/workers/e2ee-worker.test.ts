@@ -11,6 +11,7 @@ import {
   getVP8UnencryptedBytes,
   getVP9UnencryptedBytes,
   MAX_SKIP,
+  MAX_INITIAL_SKIP,
   GCM_TAG_LENGTH,
   E2EE_HEADER_LENGTH,
   TRAILER_LENGTH,
@@ -116,16 +117,18 @@ describe('getDecryptionKey', () => {
     expect(entry.nextCtr).toBe(2)
   })
 
-  it('caches intermediaries for out-of-order (ctr > nextCtr)', async () => {
+  it('caches intermediaries for out-of-order (ctr > nextCtr) after catch-up', async () => {
     const rawKey = await generateRawKey()
     const entry = await initChainEntry(rawKey, 0)
-    // Skip to ctr=5 (nextCtr=1, skip 1,2,3,4)
+    // Establish baseline so the catch-up branch is no longer used.
+    await getDecryptionKey(entry, 1)
+    // Now skip to ctr=5 (nextCtr=2, skip 2,3,4)
     const key = await getDecryptionKey(entry, 5)
     expect(key).not.toBeNull()
     expect(entry.nextCtr).toBe(6)
-    // Intermediate keys 1-4 should be cached
-    expect(entry.skippedKeys.size).toBe(4)
-    expect(entry.skippedKeys.has(1)).toBe(true)
+    // Intermediate keys 2-4 should be cached
+    expect(entry.skippedKeys.size).toBe(3)
+    expect(entry.skippedKeys.has(2)).toBe(true)
     expect(entry.skippedKeys.has(4)).toBe(true)
   })
 
@@ -141,25 +144,50 @@ describe('getDecryptionKey', () => {
     expect(key).toBeNull()
   })
 
-  it('returns null when ctr - nextCtr > MAX_SKIP (DoS protection)', async () => {
+  it('first decryption catches up from large skip without caching', async () => {
+    // Late-joiner scenario: encryptor has been running for ~15s @ 30fps,
+    // so the first frame we decrypt has ctr ≈ 450 — well above MAX_SKIP.
     const rawKey = await generateRawKey()
     const entry = await initChainEntry(rawKey, 0)
-    const key = await getDecryptionKey(entry, MAX_SKIP + 2)
+    const target = MAX_SKIP + 200 // 456: legitimate "we just joined" gap
+    const key = await getDecryptionKey(entry, target)
+    expect(key).not.toBeNull()
+    expect(entry.nextCtr).toBe(target + 1)
+    // No caching during catch-up — those frames are already gone on the wire.
+    expect(entry.skippedKeys.size).toBe(0)
+    expect(entry.caughtUp).toBe(true)
+  })
+
+  it('catch-up still bounded by MAX_INITIAL_SKIP', async () => {
+    const rawKey = await generateRawKey()
+    const entry = await initChainEntry(rawKey, 0)
+    const key = await getDecryptionKey(entry, MAX_INITIAL_SKIP + 2)
     expect(key).toBeNull()
-    // Chain should not have advanced
     expect(entry.nextCtr).toBe(1)
+    expect(entry.caughtUp).toBe(false)
+  })
+
+  it('returns null when ctr - nextCtr > MAX_SKIP after catch-up (DoS protection)', async () => {
+    const rawKey = await generateRawKey()
+    const entry = await initChainEntry(rawKey, 0)
+    // Catch-up first so the strict MAX_SKIP rule applies thereafter.
+    await getDecryptionKey(entry, 1)
+    const key = await getDecryptionKey(entry, entry.nextCtr + MAX_SKIP + 2)
+    expect(key).toBeNull()
   })
 
   it('consumes cached key and removes it', async () => {
     const rawKey = await generateRawKey()
     const entry = await initChainEntry(rawKey, 0)
-    // Skip to 3, caching 1 and 2
+    // Catch-up to seed nextCtr without caching.
+    await getDecryptionKey(entry, 1)
+    // Skip to 3, caching 2.
     await getDecryptionKey(entry, 3)
-    expect(entry.skippedKeys.has(1)).toBe(true)
+    expect(entry.skippedKeys.has(2)).toBe(true)
 
-    const key = await getDecryptionKey(entry, 1)
+    const key = await getDecryptionKey(entry, 2)
     expect(key).not.toBeNull()
-    expect(entry.skippedKeys.has(1)).toBe(false)
+    expect(entry.skippedKeys.has(2)).toBe(false)
   })
 })
 
@@ -333,6 +361,7 @@ describe('constants', () => {
     expect(E2EE_HEADER_LENGTH).toBe(5)
     expect(TRAILER_LENGTH).toBe(1)
     expect(MAX_SKIP).toBe(256)
+    expect(MAX_INITIAL_SKIP).toBe(30_000)
     expect(REPLAY_WINDOW_SIZE).toBe(128)
   })
 })

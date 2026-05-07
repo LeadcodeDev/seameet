@@ -81,6 +81,7 @@ interface CallProviderProps {
 export function CallProvider({ participantId, displayName, roomId, authToken, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
+  const [joined, setJoined] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
   const [recentSpeakers, setRecentSpeakers] = useState<string[]>([])
@@ -151,6 +152,7 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
     participantId,
     roomId,
     signaling,
+    joined,
   })
 
   const verification = useVerification(e2ee.safetyNumbers)
@@ -205,6 +207,7 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
       // Signal current mute state (correct on first join and on reconnection)
       signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
       signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
+      setJoined(true)
     }
   }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName, authToken])
 
@@ -212,6 +215,7 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
   useEffect(() => {
     if (signaling.state === 'closed') {
       joinedRef.current = false
+      setJoined(false)
     }
     if (signaling.state === 'open') {
       everOpenRef.current = true

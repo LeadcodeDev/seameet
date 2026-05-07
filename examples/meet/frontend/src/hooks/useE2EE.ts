@@ -14,6 +14,11 @@ export interface UseE2EEOptions {
   participantId: string
   roomId: string
   signaling: UseSignalingReturn
+  /** True once the parent has sent its Join message to the SFU. The pubkey
+   *  broadcast is gated on this so the SFU has an active session when the
+   *  E2eePublicKey arrives — otherwise it is dropped and the e2ee_required
+   *  deadline (5s after Join) fires, kicking the participant. */
+  joined: boolean
 }
 
 export interface UseE2EEReturn {
@@ -145,7 +150,7 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 
 // ── Hook ───────────────────────────────────────────────────────────────
 
-export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOptions): UseE2EEReturn {
+export function useE2EE({ enabled, participantId, roomId, signaling, joined }: UseE2EEOptions): UseE2EEReturn {
   const workerRef = useRef<Worker | null>(null)
   const ecdhKeyPairRef = useRef<CryptoKeyPair | null>(null)
   const senderKeyRawRef = useRef<ArrayBuffer | null>(null)
@@ -280,6 +285,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   useEffect(() => {
     if (!enabled || !keysReady) return
     if (signaling.state !== 'open') return
+    if (!joined) return
     if (broadcastedRef.current) return
     broadcastedRef.current = true
 
@@ -333,7 +339,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     }
 
     broadcast()
-  }, [enabled, keysReady, signaling.state, participantId, roomId, updateSafetyNumbers])
+  }, [enabled, keysReady, signaling.state, joined, participantId, roomId, updateSafetyNumbers])
 
   // ── Send public key to room ────────────────────────────────────────
 
@@ -467,6 +473,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       // keyframe — which left a black tile until the SFU's 30s safety-net
       // PLI. A fresh keyframe now decodes immediately because the key is
       // present.
+      console.log(`[E2EE][diag] sending request_keyframe → ${senderId.slice(0, 8)}`)
       signalingRef.current.send({
         type: 'request_keyframe',
         from: participantId,
@@ -514,8 +521,12 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         // out-of-order on the wire).
         await drainPendingSenderKeys(senderId)
 
-        // Reply with our own public key (they may not have it yet)
-        await broadcastPublicKey()
+        // Do NOT broadcast our pubkey here. Our pubkey is broadcast on three
+        // explicit triggers: WS-open (broadcast effect), peer_joined
+        // (onPeerJoined), and DH ratchet. Auto-replying here creates an
+        // unbounded ping-pong: peer receives our reply → replies → we receive
+        // → reply → ... flooding signaling and tripping the SFU's
+        // e2ee_required deadline on Alice's side as the loop saturates.
 
         // Send our current sender key immediately — no rotation here.
         // Forward secrecy is already ensured: the new peer never had
@@ -559,7 +570,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         updatePeerStates()
       }
     }
-  }, [enabled, participantId, broadcastPublicKey, sendSenderKeyTo, processSenderKey, drainPendingSenderKeys, updatePeerStates, updateSafetyNumbers])
+  }, [enabled, participantId, sendSenderKeyTo, processSenderKey, drainPendingSenderKeys, updatePeerStates, updateSafetyNumbers])
 
   // ── Peer lifecycle callbacks ───────────────────────────────────────
 

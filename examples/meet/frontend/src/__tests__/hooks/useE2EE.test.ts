@@ -55,6 +55,7 @@ function defaultOptions(overrides?: Partial<UseE2EEOptions>): UseE2EEOptions {
     participantId: 'local-id',
     roomId: 'room-1',
     signaling: createSignaling() as unknown as UseE2EEOptions['signaling'],
+    joined: true,
     ...overrides,
   }
 }

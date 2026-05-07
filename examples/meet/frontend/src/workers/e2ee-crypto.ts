@@ -16,6 +16,12 @@ export interface ChainEntry {
   keyId: number
   /** Cached message keys for out-of-order frames (ctr → CryptoKey). */
   skippedKeys: Map<number, CryptoKey>
+  /** True once we have successfully derived a key for any ctr ≥ 1. While
+   *  false, the very first decryption is allowed to skip arbitrarily many
+   *  chain steps to catch up with an encryptor that has been running solo
+   *  before we joined. After the first successful catch-up, MAX_SKIP applies
+   *  again so a malicious peer cannot DoS us with a forged huge ctr. */
+  caughtUp: boolean
 }
 
 export interface ReplayWindow {
@@ -61,8 +67,16 @@ export async function initChainEntry(rawKey: ArrayBuffer, keyId: number): Promis
     baseSalt: new Uint8Array(saltBits),
     keyId,
     skippedKeys: new Map(),
+    caughtUp: false,
   }
 }
+
+/** Maximum chain steps allowed during the one-time catch-up that follows a
+ *  fresh setKey. ~30 000 covers ~16 minutes of solo encoding at 30 fps; the
+ *  DH ratchet (every 2 min) typically resets the chain well before we hit it.
+ *  HKDF-SHA256 stepping is cheap (~5 µs each), so the worst-case ~150 ms is
+ *  acceptable for a one-shot. */
+export const MAX_INITIAL_SKIP = 30_000
 
 export async function stepChain(chainKeyRaw: ArrayBuffer): Promise<{ messageKey: CryptoKey; nextChainKeyRaw: ArrayBuffer }> {
   const keyMaterial = await crypto.subtle.importKey('raw', chainKeyRaw, 'HKDF', false, ['deriveBits', 'deriveKey'])
@@ -95,6 +109,7 @@ export async function getDecryptionKey(entry: ChainEntry, targetCtr: number): Pr
   const cached = entry.skippedKeys.get(targetCtr)
   if (cached) {
     entry.skippedKeys.delete(targetCtr)
+    entry.caughtUp = true
     return cached
   }
 
@@ -103,6 +118,28 @@ export async function getDecryptionKey(entry: ChainEntry, targetCtr: number): Pr
   }
 
   const skip = targetCtr - entry.nextCtr
+  // First decryption after setKey is a catch-up: the encryptor may have been
+  // running long before we installed the key, so the legitimate skip can far
+  // exceed MAX_SKIP. The chain key is held only by participants who possess
+  // the original sender key, so stepping the chain forward in bulk is not a
+  // privilege escalation. We discard intermediate keys (no caching) since
+  // those frames are already gone.
+  if (!entry.caughtUp) {
+    if (skip > MAX_INITIAL_SKIP) {
+      return null
+    }
+    while (entry.nextCtr < targetCtr) {
+      const { nextChainKeyRaw } = await stepChain(entry.chainKeyRaw)
+      entry.chainKeyRaw = nextChainKeyRaw
+      entry.nextCtr++
+    }
+    const { messageKey, nextChainKeyRaw } = await stepChain(entry.chainKeyRaw)
+    entry.chainKeyRaw = nextChainKeyRaw
+    entry.nextCtr++
+    entry.caughtUp = true
+    return messageKey
+  }
+
   if (skip > MAX_SKIP) {
     return null
   }
