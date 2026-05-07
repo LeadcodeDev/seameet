@@ -12,6 +12,10 @@ interface VideoTileProps {
   videoEnabled: boolean
   isScreenShare?: boolean
   e2eeActive?: boolean
+  /** Worker is fail-closed dropping frames for this tile because no key is
+   *  installed yet (handshake in progress). Renders a "waiting for E2EE"
+   *  overlay so the user understands why the tile is dark. */
+  e2eeNotReady?: boolean
   isActiveSpeaker?: boolean
   verification?: VerificationStatus
 }
@@ -26,7 +30,7 @@ function getInitials(name: string): string {
     .toUpperCase()
 }
 
-export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, isActiveSpeaker, verification }: VideoTileProps) {
+export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, e2eeNotReady, isActiveSpeaker, verification }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
@@ -106,6 +110,17 @@ export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioE
               className={`w-3 h-3 ${verification === 'verified' ? 'text-emerald-300' : 'text-green-400'}`}
             />
           )}
+        </div>
+      )}
+
+      {/* Fail-closed E2EE overlay: rendered when the worker is dropping frames
+          because no key is installed yet for this participant. */}
+      {e2eeNotReady && !isScreenShare && (
+        <div
+          data-testid="e2ee-not-ready-overlay"
+          className="absolute inset-0 flex items-center justify-center bg-black/70 text-white text-xs px-3 text-center"
+        >
+          <span>Établissement de la session chiffrée…</span>
         </div>
       )}
 

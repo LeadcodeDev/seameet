@@ -14,6 +14,7 @@ export function VideoGrid() {
     localScreenStream,
     e2eeEnabled,
     e2eePeerStates,
+    e2eeNotReady,
     activeSpeakerId,
     recentSpeakers,
     participantId,
@@ -59,6 +60,7 @@ export function VideoGrid() {
               audioEnabled={audioEnabled}
               videoEnabled={videoEnabled}
               e2eeActive={e2eeEnabled}
+              e2eeNotReady={e2eeEnabled && e2eeNotReady.local}
               isActiveSpeaker
             />
           ) : speakerPeer ? (
@@ -69,6 +71,7 @@ export function VideoGrid() {
               audioEnabled={!speakerPeer.audioMuted}
               videoEnabled={!e2eeEnabled && speakerPeer.e2ee ? false : !speakerPeer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(speakerPeer.id)?.ready}
+              e2eeNotReady={e2eeEnabled && e2eeNotReady.peers.has(speakerPeer.id)}
               isActiveSpeaker
               verification={verificationStatus(speakerPeer.id)}
             />
@@ -87,6 +90,7 @@ export function VideoGrid() {
                 audioEnabled={audioEnabled}
                 videoEnabled={videoEnabled}
                 e2eeActive={e2eeEnabled}
+                e2eeNotReady={e2eeEnabled && e2eeNotReady.local}
               />
             </div>
           )}
@@ -116,6 +120,7 @@ export function VideoGrid() {
                   audioEnabled={!peer.audioMuted}
                   videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
                   e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
+                  e2eeNotReady={e2eeEnabled && e2eeNotReady.peers.has(peer.id)}
                   verification={verificationStatus(peer.id)}
                 />
               </div>
@@ -157,6 +162,7 @@ export function VideoGrid() {
           audioEnabled={audioEnabled}
           videoEnabled={videoEnabled}
           e2eeActive={e2eeEnabled}
+          e2eeNotReady={e2eeEnabled && e2eeNotReady.local}
         />
 
         {/* Local screen share */}
@@ -181,6 +187,7 @@ export function VideoGrid() {
               audioEnabled={!peer.audioMuted}
               videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
+              e2eeNotReady={e2eeEnabled && e2eeNotReady.peers.has(peer.id)}
               verification={verificationStatus(peer.id)}
             />
             {peer.screenStream && (
@@ -214,6 +221,7 @@ export function VideoGrid() {
           audioEnabled={audioEnabled}
           videoEnabled={videoEnabled}
           e2eeActive={e2eeEnabled}
+          e2eeNotReady={e2eeEnabled && e2eeNotReady.local}
         />
         {localScreenStream && (
           <VideoTile
@@ -234,6 +242,7 @@ export function VideoGrid() {
               audioEnabled={!peer.audioMuted}
               videoEnabled={!e2eeEnabled && peer.e2ee ? false : !peer.videoMuted}
               e2eeActive={e2eeEnabled && e2eePeerStates.get(peer.id)?.ready}
+              e2eeNotReady={e2eeEnabled && e2eeNotReady.peers.has(peer.id)}
               isActiveSpeaker={peer.id === activeSpeakerId}
               verification={verificationStatus(peer.id)}
             />
