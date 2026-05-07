@@ -60,14 +60,19 @@ interface CallProviderProps {
   participantId: string
   displayName: string
   roomId: string
-  sessionToken: string
+  /**
+   * Bearer credential the SFU's `on_authenticate` hook will see. In this
+   * example it's a stub from `lib/auth.ts::getAuthToken()`; in production
+   * pass whatever your IAM returns (typically a JWT).
+   */
+  authToken: string
   initialAudioEnabled?: boolean
   initialVideoEnabled?: boolean
   initialE2EEEnabled?: boolean
   children: ReactNode
 }
 
-export function CallProvider({ participantId, displayName, roomId, sessionToken, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
+export function CallProvider({ participantId, displayName, roomId, authToken, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -121,18 +126,12 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
         setRecentSpeakers(prev => pushRecentSpeaker(prev, msg.speaker))
         return
       }
-      // Surface fatal signalling errors. 401 means the cached session token
-      // has expired or no longer matches the bound participant — purge it
-      // from sessionStorage so the next /room visit re-mints a fresh one.
+      // Surface fatal signalling errors. 401 means the bearer was rejected
+      // by `on_authenticate` — the example only checks non-empty so we
+      // never see 401 in dev; integrators with a real IAM will, and should
+      // bounce the user back to their login flow.
       if (msg.type === 'error') {
         console.warn(`[CallContext] signaling error ${msg.code}: ${msg.message}`)
-        if (msg.code === 401) {
-          try {
-            sessionStorage.removeItem(`seameet-session:${roomId}:${displayName}`)
-          } catch {
-            // sessionStorage might be disabled — best-effort.
-          }
-        }
         setFatalError({ code: msg.code, message: msg.message })
         return
       }
@@ -196,12 +195,12 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
     if (signaling.state === 'open' && media.mediaReady && !joinedRef.current) {
       joinedRef.current = true
       console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)}`)
-      signaling.join(participantId, roomId, displayName, sessionToken)
+      signaling.join(participantId, roomId, displayName, authToken)
       // Signal current mute state (correct on first join and on reconnection)
       signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
       signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
     }
-  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName, sessionToken])
+  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName, authToken])
 
   // Reset joinedRef when signaling reconnects
   useEffect(() => {

@@ -36,7 +36,14 @@ function createWrapper(opts: WrapperOptions | string = {}) {
       { initialEntries: [`/room/${roomId}`] },
       createElement(
         CallProvider,
-        { participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled },
+        {
+          participantId,
+          displayName,
+          roomId,
+          authToken: 'test-token',
+          initialAudioEnabled,
+          initialVideoEnabled,
+        },
         children
       )
     )
@@ -250,30 +257,19 @@ describe('CallContext', () => {
     expect(hook.result.current.reconnecting).toBe(true)
   })
 
-  it('inbound error 401 sets fatalError and purges the cached session', async () => {
-    sessionStorage.setItem(
-      'seameet-session:test-room:Alice',
-      JSON.stringify({ token: 'stale', participantId: 'p1' })
-    )
-
+  it('inbound error 401 surfaces fatalError', async () => {
     const { hook, ws } = await setupCall()
     expect(hook.result.current.fatalError).toBeNull()
 
     await act(async () => {
-      ws.serverPush({ type: 'error', code: 401, message: 'token expired' })
+      ws.serverPush({ type: 'error', code: 401, message: 'token rejected' })
       await new Promise(resolve => setTimeout(resolve, 30))
     })
 
-    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token expired' })
-    expect(sessionStorage.getItem('seameet-session:test-room:Alice')).toBeNull()
+    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token rejected' })
   })
 
-  it('inbound error 403 surfaces fatalError but keeps the session cache', async () => {
-    sessionStorage.setItem(
-      'seameet-session:test-room:Alice',
-      JSON.stringify({ token: 'still-valid', participantId: 'p1' })
-    )
-
+  it('inbound error 403 surfaces fatalError', async () => {
     const { hook, ws } = await setupCall()
 
     await act(async () => {
@@ -282,6 +278,5 @@ describe('CallContext', () => {
     })
 
     expect(hook.result.current.fatalError).toEqual({ code: 403, message: 'e2ee_required' })
-    expect(sessionStorage.getItem('seameet-session:test-room:Alice')).not.toBeNull()
   })
 })

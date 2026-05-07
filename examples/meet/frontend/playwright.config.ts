@@ -21,10 +21,6 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
       env: {
-        // Must match SESSION_SECRET in e2e/helpers/session.ts so JWTs
-        // minted by the Playwright fetch mock validate against the
-        // backend's HMAC key.
-        SEAMEET_SESSION_SECRET: 'seameet-playwright-secret-32-bytes!',
         HTTP_ADDR: '0.0.0.0:3002',
       },
     },
