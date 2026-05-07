@@ -177,6 +177,18 @@ pub enum SdpMessage {
         /// Number of additional slots (audio+video pairs) needed.
         needed_slots: u32,
     },
+    /// Client → server: ask the SFU to PLI a specific peer's encoder so a fresh
+    /// keyframe is produced. Used by E2EE: a late joiner emits this after the
+    /// peer's sender key has been installed in its decryption worker, so the
+    /// next decoded keyframe is no longer dropped for "no key yet".
+    RequestKeyframe {
+        /// The participant making the request.
+        from: ParticipantId,
+        /// The participant whose encoder should produce a fresh keyframe.
+        target: ParticipantId,
+        /// The room this request belongs to.
+        room_id: String,
+    },
     /// Server-driven snapshot of all participants' media state in a room.
     RoomStatus {
         /// The room this status belongs to.
@@ -279,6 +291,7 @@ impl SdpMessage {
             | Self::UnmuteVideo { room_id, .. }
             | Self::VideoConfigChanged { room_id, .. }
             | Self::RequestRenegotiation { room_id, .. }
+            | Self::RequestKeyframe { room_id, .. }
             | Self::RoomStatus { room_id, .. }
             | Self::E2eePublicKey { room_id, .. }
             | Self::E2eeSenderKey { room_id, .. }
@@ -309,6 +322,7 @@ impl SdpMessage {
             Self::UnmuteVideo { .. } => "unmute_video",
             Self::VideoConfigChanged { .. } => "video_config_changed",
             Self::RequestRenegotiation { .. } => "request_renegotiation",
+            Self::RequestKeyframe { .. } => "request_keyframe",
             Self::RoomStatus { .. } => "room_status",
             Self::E2eePublicKey { .. } => "e2ee_public_key",
             Self::E2eeSenderKey { .. } => "e2ee_sender_key",
@@ -594,6 +608,21 @@ mod tests {
         let back: SdpMessage = serde_json::from_str(&json).expect("de");
         assert_eq!(back, msg);
         assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_request_keyframe_serde() {
+        let msg = SdpMessage::RequestKeyframe {
+            from: id_a(),
+            target: id_b(),
+            room_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"request_keyframe\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+        assert_eq!(msg.kind(), "request_keyframe");
     }
 
     #[test]

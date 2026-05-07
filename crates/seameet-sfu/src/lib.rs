@@ -345,6 +345,18 @@ impl SignalingHooks for SfuServer {
                 true
             }
 
+            SdpMessage::RequestKeyframe { target, .. } => {
+                // Honour the request only if both peers share a room: the
+                // requester's current room must contain the target.
+                if let Some(room_peers) = self.room_peers_for(&pid).await {
+                    let p = room_peers.read().await;
+                    if let Some(peer) = p.get(target) {
+                        let _ = peer.cmd_tx.send(PeerCmd::RequestKeyframe);
+                    }
+                }
+                true
+            }
+
             SdpMessage::ScreenShareStarted {
                 from,
                 room_id,
