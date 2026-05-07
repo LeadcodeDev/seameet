@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useParams, useLocation, Navigate, useNavigate } from 'react-router-dom'
 import { CallProvider, useCall } from '@/context/CallContext'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
@@ -6,6 +6,7 @@ import { VideoGrid } from '@/components/VideoGrid'
 import { ControlBar } from '@/components/ControlBar'
 import { ChatPanel } from '@/components/ChatPanel'
 import { useRoomSession } from '@/hooks/useRoomSession'
+import { getAuthToken } from '@/lib/auth'
 
 function RoomContent() {
   const navigate = useNavigate()
@@ -23,8 +24,9 @@ function RoomContent() {
 
   const toggleChat = useCallback(() => setChatOpen(prev => !prev), [])
 
-  // Token expired or auth was rejected — bounce back to the lobby so the
-  // session is re-minted from scratch with a fresh REST POST.
+  // Auth was rejected by the SFU's on_authenticate hook (e.g. an integrator
+  // wired a real IAM and the JWT is expired/invalid) — bounce back to the
+  // lobby so the user can re-auth with their IdP.
   if (fatalError && fatalError.code === 401) {
     return (
       <div className="h-dvh flex items-center justify-center bg-background">
@@ -33,8 +35,8 @@ function RoomContent() {
             Session expirée
           </div>
           <div className="text-sm text-muted-foreground">
-            Votre jeton de session a expiré. Reconnectez-vous pour rejoindre la
-            room.
+            Votre jeton d'authentification a été refusé. Reconnectez-vous
+            pour rejoindre la room.
           </div>
           <div className="flex gap-2 justify-center">
             <button
@@ -170,13 +172,30 @@ export default function RoomPage() {
     | { cameraOn?: boolean; micOn?: boolean; e2eeOn?: boolean }
     | null
 
-  const { session, status, error, retry } = useRoomSession(code, displayName ?? undefined)
+  const [authToken, setAuthToken] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    getAuthToken().then((t) => {
+      if (!cancelled) setAuthToken(t)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Gate the REST POST on authToken being ready: we want the
+  // Authorization header set on the very first request.
+  const { session, status, error, retry } = useRoomSession(
+    authToken ? code : undefined,
+    authToken ? displayName ?? undefined : undefined,
+    { authToken: authToken ?? undefined },
+  )
 
   if (!displayName || !code) {
     return <Navigate to="/" replace />
   }
 
-  if (status !== 'ready' || !session) {
+  if (!authToken || status !== 'ready' || !session) {
     return (
       <SessionGate
         status={status === 'ready' ? 'creating' : status}
@@ -191,7 +210,7 @@ export default function RoomPage() {
     <ErrorBoundary>
       <CallProvider
         participantId={session.participantId}
-        sessionToken={session.sessionToken}
+        authToken={authToken}
         displayName={displayName}
         roomId={code}
         initialAudioEnabled={lobbyState?.micOn}

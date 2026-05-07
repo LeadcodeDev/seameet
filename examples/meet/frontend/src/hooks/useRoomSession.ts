@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 
 /**
- * Server-issued session created by `POST /rooms/:room_id/participants`.
- * The `participantId` is authoritative — the client never invents it.
- * The `sessionToken` is a short-lived JWT that the WebSocket layer
- * presents to the SFU via the `Join` message to bind REST creation to
- * the WS connection.
+ * Server-issued participant identity created by
+ * `POST /rooms/:room_id/participants`. The `participantId` is authoritative
+ * — the client never invents it. The bearer token used for the HTTP call
+ * is also the one the WebSocket layer presents to the SFU's
+ * `on_authenticate` hook (see `useSignaling.join`).
  */
 export interface RoomSession {
   participantId: string
-  sessionToken: string
 }
 
 export type RoomSessionStatus = 'idle' | 'creating' | 'ready' | 'error'
@@ -24,11 +23,6 @@ export interface UseRoomSessionResult {
 const DEFAULT_HTTP_URL =
   import.meta.env.VITE_HTTP_URL ?? `http://${window.location.hostname}:3002`
 
-/**
- * Build the sessionStorage key for a (room, displayName) tuple. Caching
- * by display name as well prevents collisions if the same tab re-uses a
- * room code under different identities (rare, but cheap to be safe).
- */
 function cacheKey(roomId: string, displayName: string): string {
   return `seameet-session:${roomId}:${displayName}`
 }
@@ -38,10 +32,8 @@ function readCached(roomId: string, displayName: string): RoomSession | null {
     const raw = sessionStorage.getItem(cacheKey(roomId, displayName))
     if (!raw) return null
     const parsed = JSON.parse(raw) as RoomSession
-    if (typeof parsed.participantId !== 'string' || typeof parsed.sessionToken !== 'string') {
-      return null
-    }
-    return parsed
+    if (typeof parsed.participantId !== 'string') return null
+    return { participantId: parsed.participantId }
   } catch {
     return null
   }
@@ -58,19 +50,21 @@ function writeCached(roomId: string, displayName: string, session: RoomSession):
 interface CreateParticipantResponse {
   room: { id: string }
   participant: { id: string; display_name?: string | null }
-  session: { token: string }
 }
 
 /**
  * Creates a server-side participant for `roomId` via REST and returns the
- * resulting identity + session token. Caches the result in sessionStorage
- * keyed by (roomId, displayName) so a StrictMode remount (or a manual
- * page refresh within the tab) reuses the same identity instead of
- * minting a new one.
+ * resulting identity. Caches the participant id in sessionStorage keyed by
+ * (roomId, displayName) so a StrictMode remount (or a manual page refresh
+ * within the tab) reuses the same identity instead of minting a new one.
  *
  * The hook does NOT open the WebSocket — that's still `useSignaling`'s
  * job. Consumers should gate `useSignaling` (and the broader CallProvider)
  * on `status === 'ready'`.
+ *
+ * `authToken` is the bearer credential forwarded to the backend. Pass
+ * whatever your IAM returns; in this example it is a stub from
+ * `lib/auth.ts::getAuthToken()`.
  */
 export function useRoomSession(
   roomId: string | undefined,
@@ -99,7 +93,6 @@ export function useRoomSession(
       return
     }
 
-    // Already cached and loaded — nothing to do.
     const cached = readCached(roomId, displayName)
     if (cached) {
       setSession(cached)
@@ -113,15 +106,6 @@ export function useRoomSession(
     const url = `${httpBase}/rooms/${encodeURIComponent(roomId)}/participants`
     const dedupKey = `${roomId}|${displayName}|${attempt}`
     let cancelled = false
-
-    // Important: do NOT abort the fetch on cleanup. Under React StrictMode
-    // the effect runs twice; both runs share the same in-flight Promise via
-    // `inFlightRef`. Aborting on first cleanup would reject the shared
-    // promise before the second mount can attach its handlers, leaving the
-    // UI stuck on `creating`. The `cancelled` flag below is enough to
-    // prevent stale state updates from a previous attempt; the request
-    // itself is allowed to complete and populate the session cache so the
-    // second mount's `readCached()` short-circuits.
 
     let promise = inFlightRef.current.get(dedupKey)
     if (!promise) {
@@ -144,10 +128,7 @@ export function useRoomSession(
           throw new Error(message)
         }
         const data = (await resp.json()) as CreateParticipantResponse
-        const next: RoomSession = {
-          participantId: data.participant.id,
-          sessionToken: data.session.token,
-        }
+        const next: RoomSession = { participantId: data.participant.id }
         writeCached(roomId, displayName, next)
         return next
       })()

@@ -1,13 +1,12 @@
 mod auth_jwks;
 mod http;
-mod session;
 
 use std::collections::HashMap;
 use std::env::{var, VarError};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use seameet::{ParticipantId, SeaMeetServer};
 use tokio::sync::RwLock;
@@ -16,13 +15,11 @@ use uuid::Uuid;
 
 use crate::auth_jwks::{JwksAuth, JwksConfig, DEFAULT_PID_NAMESPACE};
 use crate::http::{router, AppState, AuthOutcome, AuthProvider};
-use crate::session::SessionState;
 
 const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 const RATE_LIMIT_MSGS: u32 = 200;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
-const PURGE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Permissive provider for development: every request is accepted as
 /// anonymous, the server mints a random ParticipantId.
@@ -102,30 +99,6 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "0.0.0.0:3002".parse().unwrap());
 
-    // ── Session state (shared between HTTP and WS auth) ────────────────
-    let session_secret = match var("SEAMEET_SESSION_SECRET") {
-        Ok(s) if s.len() >= 32 => s.into_bytes(),
-        Ok(_) => {
-            panic!("SEAMEET_SESSION_SECRET must be at least 32 bytes");
-        }
-        Err(_) => {
-            warn!(
-                "SEAMEET_SESSION_SECRET not set; generating a random secret. \
-                 Tokens will be invalidated on every restart."
-            );
-            let nanos = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let mut secret = vec![0u8; 32];
-            for (i, b) in secret.iter_mut().enumerate() {
-                *b = ((nanos.wrapping_mul((i as u32) + 1)) ^ 0xA5) as u8;
-            }
-            secret
-        }
-    };
-    let sessions = SessionState::new(&session_secret);
-
     // ── Auth provider selection ────────────────────────────────────────
     let auth: Arc<dyn AuthProvider> = if let Some(jwks_auth) = build_jwks_auth() {
         info!(
@@ -163,18 +136,21 @@ async fn main() {
         builder = builder.public_ip(ip);
     }
 
-    // The WS auth hook validates the session token issued by the HTTP layer
-    // and confirms it matches the `Join` payload. This is what binds REST
-    // creation to WebSocket connection — no client can forge a Join.
-    let sessions_for_ws = sessions.clone();
-    builder = builder.on_authenticate(move |pid, room_id, token| {
-        let sessions = sessions_for_ws.clone();
-        async move {
-            let token = token.ok_or_else(|| "missing session token".to_owned())?;
-            sessions
-                .consume(&token, pid, &room_id)
-                .await
-                .map_err(|e| e.to_owned())
+    // The WS auth hook receives the bearer token sent by the client in the
+    // `Join` payload. THIS IS WHERE INTEGRATORS PLUG THEIR IAM.
+    //
+    // In a real deployment, the body of this closure should decode and
+    // verify the JWT signature against your IdP's JWKS, check `iss`/`aud`/
+    // `exp`, and confirm the `sub` claim resolves to the `pid` parameter.
+    // The `JwksAuth` provider in `auth_jwks.rs` shows one such pattern.
+    //
+    // In this example we simply accept any non-empty token. The contract
+    // we still demonstrate: the client MUST send a token. If it doesn't,
+    // the join is rejected — that's the integration point you can't skip.
+    builder = builder.on_authenticate(|_pid, _room_id, token| async move {
+        match token {
+            Some(t) if !t.is_empty() => Ok(()),
+            _ => Err("missing token".to_owned()),
         }
     });
 
@@ -200,17 +176,6 @@ async fn main() {
     info!("WS   → ws://0.0.0.0:3001  (terminate TLS upstream in production)");
     info!("UDP  → 0.0.0.0:{}", server.udp_port());
 
-    // ── Background: pending purge ──────────────────────────────────────
-    let sessions_for_purge = sessions.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(PURGE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            sessions_for_purge.purge_expired().await;
-        }
-    });
-
     // ── Background: SFU events ─────────────────────────────────────────
     let mut events = server.events();
     tokio::spawn(async move {
@@ -220,10 +185,7 @@ async fn main() {
     });
 
     // ── HTTP server ────────────────────────────────────────────────────
-    let app = router(AppState {
-        sessions: sessions.clone(),
-        auth: auth.clone(),
-    });
+    let app = router(AppState { auth: auth.clone() });
     let listener = tokio::net::TcpListener::bind(http_addr)
         .await
         .expect("HTTP bind");

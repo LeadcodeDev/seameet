@@ -13,8 +13,6 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::session::SessionState;
-
 const MAX_ROOM_ID_LEN: usize = 64;
 const MAX_DISPLAY_NAME_LEN: usize = 64;
 
@@ -46,7 +44,6 @@ pub enum AuthOutcome {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub sessions: SessionState,
     pub auth: Arc<dyn AuthProvider>,
 }
 
@@ -59,7 +56,6 @@ pub struct CreateParticipantBody {
 pub struct CreateParticipantResponse {
     pub room: RoomDto,
     pub participant: ParticipantDto,
-    pub session: SessionDto,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,11 +67,6 @@ pub struct RoomDto {
 pub struct ParticipantDto {
     pub id: ParticipantId,
     pub display_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionDto {
-    pub token: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -91,6 +82,11 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Mints a participant identity for `room_id`. The bearer token (if any)
+/// is forwarded to the configured `AuthProvider` for validation. The
+/// **same** bearer should then be sent by the client in the subsequent
+/// WebSocket `Join` message — the SFU's `on_authenticate` hook will see it
+/// there. The HTTP layer no longer issues its own session token.
 async fn create_participant(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
@@ -128,22 +124,6 @@ async fn create_participant(
         }
     };
 
-    let token = match state
-        .sessions
-        .create_session(pid, room_id.clone(), display_name.clone())
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(error = %e, "failed to mint session token");
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "session_error",
-                "could not mint session",
-            );
-        }
-    };
-
     info!(participant = %pid, room = %room_id, "participant created");
 
     let body = CreateParticipantResponse {
@@ -152,7 +132,6 @@ async fn create_participant(
             id: pid,
             display_name,
         },
-        session: SessionDto { token },
     };
     (StatusCode::CREATED, Json(body)).into_response()
 }
