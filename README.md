@@ -343,3 +343,5 @@ seameet = { version = "0.1", features = ["sfu"] }
 # With native codecs
 seameet = { version = "0.1", features = ["sfu", "opus-ffi", "vp8-ffi"] }
 ```
+
+claude --resume "seameet-security-audit"
