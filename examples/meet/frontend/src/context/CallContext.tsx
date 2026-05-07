@@ -7,6 +7,7 @@ import { useE2EE, type E2EEPeerState } from '@/hooks/useE2EE'
 import type { ChatMessage } from '@/components/ChatPanel'
 import type { SignalingMessage } from '@/types'
 import { pushRecentSpeaker } from '@/lib/roomMode'
+import { useVerification, type VerificationStatus } from '@/hooks/useVerification'
 
 interface CallContextValue {
   participantId: string
@@ -42,6 +43,14 @@ interface CallContextValue {
    *  decide who keeps live video when the room is too large to render
    *  every tile. */
   recentSpeakers: string[]
+  /** Per-peer verification status (session-scoped). Drives the "verified"
+   *  shield on tiles and the verify button in the safety-number panel. */
+  verificationStatus: (peerId: string) => VerificationStatus
+  /** Mark a peer as verified. The current safety number is snapshotted; if
+   *  it ever changes mid-session the status flips to 'changed'. */
+  markPeerVerified: (peerId: string) => void
+  /** Clear a peer's verification flag (manual revoke / dismiss warning). */
+  clearPeerVerification: (peerId: string) => void
   mediaError: string | null
 }
 
@@ -138,6 +147,8 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
     roomId,
     signaling,
   })
+
+  const verification = useVerification(e2ee.safetyNumbers)
 
   // Ref for e2ee handler to avoid stale closures
   const e2eeHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
@@ -343,6 +354,9 @@ export function CallProvider({ participantId, displayName, roomId, sessionToken,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,
     recentSpeakers,
+    verificationStatus: verification.status,
+    markPeerVerified: verification.markVerified,
+    clearPeerVerification: verification.clear,
     mediaError: media.error,
   }
 

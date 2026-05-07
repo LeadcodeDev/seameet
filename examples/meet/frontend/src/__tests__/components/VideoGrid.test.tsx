@@ -28,6 +28,7 @@ interface MockCallValues {
   activeSpeakerId: string | null
   recentSpeakers: string[]
   participantId: string
+  verificationStatus: (peerId: string) => 'unverified' | 'verified' | 'changed'
 }
 
 let mockCallValues: MockCallValues
@@ -61,6 +62,7 @@ function setCallValues(overrides: Partial<MockCallValues> = {}) {
     activeSpeakerId: null,
     recentSpeakers: [],
     participantId: 'local-id',
+    verificationStatus: () => 'unverified',
     ...overrides,
   }
 }
