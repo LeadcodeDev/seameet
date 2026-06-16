@@ -502,4 +502,33 @@ describe('useWebRTC', () => {
     const kf = signaling._sent.filter(m => m.type === 'request_keyframe' && (m as { target: string }).target === 'peer-a')
     expect(kf.length).toBeGreaterThan(0)
   })
+
+  it('buffers ICE candidates that arrive before the answer, then flushes them (A4)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+    const addSpy = vi.spyOn(pc, 'addIceCandidate')
+
+    // Candidate arrives before any answer → remoteDescription is null → must be buffered.
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'ice_candidate', from: 'server', to: 'p1', room_id: 'room-1',
+        candidate: 'candidate:1 1 udp 2122260223 192.168.1.2 54321 typ host',
+        sdp_mid: '0', sdp_mline_index: 0,
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+    expect(addSpy).not.toHaveBeenCalled()
+
+    // Answer applied → remoteDescription set → buffered candidate is flushed.
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'mock-answer' })
+      await new Promise(r => setTimeout(r, 10))
+    })
+    expect(addSpy).toHaveBeenCalledTimes(1)
+  })
 })

@@ -124,4 +124,81 @@ describe('useSignaling', () => {
     const msgs = drainMessages(ws)
     expect(msgs).toHaveLength(0)
   })
+
+  it('queues a chat message sent while the socket is not open and flushes it after rejoin', async () => {
+    const { result } = renderSignaling()
+    await flushMicrotasks()
+    const ws = getLastMockWebSocket()
+
+    // Drive socket to non-OPEN state (close it)
+    ws.close()
+
+    // Drain any messages sent before close
+    drainMessages(ws)
+
+    // Send a chat message while socket is closed
+    act(() => {
+      result.current.sendChatMessage('p1', 'room-1', 'hello world', 'Alice')
+    })
+
+    // Assert the underlying ws.send was NOT yet called with the chat frame
+    const msgsBeforeRejoin = drainMessages(ws)
+    expect(msgsBeforeRejoin).toHaveLength(0)
+
+    // Bring the socket back to OPEN state
+    ws.readyState = ws.OPEN
+
+    // Call join — this should send the join frame and then flush the queued chat
+    act(() => {
+      result.current.join('p1', 'room-1', 'Alice')
+    })
+
+    const msgsAfterRejoin = drainMessages(ws)
+
+    // Both join and queued chat must have been sent
+    const joinIdx = msgsAfterRejoin.findIndex(m => m.type === 'join')
+    const chatIdx = msgsAfterRejoin.findIndex(m => m.type === 'chat_message')
+
+    expect(joinIdx).toBeGreaterThanOrEqual(0)
+    expect(chatIdx).toBeGreaterThanOrEqual(0)
+    // Chat must come AFTER join
+    expect(chatIdx).toBeGreaterThan(joinIdx)
+
+    expect(msgsAfterRejoin[chatIdx]).toMatchObject({
+      type: 'chat_message',
+      from: 'p1',
+      room_id: 'room-1',
+      content: 'hello world',
+      display_name: 'Alice',
+    })
+  })
+
+  it('does not queue an offer (SDP regenerated on rejoin)', async () => {
+    const { result } = renderSignaling()
+    await flushMicrotasks()
+    const ws = getLastMockWebSocket()
+
+    // Drive socket to non-OPEN state
+    ws.close()
+    drainMessages(ws)
+
+    // Call sendOffer while socket is closed
+    act(() => {
+      result.current.sendOffer('p1', 'room-1', 'v=0\r\n...')
+    })
+
+    // Bring socket back to OPEN
+    ws.readyState = ws.OPEN
+
+    // Call join
+    act(() => {
+      result.current.join('p1', 'room-1', 'Alice')
+    })
+
+    const msgs = drainMessages(ws)
+
+    // The offer must NOT have been sent (neither immediately nor after rejoin)
+    const offerMsg = msgs.find(m => m.type === 'offer')
+    expect(offerMsg).toBeUndefined()
+  })
 })
