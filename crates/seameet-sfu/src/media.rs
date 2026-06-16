@@ -43,6 +43,12 @@ pub enum PeerCmd {
     PeerLeft {
         pid: ParticipantId,
     },
+    /// A remote peer stopped screen sharing — clear its screen_mid in our
+    /// source slot so a subsequent share re-triggers the gained_screen_mid
+    /// → screen_share_routed path.
+    SourceScreenStopped {
+        pid: ParticipantId,
+    },
 }
 
 pub struct ForwardedMedia {
@@ -540,6 +546,14 @@ pub async fn run_media(
                         muted_peers.remove(&left_pid);
                         source_keyframe_pending.remove(&left_pid);
                         audio_levels.remove(&left_pid);
+                    }
+                    Some(PeerCmd::SourceScreenStopped { pid: source_pid }) => {
+                        if let Some(slot) = source_slots.get_mut(&source_pid) {
+                            if slot.screen_mid.is_some() {
+                                slot.screen_mid = None;
+                                info!(source = %source_pid, "cleared screen_mid on source screen-share stop");
+                            }
+                        }
                     }
                     Some(PeerCmd::PeerCountChanged { remote_peer_count }) => {
                         let own_count = 2 + if own_screen_mid.is_some() { 1 } else { 0 };
@@ -1406,6 +1420,47 @@ a=recvonly\r\n";
             &no_watermarks(),
         ).unwrap();
         assert!(slot.screen_mid.is_some());
+    }
+
+    /// Regression test for R1: screen-share restart produces a black tile.
+    ///
+    /// Sequence under test:
+    ///   1. slot created, screen_mid lazily assigned via second get_or_create_slot call.
+    ///   2. sharer stops → SourceScreenStopped handler resets screen_mid to None.
+    ///   3. sharer restarts → get_or_create_slot finds screen_mid is None again,
+    ///      re-assigns a free video mid, gained_screen_mid fires, screen_share_routed
+    ///      is emitted to the receiver.
+    #[test]
+    fn test_source_screen_stopped_resets_mid_enabling_restart() {
+        let all_mids = make_mids();
+        let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+        let own_audio = Some(mid("0"));
+        let own_video = Some(mid("1"));
+
+        // 1. Create slot + lazy screen_mid assignment (simulates first screen share).
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks()).unwrap();
+        let assigned_mid = slot.screen_mid;
+        assert!(assigned_mid.is_some(), "screen_mid should be Some after lazy upgrade");
+
+        // 2. SourceScreenStopped handler: reset screen_mid to None.
+        if let Some(slot) = slots.get_mut(&pid(1)) {
+            if slot.screen_mid.is_some() {
+                slot.screen_mid = None;
+            }
+        }
+        assert!(slots.get(&pid(1)).unwrap().screen_mid.is_none(), "screen_mid should be None after stop");
+
+        // 3. Sharer restarts: get_or_create_slot re-assigns a free video mid.
+        //    Before the call: had_screen_mid = false (None).
+        let had_screen_mid_before = slots.get(&pid(1)).and_then(|s| s.screen_mid).is_some();
+        assert!(!had_screen_mid_before);
+
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks()).unwrap();
+        let gained_screen_mid = !had_screen_mid_before && slot.screen_mid.is_some();
+
+        assert!(slot.screen_mid.is_some(), "screen_mid should be re-assigned after restart");
+        assert!(gained_screen_mid, "gained_screen_mid must be true → screen_share_routed will fire");
     }
 
     #[test]
