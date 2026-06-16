@@ -4,6 +4,7 @@ import { useWebRTC } from '@/hooks/useWebRTC'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { SignalingMessage } from '@/types'
 import { createMockStream } from '../mocks/mock-media'
+import { MockRTCPeerConnection } from '../mocks/mock-rtc'
 
 function createMockSignaling(): UseSignalingReturn & { _sent: SignalingMessage[] } {
   const sent: SignalingMessage[] = []
@@ -339,6 +340,33 @@ describe('useWebRTC', () => {
     expect(peer?.screenTransceiver).toBeNull()
   })
 
+  it('recovers a queued renegotiation after setRemoteDescription fails (B2/INV-5)', async () => {
+    const { result, signaling } = renderWebRTC()
+
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    // Queue a second renegotiation while the initial offer is still awaiting an answer.
+    await act(async () => {
+      result.current.handleMessage({ type: 'request_renegotiation', room_id: 'room-1', needed_slots: 2 })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    const offersBefore = signaling.sendOffer.mock.calls.length
+
+    // The next answer fails to apply.
+    MockRTCPeerConnection.failNextSetRemoteDescription = true
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'bad' })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    // The failure path must release the lock AND drain the queued renegotiation → a new offer is sent.
+    expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offersBefore)
+  })
+
   it('request_renegotiation adds transceiver slots and renegotiates', async () => {
     const { result, signaling } = renderWebRTC()
 
@@ -373,5 +401,105 @@ describe('useWebRTC', () => {
 
     // Should have sent another offer for renegotiation
     expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offerCountBefore)
+  })
+
+  it('reconcile is idempotent — repeated identical room_status keeps peers stable (INV-1)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a', 'peer-b'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    const status = {
+      type: 'room_status' as const, room_id: 'room-1',
+      participants: [
+        { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+        { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        { id: 'peer-b', audio_muted: false, video_muted: false, screen_sharing: false },
+      ],
+    }
+
+    await act(async () => { result.current.handleMessage(status); await new Promise(r => setTimeout(r, 10)) })
+    const aRef = result.current.remotePeers.get('peer-a')
+    await act(async () => { result.current.handleMessage(status); await new Promise(r => setTimeout(r, 10)) })
+
+    expect(result.current.remotePeers.size).toBe(2)
+    expect(result.current.remotePeers.get('peer-a')).toBe(aRef)
+  })
+
+  it('toggling one peer does not mutate another peer (INV-4)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a', 'peer-b'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: true, screen_sharing: false },
+          { id: 'peer-b', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    expect(result.current.remotePeers.get('peer-a')?.videoMuted).toBe(true)
+    expect(result.current.remotePeers.get('peer-b')?.videoMuted).toBe(false)
+    expect(result.current.remotePeers.get('peer-b')?.audioMuted).toBe(false)
+  })
+
+  it('routes an ontrack track to the peer owning that mid, even if it arrived before re-add (INV-2)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    const videoMid = result.current.remotePeers.get('peer-a')!.videoMid!
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+
+    // Remove peer-a so its slot (and mid) returns to the pool.
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [{ id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false }],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    // A track arrives for that mid while no peer owns it → must be buffered, not dropped.
+    const lateTrack = { kind: 'video', id: 'late-video-track' } as unknown as MediaStreamTrack
+    await act(async () => {
+      pc.ontrack?.({ track: lateTrack, transceiver: { mid: videoMid } } as unknown as RTCTrackEvent)
+      await new Promise(r => setTimeout(r, 5))
+    })
+
+    // peer-a rejoins, reusing the same front-of-pool slot/mid → buffered track is attached.
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    const stream = result.current.remotePeers.get('peer-a')!.stream
+    expect(stream.getTracks().some(t => t.id === 'late-video-track')).toBe(true)
+  })
+
+  it('requests a keyframe for each newly added peer', async () => {
+    const { result, signaling } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    const kf = signaling._sent.filter(m => m.type === 'request_keyframe' && (m as { target: string }).target === 'peer-a')
+    expect(kf.length).toBeGreaterThan(0)
   })
 })

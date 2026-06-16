@@ -72,6 +72,11 @@ class MockMediaStreamTrack {
 }
 
 export class MockRTCPeerConnection {
+  /** Every constructed instance, in order. Tests grab the live PC via `.at(-1)`. */
+  static instances: MockRTCPeerConnection[] = []
+  /** When true, the next setRemoteDescription rejects once, then resets. */
+  static failNextSetRemoteDescription = false
+
   private _transceivers: MockRTCRtpTransceiver[] = []
   private _senders: MockRTCRtpSender[] = []
 
@@ -91,7 +96,9 @@ export class MockRTCPeerConnection {
   onnegotiationneeded: (() => void) | null = null
   onicecandidateerror: ((ev: Event) => void) | null = null
 
-  constructor(_config?: RTCConfiguration) {}
+  constructor(_config?: RTCConfiguration) {
+    MockRTCPeerConnection.instances.push(this)
+  }
 
   addTransceiver(trackOrKind: MediaStreamTrack | string, init?: RTCRtpTransceiverInit): MockRTCRtpTransceiver {
     const kind = typeof trackOrKind === 'string' ? trackOrKind : trackOrKind.kind
@@ -134,6 +141,10 @@ export class MockRTCPeerConnection {
   }
 
   async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
+    if (MockRTCPeerConnection.failNextSetRemoteDescription) {
+      MockRTCPeerConnection.failNextSetRemoteDescription = false
+      throw new DOMException('mock setRemoteDescription failure', 'InvalidStateError')
+    }
     this.remoteDescription = desc as RTCSessionDescription
   }
 
@@ -151,6 +162,12 @@ export class MockRTCPeerConnection {
   addEventListener(): void {}
   removeEventListener(): void {}
   dispatchEvent(): boolean { return true }
+}
+
+export function resetMockRTC(): void {
+  _midCounter = 0
+  MockRTCPeerConnection.instances = []
+  MockRTCPeerConnection.failNextSetRemoteDescription = false
 }
 
 export function installMockRTC(): void {

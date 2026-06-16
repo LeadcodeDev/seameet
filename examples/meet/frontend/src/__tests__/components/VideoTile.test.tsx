@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import { VideoTile } from '@/components/VideoTile'
 import React from 'react'
@@ -84,5 +84,20 @@ describe('VideoTile', () => {
   it('label shows screen share format', () => {
     renderTile({ isScreenShare: true, name: 'Alice' })
     expect(screen.getByText("Alice's screen")).toBeDefined()
+  })
+
+  it('does not reattach srcObject when the same stream re-renders', async () => {
+    const track = { kind: 'video', id: 'v1', addEventListener: () => {}, removeEventListener: () => {} } as unknown as MediaStreamTrack
+    const stream = { getTracks: () => [track], getVideoTracks: () => [track], getAudioTracks: () => [] } as unknown as MediaStream
+    const playSpy = vi.spyOn(window.HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+
+    try {
+      const { rerender } = renderTile({ stream, audioEnabled: true, videoEnabled: true })
+      const callsAfterFirst = playSpy.mock.calls.length
+      rerender(<VideoTile stream={stream} name="Alice" isLocal={false} audioEnabled videoEnabled />)
+      expect(playSpy.mock.calls.length).toBe(callsAfterFirst)
+    } finally {
+      playSpy.mockRestore()
+    }
   })
 })
