@@ -83,6 +83,9 @@ export function useWebRTC({
   // Tracks that arrived via ontrack before their peer/mid was reconciled.
   const pendingTracksByMid = useRef<Map<string, MediaStreamTrack>>(new Map())
 
+  // ICE candidates that arrived before setRemoteDescription was called.
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([])
+
   // Message queue to serialize async message processing (like browser-demo's await)
   const messageQueueRef = useRef<SignalingMessage[]>([])
   const processingRef = useRef(false)
@@ -478,6 +481,11 @@ export function useWebRTC({
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp })
         console.log('[WebRTC] answer applied')
+        const buffered = pendingIceRef.current
+        pendingIceRef.current = []
+        for (const init of buffered) {
+          try { await pc.addIceCandidate(init) } catch (e) { console.warn('[WebRTC] buffered ICE candidate error:', e) }
+        }
       } catch (e) {
         console.error('[WebRTC] setRemoteDescription failed:', e)
       } finally {
@@ -489,12 +497,17 @@ export function useWebRTC({
     if (data.type === 'ice_candidate') {
       const pc = pcRef.current
       if (!pc) return
+      const init: RTCIceCandidateInit = {
+        candidate: data.candidate,
+        sdpMid: data.sdp_mid ?? null,
+        sdpMLineIndex: data.sdp_mline_index ?? null,
+      }
+      if (!pc.remoteDescription) {
+        pendingIceRef.current.push(init)
+        return
+      }
       try {
-        await pc.addIceCandidate({
-          candidate: data.candidate,
-          sdpMid: data.sdp_mid ?? null,
-          sdpMLineIndex: data.sdp_mline_index ?? null,
-        })
+        await pc.addIceCandidate(init)
       } catch (e) {
         console.warn('[WebRTC] ICE candidate error:', e)
       }
