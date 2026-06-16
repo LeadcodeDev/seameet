@@ -418,6 +418,7 @@ impl SignalingHooks for SfuServer {
                         for (id, peer) in p.iter() {
                             if *id != pid {
                                 let _ = peer.ws_tx.send(json.clone());
+                                let _ = peer.cmd_tx.send(PeerCmd::SourceScreenStopped { pid: *from });
                             }
                         }
                     }

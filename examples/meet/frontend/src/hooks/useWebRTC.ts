@@ -8,6 +8,10 @@ import type { VideoSettings } from '@/hooks/useMediaDevices'
 // so the initial SDP offer includes enough audio+video pairs for future peers.
 const MAX_PEER_SLOTS = 7
 
+// How long to wait for an SDP answer before forcibly releasing the renegotiation
+// lock. Used for both the initial offer and subsequent renegotiations.
+const RENEGOTIATION_TIMEOUT_MS = 10_000
+
 function getBitrate(height: number, fps: number): number {
   const base: Record<number, number> = { 360: 500_000, 480: 800_000, 720: 1_500_000, 1080: 3_000_000 }
   const bitrate = base[height] ?? 800_000
@@ -291,10 +295,10 @@ export function useWebRTC({
 
     renegotiationTimerRef.current = setTimeout(() => {
       if (renegotiatingRef.current) {
-        console.warn('[WebRTC] renegotiation timeout (10s) — resetting')
+        console.warn('[WebRTC] renegotiation timeout — resetting')
         finishRenegotiation()
       }
-    }, 10000)
+    }, RENEGOTIATION_TIMEOUT_MS)
 
     signalingRef.current.sendOffer(
       participantIdRef.current,
@@ -468,13 +472,22 @@ export function useWebRTC({
     // when localStream arrives while we're still waiting for the initial answer.
     renegotiatingRef.current = true
 
+    // Arm the same watchdog as renegotiate() so a lost initial answer
+    // releases the lock (and drains any pending renegotiation) via finishRenegotiation.
+    renegotiationTimerRef.current = setTimeout(() => {
+      if (renegotiatingRef.current) {
+        console.warn('[WebRTC] initial offer timeout — resetting renegotiation lock')
+        finishRenegotiation()
+      }
+    }, RENEGOTIATION_TIMEOUT_MS)
+
     signalingRef.current.sendOffer(
       participantIdRef.current,
       roomIdRef.current,
       offer.sdp!,
     )
     console.log('[WebRTC] initial offer sent')
-  }, [addRemotePeer, updateRemotePeersState])
+  }, [addRemotePeer, finishRenegotiation, updateRemotePeersState])
 
   // Async message handler — mirrors browser-demo's async handleSignalingMessage
   const processMessage = useCallback(async (data: SignalingMessage) => {
