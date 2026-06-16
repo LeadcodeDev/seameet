@@ -548,56 +548,35 @@ export function useWebRTC({
     }
 
     if (data.type === 'screen_share_started') {
+      // Binding is now driven by the authoritative `screen_share_routed`
+      // message from the SFU (carries the exact mid). Nothing to do here.
+      console.log(`[WebRTC] screen_share_started from ${data.from.slice(0, 8)} (awaiting screen_share_routed)`)
+      return
+    }
+
+    if (data.type === 'screen_share_routed') {
       const peerId = data.from
       const pc = pcRef.current
       if (!pc) return
       const info = remotePeersRef.current.get(peerId)
       if (!info) return
-      console.log(`[WebRTC] screen_share_started from ${peerId.slice(0, 8)}`)
-
-      // The SFU routes screen share RTP to the first free video mid in its
-      // slot for this source peer.  That mid corresponds to a pre-allocated
-      // pool transceiver on this browser — find it by looking for the first
-      // video transceiver whose mid isn't already assigned to any peer or
-      // used for our own local tracks.
-      const usedMids = new Set<string | null>()
-      for (const [, peer] of remotePeersRef.current) {
-        usedMids.add(peer.audioMid)
-        usedMids.add(peer.videoMid)
-        if (peer.screenTransceiver) usedMids.add(peer.screenTransceiver.mid)
-      }
-
-      let screenTransceiver: RTCRtpTransceiver | null = null
-      for (const t of pc.getTransceivers()) {
-        if (t.mid === null) continue
-        if (t.receiver.track.kind !== 'video') continue
-        if (usedMids.has(t.mid)) continue
-        // Skip own transceivers (they have a local send track attached)
-        if (t.sender.track !== null) continue
-        screenTransceiver = t
-        break
-      }
-
-      if (!screenTransceiver) {
-        console.warn(`[WebRTC] no free video transceiver for screen share from ${peerId.slice(0, 8)}`)
+      const t = pc.getTransceivers().find(tr => tr.mid === data.mid)
+      if (!t) {
+        console.warn(`[WebRTC] screen_share_routed: no transceiver for mid=${data.mid}`)
         return
       }
-
       const screenStream = new MediaStream()
-      const videoTrack = screenTransceiver.receiver.track
+      const videoTrack = t.receiver.track
       if (videoTrack) screenStream.addTrack(videoTrack)
-
-      // Apply E2EE to remote screen share receiver
       if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
-        screenTransceiver.receiver.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
+        t.receiver.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
           operation: 'decrypt', senderId: peerId,
         })
       }
-
-      info.screenTransceiver = screenTransceiver
+      info.screenTransceiver = t
       info.screenStream = screenStream
       updateRemotePeersState()
-      console.log(`[WebRTC] screen share routed via mid=${screenTransceiver.mid}`)
+      console.log(`[WebRTC] screen share bound to authoritative mid=${data.mid} for ${peerId.slice(0, 8)}`)
       return
     }
 

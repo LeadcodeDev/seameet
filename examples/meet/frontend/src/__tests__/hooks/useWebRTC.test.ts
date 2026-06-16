@@ -250,7 +250,7 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.get('peer-a')?.videoMuted).toBe(false)
   })
 
-  it('screen_share_started sets screenStream on peer', async () => {
+  it('screen_share_routed binds the screen transceiver to the server-given mid', async () => {
     const { result } = renderWebRTC()
 
     await act(async () => {
@@ -275,6 +275,58 @@ describe('useWebRTC', () => {
       await new Promise(resolve => setTimeout(resolve, 10))
     })
 
+    // Pick a concrete free video transceiver mid from the live pc:
+    // one that is NOT peer-a's audioMid/videoMid and has no sender.track.
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+    const peerA = result.current.remotePeers.get('peer-a')!
+    const usedMids = new Set([peerA.audioMid, peerA.videoMid])
+    const freeVideoTransceiver = pc.getTransceivers().find(
+      t => t.mid !== null &&
+           !usedMids.has(t.mid) &&
+           t.receiver.track.kind === 'video' &&
+           t.sender.track === null,
+    )!
+    const screenMid = freeVideoTransceiver.mid!
+
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'screen_share_routed',
+        from: 'peer-a',
+        mid: screenMid,
+        room_id: 'room-1',
+      })
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    const peer = result.current.remotePeers.get('peer-a')
+    expect(peer?.screenTransceiver?.mid).toBe(screenMid)
+    expect(peer?.screenStream).not.toBeNull()
+  })
+
+  it('screen_share_started alone does not bind screenTransceiver (only screen_share_routed binds)', async () => {
+    const { result } = renderWebRTC()
+
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'ready',
+        room_id: 'room-1',
+        initiator: true,
+        peers: ['peer-a'],
+      })
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'answer',
+        from: 'server',
+        to: 'p1',
+        room_id: 'room-1',
+        sdp: 'mock-answer-sdp',
+      })
+      await new Promise(resolve => setTimeout(resolve, 10))
+    })
+
     await act(async () => {
       result.current.handleMessage({
         type: 'screen_share_started',
@@ -286,8 +338,8 @@ describe('useWebRTC', () => {
     })
 
     const peer = result.current.remotePeers.get('peer-a')
-    expect(peer?.screenStream).not.toBeNull()
-    expect(peer?.screenTransceiver).not.toBeNull()
+    expect(peer?.screenTransceiver).toBeNull()
+    expect(peer?.screenStream).toBeNull()
   })
 
   it('screen_share_stopped clears screenStream on peer', async () => {
@@ -311,21 +363,26 @@ describe('useWebRTC', () => {
       await new Promise(resolve => setTimeout(resolve, 10))
     })
 
-    // Start screen share
+    // Bind via screen_share_routed (authoritative mid from server)
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+    const peerA = result.current.remotePeers.get('peer-a')!
+    const usedMids = new Set([peerA.audioMid, peerA.videoMid])
+    const freeVideoTransceiver = pc.getTransceivers().find(
+      t => t.mid !== null &&
+           !usedMids.has(t.mid) &&
+           t.receiver.track.kind === 'video' &&
+           t.sender.track === null,
+    )!
+    const screenMid = freeVideoTransceiver.mid!
+
     await act(async () => {
       result.current.handleMessage({
-        type: 'screen_share_started', from: 'peer-a', room_id: 'room-1', track_id: 0,
+        type: 'screen_share_routed', from: 'peer-a', mid: screenMid, room_id: 'room-1',
       })
       await new Promise(resolve => setTimeout(resolve, 20))
     })
 
-    // Answer renegotiation
-    await act(async () => {
-      result.current.handleMessage({
-        type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'mock-answer-sdp-2',
-      })
-      await new Promise(resolve => setTimeout(resolve, 10))
-    })
+    expect(result.current.remotePeers.get('peer-a')?.screenTransceiver).not.toBeNull()
 
     // Stop screen share
     await act(async () => {

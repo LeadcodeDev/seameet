@@ -9,6 +9,7 @@ export type SignalingMessage =
   | { type: 'peer_left'; participant: string; room_id: string }
   | { type: 'screen_share_started'; from: string; room_id: string; track_id: number }
   | { type: 'screen_share_stopped'; from: string; room_id: string; track_id: number }
+  | { type: 'screen_share_routed'; from: string; mid: string; room_id: string }
   | { type: 'mute_audio'; from: string; room_id: string }
   | { type: 'unmute_audio'; from: string; room_id: string }
   | { type: 'mute_video'; from: string; room_id: string }
