@@ -80,6 +80,8 @@ export function useWebRTC({
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const renegotiateRef = useRef<() => Promise<void>>(async () => {})
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const iceRestartingRef = useRef(false)
+  const attemptIceRestartRef = useRef<() => void>(() => {})
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const localAudioTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const localVideoTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
@@ -310,6 +312,17 @@ export function useWebRTC({
 
   renegotiateRef.current = renegotiate
 
+  const attemptIceRestart = useCallback(() => {
+    const pc = pcRef.current
+    if (!pc || iceRestartingRef.current) return
+    iceRestartingRef.current = true
+    console.warn('[WebRTC] attempting ICE restart')
+    try { pc.restartIce() } catch (e) { console.warn('[WebRTC] restartIce failed:', e) }
+    void renegotiate()
+  }, [renegotiate])
+
+  attemptIceRestartRef.current = attemptIceRestart
+
   const createOfferToServer = useCallback(async (existingPeers: string[], displayNames?: Record<string, string>) => {
     console.log(`[WebRTC] createOfferToServer, existingPeers: ${existingPeers.length}, localStream: ${!!localStreamRef.current}`)
 
@@ -385,10 +398,14 @@ export function useWebRTC({
         disconnectTimerRef.current = null
       }
 
-      if (state === 'disconnected') {
+      if (state === 'connected') {
+        iceRestartingRef.current = false
+      } else if (state === 'failed') {
+        attemptIceRestartRef.current()
+      } else if (state === 'disconnected') {
         disconnectTimerRef.current = setTimeout(() => {
           if (pc.connectionState === 'disconnected') {
-            setConnectionState('disconnected')
+            attemptIceRestartRef.current()
           }
         }, 3000)
       }

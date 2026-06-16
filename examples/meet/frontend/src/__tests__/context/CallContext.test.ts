@@ -1,9 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { createElement, type ReactNode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { CallProvider, useCall } from '@/context/CallContext'
-import { getLastMockWebSocket, type MockWebSocket } from '../mocks/mock-websocket'
+import { getLastMockWebSocket } from '../mocks/mock-websocket'
 import type { SignalingMessage } from '@/types'
 
 function flushAsync(ms = 30): Promise<void> {
@@ -281,7 +281,7 @@ describe('CallContext', () => {
   })
 
   it('duplicate chat messages (same id) are not appended twice', async () => {
-    const { hook, ws } = await setupCall()
+    const { hook } = await setupCall()
 
     const chatMsg = {
       type: 'chat_message' as const,
@@ -292,10 +292,14 @@ describe('CallContext', () => {
       timestamp: 1000000,
     } as SignalingMessage
 
+    // Re-fetch the current socket immediately before pushing — guards against
+    // a prior-test reconnect having replaced the captured ws reference.
+    const currentWs = getLastMockWebSocket()
+
     // Deliver the same message twice (simulating server replay on reconnect)
     await act(async () => {
-      ws.serverPush(chatMsg)
-      ws.serverPush(chatMsg)
+      currentWs.serverPush(chatMsg)
+      currentWs.serverPush(chatMsg)
       await new Promise(resolve => setTimeout(resolve, 50))
     })
 
@@ -308,28 +312,37 @@ describe('CallContext', () => {
   })
 
   it('fatalError is cleared when signaling reconnects', async () => {
-    const { hook, ws } = await setupCall()
+    const { hook } = await setupCall()
 
-    // Trigger a fatal error
+    // Re-fetch the current socket immediately before pushing — guards against
+    // a stale reference if a prior-test reconnect ran between setupCall and here.
+    const ws = getLastMockWebSocket()
+
+    // Trigger a fatal error; poll until the state propagates rather than
+    // sleeping a fixed interval (robust under scheduler load in the full suite).
     await act(async () => {
       ws.serverPush({ type: 'error', code: 401, message: 'token rejected' })
-      await new Promise(resolve => setTimeout(resolve, 30))
     })
-    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token rejected' })
+    await vi.waitFor(
+      () => expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token rejected' }),
+      { timeout: 2000 },
+    )
 
-    // Simulate WS drop — state goes to 'closed'
+    // Simulate WS drop — poll until state reflects 'closed'.
     await act(async () => {
       ws.close()
-      await new Promise(resolve => setTimeout(resolve, 30))
     })
-    expect(hook.result.current.signalingState).toBe('closed')
+    await vi.waitFor(
+      () => expect(hook.result.current.signalingState).toBe('closed'),
+      { timeout: 2000 },
+    )
 
-    // Wait for the reconnect timer (1 000 ms) + microtask for the new WS to open
-    await act(async () => {
-      await new Promise(resolve => setTimeout(resolve, 1100))
-    })
-
-    expect(hook.result.current.signalingState).toBe('open')
+    // Poll until the reconnect fires, the new WebSocket opens, and the hook
+    // reports 'open' again — no hardcoded sleep for the 1 000 ms reconnect timer.
+    await vi.waitFor(
+      () => expect(hook.result.current.signalingState).toBe('open'),
+      { timeout: 5000 },
+    )
     expect(hook.result.current.fatalError).toBeNull()
   })
 })

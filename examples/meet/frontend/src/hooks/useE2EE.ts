@@ -166,6 +166,13 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 
 export function useE2EE({ enabled, participantId, roomId, signaling, joined }: UseE2EEOptions): UseE2EEReturn {
   const workerRef = useRef<Worker | null>(null)
+  // Bumping this triggers the worker-lifecycle effect to tear down the dead
+  // worker and create a fresh one. Each crash increments by 1; there is no
+  // elaborate backoff here — if the worker crashes immediately on every
+  // creation the counter will increment on each crash event (risk of rapid
+  // re-creation loop), but in practice a persistently crashing worker signals
+  // a code bug that must be fixed rather than suppressed with backoff.
+  const [workerGeneration, setWorkerGeneration] = useState(0)
   const ecdhKeyPairRef = useRef<CryptoKeyPair | null>(null)
   const senderKeyRawRef = useRef<ArrayBuffer | null>(null)
   const localKeyIdRef = useRef(0)
@@ -226,6 +233,17 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
     const worker = new Worker(new URL('../workers/e2ee-worker.ts', import.meta.url), { type: 'module' })
     workerRef.current = worker
 
+    // Re-install current key state into the fresh worker. On first mount
+    // senderKeyRawRef is still null (genKeys hasn't run yet), so these are
+    // no-ops. On a post-crash recreate they restore all known keys so the
+    // worker is immediately usable without waiting for a new key exchange.
+    if (senderKeyRawRef.current) {
+      worker.postMessage({ type: 'setKey', participantId, keyId: localKeyIdRef.current, rawKey: senderKeyRawRef.current })
+    }
+    for (const [peerId, { raw, keyId }] of peerSenderKeysRef.current) {
+      worker.postMessage({ type: 'setKey', participantId: peerId, keyId, rawKey: raw })
+    }
+
     const onWorkerMessage = (event: MessageEvent) => {
       const data = event.data as { type?: string; operation?: 'encrypt' | 'decrypt'; participantId?: string }
       if (data?.type !== 'e2ee_not_ready') return
@@ -248,12 +266,19 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
     }
     worker.addEventListener('message', onWorkerMessage)
 
+    const onWorkerError = (e: ErrorEvent | Event) => {
+      console.error('[E2EE] worker crashed — recreating', e)
+      setWorkerGeneration(g => g + 1)
+    }
+    worker.addEventListener('error', onWorkerError)
+
     return () => {
       worker.removeEventListener('message', onWorkerMessage)
+      worker.removeEventListener('error', onWorkerError)
       worker.terminate()
       workerRef.current = null
     }
-  }, [enabled, participantId])
+  }, [enabled, participantId, workerGeneration])
 
   // ── Key Generation on Mount ────────────────────────────────────────
   //
