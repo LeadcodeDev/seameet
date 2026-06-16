@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import {
   initChainEntry,
   stepChain,
@@ -363,5 +363,132 @@ describe('constants', () => {
     expect(MAX_SKIP).toBe(256)
     expect(MAX_INITIAL_SKIP).toBe(30_000)
     expect(REPLAY_WINDOW_SIZE).toBe(128)
+  })
+})
+
+// ── Worker decryptFrame — KID mismatch → not-ready ─────────────────────
+//
+// Tests that e2ee_not_ready is emitted when a frame arrives whose KID does
+// not match any installed chain entry (rotation window: sender has switched
+// to key N+1 but receiver only has key N).
+
+describe('e2ee-worker decryptFrame KID mismatch', () => {
+  // We drive the worker module's transform pipeline by:
+  //  1. Spying on self.postMessage to capture e2ee_not_ready events
+  //  2. Dispatching a fake 'message' event to install the sender key (setKey)
+  //  3. Dispatching a fake 'rtctransform' event with a ReadableStream that
+  //     emits our crafted frame (KID = installed_kid + 1)
+  //  4. Waiting for the pipeline to process the frame
+  //  5. Asserting e2ee_not_ready was posted
+
+  // Build a minimal valid E2EE-framed buffer with the given KID byte.
+  // Layout (0 unencrypted codec bytes, i.e. audio-style frame):
+  //   [KID 1B] [CTR 4B big-endian] [fake-ciphertext 16B] [trailer 1B = 0]
+  // Total = 22 bytes — passes the minSize check (HEADER 5 + GCM_TAG 16 + TRAILER 1).
+  function buildFrameWithKid(kid: number, ctr = 1): ArrayBuffer {
+    const buf = new ArrayBuffer(22)
+    const view = new DataView(buf)
+    // E2EE header at offset 0 (0 unencrypted bytes)
+    view.setUint8(0, kid & 0xff)           // KID
+    view.setUint32(1, ctr)                 // CTR big-endian
+    // Bytes 5-20: fake ciphertext (16 bytes, all zeros — will not decrypt)
+    // Byte 21: trailer = 0 (unencrypted codec header length)
+    view.setUint8(21, 0)
+    return buf
+  }
+
+  // Minimal RTCEncodedFrame mock
+  function makeFrame(data: ArrayBuffer): { data: ArrayBuffer; getMetadata: () => { payloadType: number } } {
+    return {
+      data,
+      getMetadata: () => ({ payloadType: 111 }), // audio payload type → 0 unencrypted bytes
+    }
+  }
+
+  let originalPostMessage: typeof self.postMessage
+  const postedMessages: unknown[] = []
+
+  beforeEach(async () => {
+    // Spy on self.postMessage before loading the worker module
+    originalPostMessage = self.postMessage
+    postedMessages.length = 0
+    ;(self as unknown as Worker).postMessage = (msg: unknown) => {
+      postedMessages.push(msg)
+    }
+
+    // Load (or re-use) the worker module. Because Vitest caches modules, the
+    // worker's module-level senderChains map persists. We reset it by sending
+    // a removeKeys message before each test.
+  })
+
+  afterEach(() => {
+    ;(self as unknown as Worker).postMessage = originalPostMessage
+  })
+
+  it('emits e2ee_not_ready when the frame KID is not installed (rotation window)', async () => {
+    // Import the worker module — this registers the 'message' and
+    // 'rtctransform' event listeners on self.
+    await import('@/workers/e2ee-worker')
+
+    const senderId = `test-sender-kid-mismatch-${Math.random().toString(36).slice(2)}`
+
+    // Install sender key at keyId = 0
+    const rawKey = await generateRawKey()
+    await new Promise<void>(resolve => {
+      const handler = () => {
+        self.removeEventListener('message', handler)
+        resolve()
+      }
+      // The worker's message handler is async; we resolve after a micro-tick
+      // by piggybacking on the event loop: post the message, then wait one
+      // promise tick for the async handler to set the key.
+      self.dispatchEvent(Object.assign(new MessageEvent('message', {
+        data: { type: 'setKey', participantId: senderId, keyId: 0, rawKey },
+      }), {}))
+      // Give the async initChainEntry inside the handler time to complete
+      Promise.resolve().then(() => setTimeout(resolve, 50))
+    })
+
+    // Now clear any not-ready notifications that may have fired (none expected
+    // yet, but reset the spy to isolate the assertion below).
+    postedMessages.length = 0
+
+    // Build a frame whose KID byte is 1 (not installed — only keyId=0 exists)
+    const frameData = buildFrameWithKid(1, 1)
+    const frame = makeFrame(frameData)
+
+    // Drive the frame through the worker's decrypt transform.
+    // We construct a ReadableStream that emits the frame, then a writable sink,
+    // and dispatch a synthetic 'rtctransform' event that the worker listens to.
+    let framePushed: () => void
+    const readable = new ReadableStream({
+      start(controller) {
+        // Push the frame immediately, then close
+        controller.enqueue(frame)
+        controller.close()
+      },
+    })
+    const writable = new WritableStream({ write() {} })
+
+    self.dispatchEvent(Object.assign(new Event('rtctransform'), {
+      transformer: {
+        readable,
+        writable,
+        options: { operation: 'decrypt', senderId },
+      },
+    }))
+
+    // Wait for the pipeline to fully drain (the transform is async)
+    await new Promise(r => setTimeout(r, 200))
+
+    const notReadyEvents = postedMessages.filter(
+      (m): m is { type: string; operation: string; participantId: string } =>
+        typeof m === 'object' && m !== null && (m as Record<string, unknown>).type === 'e2ee_not_ready',
+    )
+
+    expect(notReadyEvents.length).toBeGreaterThanOrEqual(1)
+    const evt = notReadyEvents[0]
+    expect(evt.operation).toBe('decrypt')
+    expect(evt.participantId).toBe(senderId)
   })
 })
