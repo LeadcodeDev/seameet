@@ -450,4 +450,46 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.get('peer-b')?.videoMuted).toBe(false)
     expect(result.current.remotePeers.get('peer-b')?.audioMuted).toBe(false)
   })
+
+  it('routes an ontrack track to the peer owning that mid, even if it arrived before re-add (INV-2)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    const videoMid = result.current.remotePeers.get('peer-a')!.videoMid!
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+
+    // Remove peer-a so its slot (and mid) returns to the pool.
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [{ id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false }],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    // A track arrives for that mid while no peer owns it → must be buffered, not dropped.
+    const lateTrack = { kind: 'video', id: 'late-video-track' } as unknown as MediaStreamTrack
+    await act(async () => {
+      pc.ontrack?.({ track: lateTrack, transceiver: { mid: videoMid } } as unknown as RTCTrackEvent)
+      await new Promise(r => setTimeout(r, 5))
+    })
+
+    // peer-a rejoins, reusing the same front-of-pool slot/mid → buffered track is attached.
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    const stream = result.current.remotePeers.get('peer-a')!.stream
+    expect(stream.getTracks().some(t => t.id === 'late-video-track')).toBe(true)
+  })
 })

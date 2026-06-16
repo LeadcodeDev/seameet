@@ -80,6 +80,9 @@ export function useWebRTC({
   // Pool of pre-allocated transceiver pairs from the initial offer.
   const transceiverPoolRef = useRef<TransceiverSlot[]>([])
 
+  // Tracks that arrived via ontrack before their peer/mid was reconciled.
+  const pendingTracksByMid = useRef<Map<string, MediaStreamTrack>>(new Map())
+
   // Message queue to serialize async message processing (like browser-demo's await)
   const messageQueueRef = useRef<SignalingMessage[]>([])
   const processingRef = useRef(false)
@@ -126,6 +129,11 @@ export function useWebRTC({
       }
     }
 
+    // Clear any buffered tracks for this peer's mids so a future slot occupant
+    // does not inherit a stale track from a previous occupant.
+    if (info.audioMid) pendingTracksByMid.current.delete(info.audioMid)
+    if (info.videoMid) pendingTracksByMid.current.delete(info.videoMid)
+
     remotePeersRef.current.delete(peerId)
     updateRemotePeersState()
     console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}, pool: ${transceiverPoolRef.current.length}`)
@@ -154,6 +162,19 @@ export function useWebRTC({
     const videoTrack = slot.videoTransceiver.receiver.track
     if (audioTrack) stream.addTrack(audioTrack)
     if (videoTrack) stream.addTrack(videoTrack)
+
+    // Drain tracks that arrived before this peer was (re)added.
+    for (const mid of [audioMid, videoMid]) {
+      if (!mid) continue
+      const pending = pendingTracksByMid.current.get(mid)
+      if (pending) {
+        for (const old of stream.getTracks()) {
+          if (old.kind === pending.kind && old.id !== pending.id) stream.removeTrack(old)
+        }
+        stream.addTrack(pending)
+        pendingTracksByMid.current.delete(mid)
+      }
+    }
 
     const peer: RemotePeer = {
       id: peerId,
@@ -323,7 +344,11 @@ export function useWebRTC({
           return
         }
       }
-      console.log(`[WebRTC] unmatched track (mid=${mid})`)
+      // No peer owns this mid yet — buffer it; addRemotePeer drains on (re)add.
+      if (mid) {
+        pendingTracksByMid.current.set(mid, evt.track)
+        console.log(`[WebRTC] buffered track for unassigned mid=${mid}`)
+      }
     }
 
     pc.onconnectionstatechange = () => {
