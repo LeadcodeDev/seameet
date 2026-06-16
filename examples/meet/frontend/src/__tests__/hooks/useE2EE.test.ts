@@ -8,17 +8,26 @@ class MockWorker {
   messages: Array<{ type: string; [key: string]: unknown }> = []
   onmessage: ((ev: MessageEvent) => void) | null = null
   private listeners: Array<(ev: MessageEvent) => void> = []
+  errorListeners: Array<(ev: Event) => void> = []
 
   postMessage(data: unknown): void {
     this.messages.push(data as { type: string; [key: string]: unknown })
   }
 
   terminate(): void {}
-  addEventListener(_type: string, listener: (ev: MessageEvent) => void): void {
-    this.listeners.push(listener)
+  addEventListener(type: string, listener: (ev: MessageEvent) => void): void {
+    if (type === 'error') {
+      this.errorListeners.push(listener as unknown as (ev: Event) => void)
+    } else {
+      this.listeners.push(listener)
+    }
   }
-  removeEventListener(_type: string, listener: (ev: MessageEvent) => void): void {
-    this.listeners = this.listeners.filter(l => l !== listener)
+  removeEventListener(type: string, listener: (ev: MessageEvent) => void): void {
+    if (type === 'error') {
+      this.errorListeners = this.errorListeners.filter(l => l !== (listener as unknown as (ev: Event) => void))
+    } else {
+      this.listeners = this.listeners.filter(l => l !== listener)
+    }
   }
   dispatchEvent(): boolean { return true }
 
@@ -26,6 +35,12 @@ class MockWorker {
   emit(data: unknown): void {
     const ev = { data } as MessageEvent
     for (const l of this.listeners) l(ev)
+  }
+
+  /** Test helper: simulate a fatal worker error. */
+  emitError(): void {
+    const ev = new Event('error')
+    for (const l of this.errorListeners) l(ev as unknown as MessageEvent)
   }
 }
 
@@ -474,6 +489,27 @@ describe('useE2EE', () => {
     } finally {
       setIntervalSpy.mockRestore()
     }
+  })
+
+  // G4: The E2EE worker has an `error` listener. On a fatal crash the hook
+  // must detect the dead worker, recreate it, and re-install the current key
+  // state (our own sender key + all known peer sender keys) into the fresh
+  // worker so the E2EE subsystem self-heals without requiring a full reconnect.
+  it('recreates the worker and re-installs keys after a worker crash (G4)', async () => {
+    const { result } = renderHook(() => useE2EE(defaultOptions()))
+    await flushAsync() // genKeys runs, our setKey posted to worker #1
+    const firstWorker = lastWorker!
+    expect(firstWorker.messages.some(m => m.type === 'setKey')).toBe(true)
+
+    await act(async () => {
+      firstWorker.emitError() // simulate fatal worker crash
+    })
+    await flushAsync()
+
+    // A NEW worker was created...
+    expect(lastWorker).not.toBe(firstWorker)
+    // ...and our sender key was re-installed into it.
+    expect(lastWorker!.messages.some(m => m.type === 'setKey' && m.participantId === 'local-id')).toBe(true)
   })
 
   // D-INV-3: The per-peer pending sender-key queue must be bounded so a
