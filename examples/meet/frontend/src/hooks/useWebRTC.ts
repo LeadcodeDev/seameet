@@ -204,6 +204,12 @@ export function useWebRTC({
     }
 
     updateRemotePeersState()
+    signalingRef.current.send({
+      type: 'request_keyframe',
+      from: participantIdRef.current,
+      target: peerId,
+      room_id: roomIdRef.current,
+    })
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [removeRemotePeer, updateRemotePeersState])
 

@@ -492,4 +492,14 @@ describe('useWebRTC', () => {
     const stream = result.current.remotePeers.get('peer-a')!.stream
     expect(stream.getTracks().some(t => t.id === 'late-video-track')).toBe(true)
   })
+
+  it('requests a keyframe for each newly added peer', async () => {
+    const { result, signaling } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    const kf = signaling._sent.filter(m => m.type === 'request_keyframe' && (m as { target: string }).target === 'peer-a')
+    expect(kf.length).toBeGreaterThan(0)
+  })
 })
