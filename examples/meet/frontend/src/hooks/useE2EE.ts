@@ -2,6 +2,13 @@ import { useRef, useEffect, useCallback, useState } from 'react'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { SignalingMessage } from '@/types'
 
+// ── Constants ──────────────────────────────────────────────────────────
+
+/** Maximum number of queued e2ee_sender_key messages per peer before we start
+ *  dropping the oldest entry (oldest = lowest keyId). This prevents a slow or
+ *  misbehaving peer from growing the queue without bound. */
+const PENDING_SENDER_KEY_CAP = 20
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface E2EEPeerState {
@@ -419,7 +426,15 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
       // 5. Clear old shared secrets (they used the old ECDH keypair)
       sharedSecretsRef.current.clear()
 
-      // 6. Broadcast new public key — peers will:
+      // 6. Notify peers that a rotation occurred so they can mark our key stale.
+      signalingRef.current.send({
+        type: 'e2ee_key_rotation',
+        from: participantId,
+        room_id: roomId,
+        key_id: newKeyId,
+      } as SignalingMessage)
+
+      // 7. Broadcast new public key — peers will:
       //    a) Derive new shared secret (their private + our new public)
       //    b) Respond with their public key
       //    c) We re-derive shared secret and send new sender key
@@ -550,6 +565,10 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
         // e2ee_public_key handling completes.
         const queue = pendingSenderKeysRef.current.get(senderId) ?? []
         queue.push({ encrypted_key: msg.encrypted_key, key_id: msg.key_id })
+        if (queue.length > PENDING_SENDER_KEY_CAP) {
+          queue.shift() // drop oldest to enforce the cap
+          console.warn(`[E2EE] pending sender-key queue for ${senderId.slice(0, 8)} exceeded cap (${PENDING_SENDER_KEY_CAP}), dropping oldest`)
+        }
         pendingSenderKeysRef.current.set(senderId, queue)
         console.log(`[E2EE] queued sender key from ${senderId.slice(0, 8)} pending shared secret`)
         return
