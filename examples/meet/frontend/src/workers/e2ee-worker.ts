@@ -290,6 +290,11 @@ async function decryptFrame(
           }
         }
       }
+
+      // All installed chain entries failed to decrypt this frame — most commonly
+      // a KID from a not-yet-installed rotated key. Surface not-ready so the
+      // recovery watchdog re-requests the sender's key. (Deduped until next setKey.)
+      notifyNotReady('decrypt', senderId)
     } catch (e) {
       console.warn(`[E2EE Worker] decrypt error for sender ${senderId.slice(0, 8)}:`, e)
     }
