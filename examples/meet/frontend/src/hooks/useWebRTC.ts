@@ -14,6 +14,10 @@ function getBitrate(height: number, fps: number): number {
   return fps > 30 ? Math.round(bitrate * 1.6) : bitrate
 }
 
+export function clampToBwe(base: number, bweCap: number | null): number {
+  return bweCap == null ? base : Math.min(base, bweCap)
+}
+
 interface TransceiverSlot {
   audioTransceiver: RTCRtpTransceiver
   videoTransceiver: RTCRtpTransceiver
@@ -104,6 +108,7 @@ export function useWebRTC({
   const videoSettingsRef = useRef(videoSettings)
   const e2eeWorkerRef = useRef(e2eeWorker)
   const e2eeEnabledRef = useRef(e2eeEnabled)
+  const latestBweCapRef = useRef<number | null>(null)
 
   participantIdRef.current = participantId
   roomIdRef.current = roomId
@@ -601,11 +606,11 @@ export function useWebRTC({
       if (!pc) return
       const floor = 100_000 // 100 kbps minimum
       const cap = Math.max(data.max_bitrate_bps, floor)
+      latestBweCapRef.current = cap
       for (const sender of pc.getSenders().filter(s => s.track?.kind === 'video')) {
         const params = sender.getParameters()
         if (params.encodings.length > 0) {
-          const currentMax = getBitrate(videoSettingsRef.current.height, videoSettingsRef.current.frameRate)
-          params.encodings[0].maxBitrate = Math.min(cap, currentMax)
+          params.encodings[0].maxBitrate = clampToBwe(getBitrate(videoSettingsRef.current.height, videoSettingsRef.current.frameRate), cap)
           sender.setParameters(params)
         }
       }
@@ -746,7 +751,7 @@ export function useWebRTC({
       for (const sender of videoSenders) {
         const params = sender.getParameters()
         if (params.encodings.length > 0) {
-          params.encodings[0].maxBitrate = getBitrate(videoSettings.height, videoSettings.frameRate)
+          params.encodings[0].maxBitrate = clampToBwe(getBitrate(videoSettings.height, videoSettings.frameRate), latestBweCapRef.current)
           params.encodings[0].maxFramerate = videoSettings.frameRate
           params.degradationPreference = 'maintain-resolution'
           sender.setParameters(params)
