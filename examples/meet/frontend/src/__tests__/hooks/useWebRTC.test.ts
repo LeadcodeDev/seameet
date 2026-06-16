@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { useWebRTC } from '@/hooks/useWebRTC'
+import { useWebRTC, clampToBwe } from '@/hooks/useWebRTC'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { SignalingMessage } from '@/types'
 import { createMockStream } from '../mocks/mock-media'
@@ -572,5 +572,17 @@ describe('useWebRTC', () => {
       await new Promise(r => setTimeout(r, 10))
     })
     expect(addSpy).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('clampToBwe', () => {
+  it('returns base when no BWE cap', () => {
+    expect(clampToBwe(800_000, null)).toBe(800_000)
+  })
+  it('clamps to the BWE cap when it is lower', () => {
+    expect(clampToBwe(800_000, 200_000)).toBe(200_000)
+  })
+  it('keeps base when it is already below the BWE cap', () => {
+    expect(clampToBwe(100_000, 200_000)).toBe(100_000)
   })
 })
