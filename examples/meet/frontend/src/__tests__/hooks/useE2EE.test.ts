@@ -422,6 +422,60 @@ describe('useE2EE', () => {
     }
   })
 
+  it('re-broadcasts our public key to recover a peer stuck not-ready (D-INV-2)', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    try {
+      const sig = createSignaling()
+      const { result } = renderHook(() => useE2EE(defaultOptions({ signaling: sig as unknown as UseE2EEOptions['signaling'] })))
+      await flushAsync()
+
+      // Capture the recovery watchdog callback (registered with RECOVERY_INTERVAL_MS = 3000).
+      const call = setIntervalSpy.mock.calls.find(c => c[1] === 3000)
+      expect(call).toBeDefined()
+      const tick = call![0] as () => void
+
+      // Peer becomes stuck not-ready (worker dropped its frames, no key yet).
+      await act(async () => {
+        lastWorker!.emit({ type: 'e2ee_not_ready', operation: 'decrypt', participantId: 'peer-stuck' })
+      })
+      await flushAsync()
+      expect(result.current.e2eeNotReady.peers.has('peer-stuck')).toBe(true)
+
+      const pubKeysBefore = sig.sent.filter((m: any) => m.type === 'e2ee_public_key').length
+
+      // Watchdog fires → should re-broadcast our pubkey to trigger key re-delivery.
+      await act(async () => { tick(); await Promise.resolve() })
+      await flushAsync()
+
+      const pubKeysAfter = sig.sent.filter((m: any) => m.type === 'e2ee_public_key').length
+      expect(pubKeysAfter).toBeGreaterThan(pubKeysBefore)
+    } finally {
+      setIntervalSpy.mockRestore()
+    }
+  })
+
+  it('stops re-broadcasting after MAX_RECOVERY_ATTEMPTS for a peer (D-INV-2 bounded)', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    try {
+      const sig = createSignaling()
+      const { result } = renderHook(() => useE2EE(defaultOptions({ signaling: sig as unknown as UseE2EEOptions['signaling'] })))
+      await flushAsync()
+      const tick = setIntervalSpy.mock.calls.find(c => c[1] === 3000)![0] as () => void
+
+      await act(async () => { lastWorker!.emit({ type: 'e2ee_not_ready', operation: 'decrypt', participantId: 'peer-stuck' }) })
+      await flushAsync()
+
+      const before = sig.sent.filter((m: any) => m.type === 'e2ee_public_key').length
+      // Fire many times; only MAX_RECOVERY_ATTEMPTS (5) re-broadcasts should occur.
+      for (let i = 0; i < 10; i++) { await act(async () => { tick(); await Promise.resolve() }) }
+      await flushAsync()
+      const after = sig.sent.filter((m: any) => m.type === 'e2ee_public_key').length
+      expect(after - before).toBe(5)
+    } finally {
+      setIntervalSpy.mockRestore()
+    }
+  })
+
   // D-INV-3: The per-peer pending sender-key queue must be bounded so a
   // misbehaving or slow peer cannot cause unbounded memory growth.
   it('caps the pending e2ee_sender_key queue per peer (D-INV-3)', async () => {

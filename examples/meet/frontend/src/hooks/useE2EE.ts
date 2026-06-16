@@ -9,6 +9,13 @@ import type { SignalingMessage } from '@/types'
  *  misbehaving peer from growing the queue without bound. */
 const PENDING_SENDER_KEY_CAP = 20
 
+/** How often (ms) the not-ready recovery watchdog fires to re-broadcast our
+ *  public key toward peers stuck without a sender key installed. */
+const RECOVERY_INTERVAL_MS = 3000
+
+/** Maximum number of re-broadcast attempts per stuck peer before giving up. */
+const MAX_RECOVERY_ATTEMPTS = 5
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface E2EEPeerState {
@@ -190,6 +197,14 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
 
   const signalingRef = useRef(signaling)
   signalingRef.current = signaling
+
+  // Mirror of e2eeNotReady kept fresh on every render so interval closures
+  // don't capture a stale value.
+  const e2eeNotReadyRef = useRef(e2eeNotReady)
+  e2eeNotReadyRef.current = e2eeNotReady
+
+  // Per-peer attempt counters for the recovery watchdog.
+  const recoveryAttemptsRef = useRef<Map<string, number>>(new Map())
 
   // Forward reference to drainPendingSenderKeys (defined below) so the
   // broadcast effect can call it without a circular declaration.
@@ -445,6 +460,44 @@ export function useE2EE({ enabled, participantId, roomId, signaling, joined }: U
 
     return () => clearInterval(interval)
   }, [enabled, participantId, roomId, broadcastPublicKey])
+
+  // ── Not-ready recovery watchdog ───────────────────────────────────
+  //
+  // While a peer is stuck in e2eeNotReady (the worker couldn't decrypt their
+  // frames because no sender key is installed yet), periodically re-broadcast
+  // our own public key. Re-broadcasting triggers the peer's e2ee_public_key
+  // handler, which calls sendSenderKeyTo(us), re-delivering their sender key so
+  // processSenderKey can install it and clear the overlay.
+  // Bounded to MAX_RECOVERY_ATTEMPTS per peer to avoid infinite churn.
+
+  useEffect(() => {
+    if (!enabled) return
+
+    const interval = setInterval(() => {
+      const stuck = [...e2eeNotReadyRef.current.peers]
+
+      // Drop attempt counters for peers that are no longer stuck.
+      for (const peerId of recoveryAttemptsRef.current.keys()) {
+        if (!stuck.includes(peerId)) {
+          recoveryAttemptsRef.current.delete(peerId)
+        }
+      }
+
+      // Peers that still have attempts remaining.
+      const needy = stuck.filter(
+        p => (recoveryAttemptsRef.current.get(p) ?? 0) < MAX_RECOVERY_ATTEMPTS,
+      )
+
+      if (needy.length > 0) {
+        void broadcastPublicKey()
+        for (const p of needy) {
+          recoveryAttemptsRef.current.set(p, (recoveryAttemptsRef.current.get(p) ?? 0) + 1)
+        }
+      }
+    }, RECOVERY_INTERVAL_MS)
+
+    return () => clearInterval(interval)
+  }, [enabled, broadcastPublicKey])
 
   // ── Handle E2EE signaling messages ─────────────────────────────────
 
