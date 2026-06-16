@@ -679,6 +679,32 @@ describe('useWebRTC', () => {
     })
     expect(addSpy).toHaveBeenCalledTimes(1)
   })
+
+  it('attempts an ICE restart when the connection fails (G5)', async () => {
+    const { result, signaling } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    // Complete the initial offer so the renegotiation lock is released.
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'a0' })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    const pc = MockRTCPeerConnection.instances.at(-1)!
+    const restartSpy = vi.spyOn(pc, 'restartIce')
+    const offersBefore = signaling.sendOffer.mock.calls.length
+
+    await act(async () => {
+      pc.connectionState = 'failed'
+      pc.onconnectionstatechange?.(new Event('connectionstatechange') as unknown as never)
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    expect(restartSpy).toHaveBeenCalledTimes(1)
+    expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offersBefore) // renegotiation offer with fresh ICE
+  })
 })
 
 describe('clampToBwe', () => {
