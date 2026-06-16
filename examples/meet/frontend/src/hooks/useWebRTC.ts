@@ -186,6 +186,42 @@ export function useWebRTC({
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [removeRemotePeer, updateRemotePeersState])
 
+  const reconcile = useCallback((participants: Array<{
+    id: string; display_name?: string; audio_muted: boolean; video_muted: boolean; e2ee?: boolean
+  }>) => {
+    const myId = participantIdRef.current
+    const remote = participants.filter(p => p.id !== myId)
+    const desired = new Set(remote.map(p => p.id))
+
+    // Remove peers no longer present.
+    for (const peerId of [...remotePeersRef.current.keys()]) {
+      if (!desired.has(peerId)) removeRemotePeer(peerId)
+    }
+    // Add peers not yet tracked.
+    for (const p of remote) {
+      if (!remotePeersRef.current.has(p.id)) addRemotePeer(p.id, p.display_name)
+    }
+    // Update flags on tracked peers.
+    for (const p of remote) {
+      const info = remotePeersRef.current.get(p.id)
+      if (info) {
+        info.audioMuted = p.audio_muted
+        info.videoMuted = p.video_muted
+        info.e2ee = p.e2ee ?? false
+      }
+    }
+    // Defensive track-disable for E2EE peers when local client has no E2EE.
+    if (!e2eeEnabledRef.current) {
+      for (const p of remote) {
+        if (!(p.e2ee ?? false)) continue
+        const info = remotePeersRef.current.get(p.id)
+        if (!info) continue
+        for (const track of info.stream.getTracks()) track.enabled = false
+      }
+    }
+    updateRemotePeersState()
+  }, [addRemotePeer, removeRemotePeer, updateRemotePeersState])
+
   const finishRenegotiation = useCallback((): void => {
     if (renegotiationTimerRef.current) {
       clearTimeout(renegotiationTimerRef.current)
@@ -435,50 +471,7 @@ export function useWebRTC({
     }
 
     if (data.type === 'room_status') {
-      const myId = participantIdRef.current
-      const remoteParticipants = data.participants.filter(p => p.id !== myId)
-      const remoteIds = new Set(remoteParticipants.map(p => p.id))
-
-      // Remove peers no longer in the room
-      for (const peerId of remotePeersRef.current.keys()) {
-        if (!remoteIds.has(peerId)) {
-          removeRemotePeer(peerId)
-        }
-      }
-
-      // Add new peers not yet tracked
-      for (const p of remoteParticipants) {
-        if (!remotePeersRef.current.has(p.id)) {
-          addRemotePeer(p.id, p.display_name)
-        }
-      }
-
-      // Update media state for all remote peers
-      for (const p of remoteParticipants) {
-        const info = remotePeersRef.current.get(p.id)
-        if (info) {
-          info.audioMuted = p.audio_muted
-          info.videoMuted = p.video_muted
-          info.e2ee = p.e2ee ?? false
-        }
-      }
-
-      // Disable tracks for E2EE peers when local client has no E2EE.
-      // This prevents the browser from playing encrypted bytes as garbled audio/video.
-      // Note: we do NOT remove decrypt transforms for non-E2EE peers — the E2EE worker
-      // handles passthrough natively (no sender key → frame enqueued as-is).
-      if (!e2eeEnabledRef.current) {
-        for (const p of remoteParticipants) {
-          if (!(p.e2ee ?? false)) continue
-          const info = remotePeersRef.current.get(p.id)
-          if (!info) continue
-          for (const track of info.stream.getTracks()) {
-            track.enabled = false
-          }
-        }
-      }
-
-      updateRemotePeersState()
+      reconcile(data.participants)
       return
     }
 
@@ -587,7 +580,7 @@ export function useWebRTC({
       updateRemotePeersState()
       return
     }
-  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, finishRenegotiation, updateRemotePeersState])
+  }, [createOfferToServer, addRemotePeer, removeRemotePeer, reconcile, renegotiate, finishRenegotiation, updateRemotePeersState])
 
   const replaceLocalTracks = useCallback(async (stream: MediaStream) => {
     const audioTrack = stream.getAudioTracks()[0] ?? null

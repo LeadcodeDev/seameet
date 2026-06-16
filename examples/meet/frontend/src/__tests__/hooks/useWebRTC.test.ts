@@ -402,4 +402,52 @@ describe('useWebRTC', () => {
     // Should have sent another offer for renegotiation
     expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offerCountBefore)
   })
+
+  it('reconcile is idempotent — repeated identical room_status keeps peers stable (INV-1)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a', 'peer-b'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    const status = {
+      type: 'room_status' as const, room_id: 'room-1',
+      participants: [
+        { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+        { id: 'peer-a', audio_muted: false, video_muted: false, screen_sharing: false },
+        { id: 'peer-b', audio_muted: false, video_muted: false, screen_sharing: false },
+      ],
+    }
+
+    await act(async () => { result.current.handleMessage(status); await new Promise(r => setTimeout(r, 10)) })
+    const aRef = result.current.remotePeers.get('peer-a')
+    await act(async () => { result.current.handleMessage(status); await new Promise(r => setTimeout(r, 10)) })
+
+    expect(result.current.remotePeers.size).toBe(2)
+    expect(result.current.remotePeers.get('peer-a')).toBe(aRef)
+  })
+
+  it('toggling one peer does not mutate another peer (INV-4)', async () => {
+    const { result } = renderWebRTC()
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: ['peer-a', 'peer-b'] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    await act(async () => {
+      result.current.handleMessage({
+        type: 'room_status', room_id: 'room-1',
+        participants: [
+          { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+          { id: 'peer-a', audio_muted: false, video_muted: true, screen_sharing: false },
+          { id: 'peer-b', audio_muted: false, video_muted: false, screen_sharing: false },
+        ],
+      })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    expect(result.current.remotePeers.get('peer-a')?.videoMuted).toBe(true)
+    expect(result.current.remotePeers.get('peer-b')?.videoMuted).toBe(false)
+    expect(result.current.remotePeers.get('peer-b')?.audioMuted).toBe(false)
+  })
 })
