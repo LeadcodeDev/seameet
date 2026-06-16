@@ -602,6 +602,55 @@ describe('useWebRTC', () => {
     expect(result.current.remotePeers.size).toBe(8)
   })
 
+  it('releases the lock via watchdog if the initial answer never arrives (G1)', async () => {
+    // Spy on globalThis.setTimeout to capture the watchdog callback that
+    // createOfferToServer arms with delay RENEGOTIATION_TIMEOUT_MS (10 000 ms).
+    const timerCallbacks: Array<() => void> = []
+    const originalSetTimeout = globalThis.setTimeout
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      (fn: TimerHandler, delay?: number, ...args: unknown[]) => {
+        if (delay === 10_000 && typeof fn === 'function') {
+          timerCallbacks.push(fn as () => void)
+        }
+        return originalSetTimeout(fn as () => void, delay, ...args)
+      },
+    )
+
+    try {
+      const { result, signaling } = renderWebRTC()
+
+      // Send ready → createOfferToServer runs, arms the watchdog, sends initial offer.
+      await act(async () => {
+        result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+        await new Promise(r => originalSetTimeout(r, 50)) // flush async chain
+      })
+
+      // Initial offer must have been sent and lock must be held.
+      expect(signaling.sendOffer.mock.calls.length).toBeGreaterThanOrEqual(1)
+      // The watchdog must have been registered.
+      expect(timerCallbacks.length).toBeGreaterThanOrEqual(1)
+
+      // Queue a renegotiation while the (never-answered) initial offer holds the lock.
+      await act(async () => {
+        result.current.handleMessage({ type: 'request_renegotiation', room_id: 'room-1', needed_slots: 1 })
+        await new Promise(r => originalSetTimeout(r, 10))
+      })
+
+      const offersBefore = signaling.sendOffer.mock.calls.length
+
+      // Fire the initial-offer watchdog — no answer ever arrived.
+      // This must release the lock and drain the pending renegotiation.
+      await act(async () => {
+        timerCallbacks[0]()
+        await new Promise(r => originalSetTimeout(r, 30))
+      })
+
+      expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offersBefore)
+    } finally {
+      setTimeoutSpy.mockRestore()
+    }
+  })
+
   it('buffers ICE candidates that arrive before the answer, then flushes them (A4)', async () => {
     const { result } = renderWebRTC()
     await act(async () => {
