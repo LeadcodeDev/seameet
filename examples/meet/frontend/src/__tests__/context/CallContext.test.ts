@@ -279,4 +279,57 @@ describe('CallContext', () => {
 
     expect(hook.result.current.fatalError).toEqual({ code: 403, message: 'e2ee_required' })
   })
+
+  it('duplicate chat messages (same id) are not appended twice', async () => {
+    const { hook, ws } = await setupCall()
+
+    const chatMsg = {
+      type: 'chat_message' as const,
+      from: 'peer-b',
+      room_id: 'test-room',
+      content: 'hello',
+      display_name: 'Bob',
+      timestamp: 1000000,
+    } as SignalingMessage
+
+    // Deliver the same message twice (simulating server replay on reconnect)
+    await act(async () => {
+      ws.serverPush(chatMsg)
+      ws.serverPush(chatMsg)
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+
+    expect(hook.result.current.chatMessages).toHaveLength(1)
+    expect(hook.result.current.chatMessages[0]).toMatchObject({
+      id: 'peer-b-1000000',
+      from: 'peer-b',
+      content: 'hello',
+    })
+  })
+
+  it('fatalError is cleared when signaling reconnects', async () => {
+    const { hook, ws } = await setupCall()
+
+    // Trigger a fatal error
+    await act(async () => {
+      ws.serverPush({ type: 'error', code: 401, message: 'token rejected' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token rejected' })
+
+    // Simulate WS drop — state goes to 'closed'
+    await act(async () => {
+      ws.close()
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+    expect(hook.result.current.signalingState).toBe('closed')
+
+    // Wait for the reconnect timer (1 000 ms) + microtask for the new WS to open
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 1100))
+    })
+
+    expect(hook.result.current.signalingState).toBe('open')
+    expect(hook.result.current.fatalError).toBeNull()
+  })
 })

@@ -112,9 +112,11 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
               encrypted = true
             }
           }
+          const id = `${msg.from}-${msg.timestamp}`
           setChatMessages(prev => {
+            if (prev.some(m => m.id === id)) return prev
             const next = [...prev, {
-              id: `${msg.from}-${msg.timestamp}`,
+              id,
               from: msg.from,
               displayName: msg.display_name ?? msg.from.slice(0, 8),
               content,
@@ -219,6 +221,9 @@ export function CallProvider({ participantId, displayName, roomId, authToken, in
     }
     if (signaling.state === 'open') {
       everOpenRef.current = true
+      // Clear any stale fatal error from before the reconnect; if the error
+      // persists the server will re-send it immediately after re-join.
+      setFatalError(null)
     }
   }, [signaling.state])
 
