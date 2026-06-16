@@ -4,6 +4,7 @@ import { useWebRTC } from '@/hooks/useWebRTC'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { SignalingMessage } from '@/types'
 import { createMockStream } from '../mocks/mock-media'
+import { MockRTCPeerConnection } from '../mocks/mock-rtc'
 
 function createMockSignaling(): UseSignalingReturn & { _sent: SignalingMessage[] } {
   const sent: SignalingMessage[] = []
@@ -337,6 +338,33 @@ describe('useWebRTC', () => {
     const peer = result.current.remotePeers.get('peer-a')
     expect(peer?.screenStream).toBeNull()
     expect(peer?.screenTransceiver).toBeNull()
+  })
+
+  it('recovers a queued renegotiation after setRemoteDescription fails (B2/INV-5)', async () => {
+    const { result, signaling } = renderWebRTC()
+
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    // Queue a second renegotiation while the initial offer is still awaiting an answer.
+    await act(async () => {
+      result.current.handleMessage({ type: 'request_renegotiation', room_id: 'room-1', needed_slots: 2 })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    const offersBefore = signaling.sendOffer.mock.calls.length
+
+    // The next answer fails to apply.
+    MockRTCPeerConnection.failNextSetRemoteDescription = true
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'bad' })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    // The failure path must release the lock AND drain the queued renegotiation → a new offer is sent.
+    expect(signaling.sendOffer.mock.calls.length).toBeGreaterThan(offersBefore)
   })
 
   it('request_renegotiation adds transceiver slots and renegotiates', async () => {

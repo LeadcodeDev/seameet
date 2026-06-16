@@ -70,6 +70,7 @@ export function useWebRTC({
   const renegotiatingRef = useRef(false)
   const renegotiationPendingRef = useRef(false)
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const renegotiateRef = useRef<() => Promise<void>>(async () => {})
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const localAudioTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
@@ -185,6 +186,18 @@ export function useWebRTC({
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [removeRemotePeer, updateRemotePeersState])
 
+  const finishRenegotiation = useCallback((): void => {
+    if (renegotiationTimerRef.current) {
+      clearTimeout(renegotiationTimerRef.current)
+      renegotiationTimerRef.current = null
+    }
+    renegotiatingRef.current = false
+    if (renegotiationPendingRef.current) {
+      renegotiationPendingRef.current = false
+      queueMicrotask(() => { void renegotiateRef.current() })
+    }
+  }, [])
+
   const renegotiate = useCallback(async () => {
     const pc = pcRef.current
     if (!pc) return
@@ -202,11 +215,7 @@ export function useWebRTC({
     renegotiationTimerRef.current = setTimeout(() => {
       if (renegotiatingRef.current) {
         console.warn('[WebRTC] renegotiation timeout (10s) — resetting')
-        renegotiatingRef.current = false
-        if (renegotiationPendingRef.current) {
-          renegotiationPendingRef.current = false
-          renegotiate()
-        }
+        finishRenegotiation()
       }
     }, 10000)
 
@@ -216,7 +225,9 @@ export function useWebRTC({
       offer.sdp!,
     )
     console.log('[WebRTC] renegotiation offer sent')
-  }, [])
+  }, [finishRenegotiation])
+
+  renegotiateRef.current = renegotiate
 
   const createOfferToServer = useCallback(async (existingPeers: string[], displayNames?: Record<string, string>) => {
     console.log(`[WebRTC] createOfferToServer, existingPeers: ${existingPeers.length}, localStream: ${!!localStreamRef.current}`)
@@ -397,26 +408,13 @@ export function useWebRTC({
     if (data.type === 'answer') {
       const pc = pcRef.current
       if (!pc) return
-
-      if (renegotiationTimerRef.current) {
-        clearTimeout(renegotiationTimerRef.current)
-        renegotiationTimerRef.current = null
-      }
-
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp })
+        console.log('[WebRTC] answer applied')
       } catch (e) {
         console.error('[WebRTC] setRemoteDescription failed:', e)
-        renegotiatingRef.current = false
-        return
-      }
-
-      console.log('[WebRTC] answer applied')
-      renegotiatingRef.current = false
-
-      if (renegotiationPendingRef.current) {
-        renegotiationPendingRef.current = false
-        await renegotiate()
+      } finally {
+        finishRenegotiation()
       }
       return
     }
@@ -589,7 +587,7 @@ export function useWebRTC({
       updateRemotePeersState()
       return
     }
-  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, updateRemotePeersState])
+  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, finishRenegotiation, updateRemotePeersState])
 
   const replaceLocalTracks = useCallback(async (stream: MediaStream) => {
     const audioTrack = stream.getAudioTracks()[0] ?? null
