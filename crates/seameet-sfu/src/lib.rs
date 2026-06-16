@@ -277,10 +277,14 @@ impl SignalingHooks for SfuServer {
                     .next_peer_gen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let media_inflight = std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                );
                 let sfu_peer = SfuPeer {
                     cmd_tx,
                     ws_tx: self_tx.clone(),
                     gen: peer_gen,
+                    media_inflight: std::sync::Arc::clone(&media_inflight),
                 };
                 {
                     let mut p = room_peers.write().await;
@@ -290,6 +294,7 @@ impl SignalingHooks for SfuServer {
                             cmd_tx: sfu_peer.cmd_tx.clone(),
                             ws_tx: sfu_peer.ws_tx.clone(),
                             gen: peer_gen,
+                            media_inflight: std::sync::Arc::clone(&media_inflight),
                         },
                     );
                 }
@@ -322,6 +327,7 @@ impl SignalingHooks for SfuServer {
                         local_addr,
                         pid,
                         cmd_rx,
+                        media_inflight,
                         peers_clone,
                         routes_clone,
                         own_audio_pt.unwrap_or(111),
@@ -795,6 +801,7 @@ mod tests {
                 cmd_tx,
                 ws_tx: peer.out_tx.clone(),
                 gen: 0,
+                media_inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             };
 
             let rooms = self.hooks.rooms.read().await;

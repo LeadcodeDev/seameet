@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,12 +76,30 @@ pub struct SfuPeer {
     /// Monotonic generation set when the media task is spawned.
     /// Used to avoid removing a replacement entry on task exit.
     pub gen: u64,
+    /// Count of media packets currently enqueued but not yet processed.
+    /// Used to gate media forwarding without affecting control commands.
+    pub media_inflight: Arc<AtomicUsize>,
 }
 
 pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
 /// Maps remote UDP address → ParticipantId for efficient packet routing.
 /// Uses DashMap for lock-free reads on the hot UDP path.
 pub type RouteTable = Arc<DashMap<SocketAddr, ParticipantId>>;
+
+/// Max media packets in flight per peer before new media is dropped to bound
+/// memory and isolate a slow/stalled consumer. Control commands are unaffected.
+const MEDIA_INFLIGHT_CAP: usize = 512;
+
+/// Try to reserve an in-flight media slot for a peer. Returns true and
+/// increments the counter if below the cap; returns false (caller drops the
+/// packet) if at/over the cap.
+fn try_reserve_media_slot(inflight: &AtomicUsize) -> bool {
+    if inflight.load(Ordering::Relaxed) >= MEDIA_INFLIGHT_CAP {
+        return false;
+    }
+    inflight.fetch_add(1, Ordering::Relaxed);
+    true
+}
 
 /// Maximum number of media packets buffered per source while awaiting renegotiation.
 const MEDIA_BUFFER_CAP: usize = 500;
@@ -129,6 +148,7 @@ pub async fn run_media(
     local_addr: SocketAddr,
     pid: ParticipantId,
     mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
+    media_inflight: Arc<AtomicUsize>,
     peers: Peers,
     routes: RouteTable,
     own_audio_pt: u8,
@@ -311,6 +331,10 @@ pub async fn run_media(
                         }
                     }
                     Some(PeerCmd::Media(m)) => {
+                        // Release the in-flight slot immediately — before any
+                        // early continue — so every dequeued media packet
+                        // decrements the counter exactly once.
+                        media_inflight.fetch_sub(1, Ordering::Relaxed);
                         // Skip audio from muted peers.
                         if m.is_audio && muted_peers.contains(&m.source_pid) {
                             continue;
@@ -793,18 +817,23 @@ async fn drain_outputs(
                     let p = peers.read().await;
                     for (id, peer) in p.iter() {
                         if id != pid {
-                            let _ = peer.cmd_tx.send(PeerCmd::Media(ForwardedMedia {
-                                pt: *pkt.header.payload_type,
-                                seq_no: (*pkt.seq_no).into(),
-                                time: pkt.header.timestamp,
-                                marker: pkt.header.marker,
-                                payload: payload.clone(),
-                                is_audio,
-                                is_screen,
-                                source_pid: *pid,
-                                wallclock: now,
-                                ext_vals: Arc::clone(&ext_vals),
-                            }));
+                            if try_reserve_media_slot(&peer.media_inflight) {
+                                let _ = peer.cmd_tx.send(PeerCmd::Media(ForwardedMedia {
+                                    pt: *pkt.header.payload_type,
+                                    seq_no: (*pkt.seq_no).into(),
+                                    time: pkt.header.timestamp,
+                                    marker: pkt.header.marker,
+                                    payload: payload.clone(),
+                                    is_audio,
+                                    is_screen,
+                                    source_pid: *pid,
+                                    wallclock: now,
+                                    ext_vals: Arc::clone(&ext_vals),
+                                }));
+                            }
+                            // Slow/stalled consumer — drop media to bound memory
+                            // and isolate this peer. str0m's NACK/RTX + receiver
+                            // PLC absorb the loss; a keyframe recovers video.
                         }
                     }
                 }
@@ -1755,6 +1784,17 @@ a=mid:3\r\n";
     fn test_media_buffer_cap() {
         // Verify the buffer cap constant is what we expect.
         assert_eq!(MEDIA_BUFFER_CAP, 500);
+    }
+
+    #[test]
+    fn try_reserve_media_slot_caps_inflight() {
+        let inflight = AtomicUsize::new(MEDIA_INFLIGHT_CAP - 1);
+        // One slot left → reserve succeeds, now at cap.
+        assert!(try_reserve_media_slot(&inflight));
+        assert_eq!(inflight.load(Ordering::Relaxed), MEDIA_INFLIGHT_CAP);
+        // At cap → reservation fails and the counter does not grow.
+        assert!(!try_reserve_media_slot(&inflight));
+        assert_eq!(inflight.load(Ordering::Relaxed), MEDIA_INFLIGHT_CAP);
     }
 
     // ── E2E: write_forwarded_rtp with real Rtc ──────────────────────
