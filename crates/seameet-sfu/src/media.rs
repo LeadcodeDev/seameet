@@ -117,6 +117,16 @@ fn try_reserve_media_slot(inflight: &AtomicUsize, cap: usize) -> bool {
 /// Maximum number of media packets buffered per source while awaiting renegotiation.
 const MEDIA_BUFFER_CAP: usize = 500;
 
+/// Buffered media older than this at flush time is dropped, to avoid replaying
+/// a burst of stale audio/video after a slow renegotiation (a fresh keyframe is
+/// requested right after the flush, so dropping stale video is safe).
+const PENDING_MEDIA_MAX_AGE: Duration = Duration::from_millis(1000);
+
+/// Whether a buffered packet captured at `wallclock` is too old to forward at `now`.
+fn is_pending_media_stale(wallclock: Instant, now: Instant) -> bool {
+    now.duration_since(wallclock) > PENDING_MEDIA_MAX_AGE
+}
+
 // ── UDP reader (single socket, broadcast to all peers) ─────────────────
 
 pub async fn udp_reader(socket: Arc<UdpSocket>, peers: Peers, routes: RouteTable) {
@@ -473,9 +483,15 @@ pub async fn run_media(
                         if !pending_media.is_empty() {
                             let sources: Vec<ParticipantId> = pending_media.keys().copied().collect();
                             let mut flushed_count = 0usize;
+                            let flush_now = Instant::now();
+                            let mut stale_dropped = 0usize;
                             for source_pid in sources {
                                 if let Some(buffered) = pending_media.remove(&source_pid) {
                                     for m in &buffered {
+                                        if is_pending_media_stale(m.wallclock, flush_now) {
+                                            stale_dropped += 1;
+                                            continue;
+                                        }
                                         write_forwarded_rtp(
                                             &mut rtc, m, &mut source_slots, &mut rtp_tx_count,
                                             &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
@@ -491,6 +507,9 @@ pub async fn run_media(
                                         }
                                     }
                                 }
+                            }
+                            if stale_dropped > 0 {
+                                info!(participant = %pid, stale_dropped, "dropped stale buffered media on flush");
                             }
                             if flushed_count > 0 {
                                 info!(participant = %pid, flushed_count, "flushed buffered media after renegotiation");
@@ -2424,5 +2443,16 @@ a=mid:3\r\n";
             source_slots.get(&user3).unwrap().video_mid, user3_video_mid,
             "user3 slot unchanged after user2 left"
         );
+    }
+
+    // ── pending media staleness ─────────────────────────────────────
+
+    #[test]
+    fn pending_media_staleness_threshold() {
+        let now = Instant::now();
+        // A 2s-old packet is stale.
+        assert!(is_pending_media_stale(now - Duration::from_secs(2), now));
+        // A 100ms-old packet is fresh.
+        assert!(!is_pending_media_stale(now - Duration::from_millis(100), now));
     }
 }
