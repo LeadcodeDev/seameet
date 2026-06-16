@@ -503,6 +503,48 @@ describe('useWebRTC', () => {
     expect(kf.length).toBeGreaterThan(0)
   })
 
+  it('adds peers skipped due to pool exhaustion after request_renegotiation grows the pool (B1)', async () => {
+    const { result } = renderWebRTC()
+
+    // Join with no existing peers → pool = MAX_PEER_SLOTS (7).
+    await act(async () => {
+      result.current.handleMessage({ type: 'ready', room_id: 'room-1', initiator: true, peers: [] })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    // Apply the initial answer so the connection is established.
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'a0' })
+      await new Promise(r => setTimeout(r, 10))
+    })
+
+    // room_status with 8 REMOTE peers (+ self) → only 7 fit; the 8th is skipped.
+    const participants = [
+      { id: 'p1', audio_muted: false, video_muted: false, screen_sharing: false },
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: `peer-${i}`, audio_muted: false, video_muted: false, screen_sharing: false,
+      })),
+    ]
+    await act(async () => {
+      result.current.handleMessage({ type: 'room_status', room_id: 'room-1', participants })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    expect(result.current.remotePeers.size).toBe(7) // 8th skipped — pool exhausted
+
+    // Server asks for 1 more slot. The handler grows the pool, renegotiates,
+    // and (the fix) re-reconciles → the 8th peer is finally added.
+    await act(async () => {
+      result.current.handleMessage({ type: 'request_renegotiation', room_id: 'room-1', needed_slots: 1 })
+      await new Promise(r => setTimeout(r, 20))
+    })
+    // Apply the renegotiation answer.
+    await act(async () => {
+      result.current.handleMessage({ type: 'answer', from: 'server', to: 'p1', room_id: 'room-1', sdp: 'a1' })
+      await new Promise(r => setTimeout(r, 20))
+    })
+
+    expect(result.current.remotePeers.size).toBe(8)
+  })
+
   it('buffers ICE candidates that arrive before the answer, then flushes them (A4)', async () => {
     const { result } = renderWebRTC()
     await act(async () => {

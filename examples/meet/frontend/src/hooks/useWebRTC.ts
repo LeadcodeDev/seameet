@@ -80,6 +80,11 @@ export function useWebRTC({
   // Pool of pre-allocated transceiver pairs from the initial offer.
   const transceiverPoolRef = useRef<TransceiverSlot[]>([])
 
+  // Last participants list from room_status — used to re-reconcile after pool growth.
+  const lastParticipantsRef = useRef<Array<{
+    id: string; display_name?: string; audio_muted: boolean; video_muted: boolean; screen_sharing: boolean; e2ee?: boolean
+  }>>([])
+
   // Tracks that arrived via ontrack before their peer/mid was reconciled.
   const pendingTracksByMid = useRef<Map<string, MediaStreamTrack>>(new Map())
 
@@ -219,6 +224,7 @@ export function useWebRTC({
   const reconcile = useCallback((participants: Array<{
     id: string; display_name?: string; audio_muted: boolean; video_muted: boolean; e2ee?: boolean
   }>) => {
+    lastParticipantsRef.current = participants
     const myId = participantIdRef.current
     const remote = participants.filter(p => p.id !== myId)
     const desired = new Set(remote.map(p => p.id))
@@ -530,6 +536,9 @@ export function useWebRTC({
         })
       }
       await renegotiate()
+      // Pool grew — re-attempt any peers that were skipped while the pool was
+      // exhausted (they were never added to remotePeers, so reconcile adds them now).
+      reconcile(lastParticipantsRef.current)
       return
     }
 
