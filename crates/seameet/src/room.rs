@@ -247,6 +247,28 @@ pub struct Room {
 }
 
 impl Room {
+    // ── Lock helpers ────────────────────────────────────────────────────────
+    //
+    // std RwLock poisoning only happens if a thread panicked mid-mutation; the
+    // participant map mutations are trivial, so recovering the guard keeps the
+    // room available instead of wedging it.
+
+    fn read_participants(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<ParticipantId, ParticipantEntry>> {
+        self.participants
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn write_participants(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<ParticipantId, ParticipantEntry>> {
+        self.participants
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Creates a new empty room with the given configuration.
     pub fn new(config: RoomConfig) -> Self {
         let (global_stop_tx, _) = broadcast::channel(4);
@@ -306,10 +328,7 @@ impl Room {
     {
         // Check capacity under a brief read lock.
         {
-            let participants = self
-                .participants
-                .read()
-                .map_err(|_| SeaMeetError::PeerConnection("lock poisoned".into()))?;
+            let participants = self.read_participants();
             if participants.len() >= self.config.max_participants {
                 return Err(SeaMeetError::RoomFull);
             }
@@ -378,7 +397,10 @@ impl Room {
             let _ = event_tx.send(RoomEvent::ParticipantLeft(id));
 
             // Remove from participants map.
-            if let Ok(mut parts) = participants_ref.write() {
+            {
+                let mut parts = participants_ref
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
                 parts.remove(&id);
                 if parts.is_empty() {
                     let _ = event_tx.send(RoomEvent::RoomEmpty);
@@ -388,10 +410,7 @@ impl Room {
 
         // Insert under a brief write lock.
         {
-            let mut participants = self
-                .participants
-                .write()
-                .map_err(|_| SeaMeetError::PeerConnection("lock poisoned".into()))?;
+            let mut participants = self.write_participants();
             participants.insert(
                 id,
                 ParticipantEntry {
@@ -415,7 +434,7 @@ impl Room {
 
     /// Returns `true` if a participant with this identifier is currently in the room.
     pub fn has_participant(&self, id: &ParticipantId) -> bool {
-        let participants = self.participants.read().expect("lock not poisoned");
+        let participants = self.read_participants();
         participants.contains_key(id)
     }
 
@@ -424,7 +443,7 @@ impl Room {
     /// Returns `Err(SeaMeetError::ParticipantNotFound(id))` if the participant
     /// is not in the room.
     pub fn get_participant(&self, id: &ParticipantId) -> Result<RoomHandle, SeaMeetError> {
-        let participants = self.participants.read().expect("lock not poisoned");
+        let participants = self.read_participants();
         participants
             .get(id)
             .map(|e| e.handle.clone())
@@ -434,7 +453,7 @@ impl Room {
     /// Returns the handles of all currently connected participants.
     /// The order is not guaranteed.
     pub fn fetch_participants(&self) -> Vec<RoomHandle> {
-        let participants = self.participants.read().expect("lock not poisoned");
+        let participants = self.read_participants();
         participants.values().map(|e| e.handle.clone()).collect()
     }
 
@@ -448,10 +467,7 @@ impl Room {
     /// This is a silent no-op if the participant is not in the room.
     pub async fn remove_participant(&self, id: &ParticipantId) -> Result<(), SeaMeetError> {
         let entry = {
-            let mut participants = self
-                .participants
-                .write()
-                .map_err(|_| SeaMeetError::PeerConnection("lock poisoned".into()))?;
+            let mut participants = self.write_participants();
             participants.remove(id)
         };
         // Lock is released here.
@@ -464,7 +480,7 @@ impl Room {
             let _ = self.event_tx.send(RoomEvent::ParticipantLeft(*id));
 
             let is_empty = {
-                let participants = self.participants.read().expect("lock not poisoned");
+                let participants = self.read_participants();
                 participants.is_empty()
             };
             if is_empty {
@@ -490,7 +506,7 @@ impl Room {
 
     /// Returns the number of currently connected participants.
     pub fn participant_count(&self) -> usize {
-        self.participants.read().expect("lock not poisoned").len()
+        self.read_participants().len()
     }
 
     /// Closes the room, stopping all participant tasks.
@@ -504,7 +520,7 @@ impl Room {
 
         // Collect participant IDs before emitting RoomEnded.
         let ids: Vec<ParticipantId> = {
-            let parts = self.participants.read().expect("lock not poisoned");
+            let parts = self.read_participants();
             parts.keys().copied().collect()
         };
 
@@ -521,7 +537,7 @@ impl Room {
 
     /// Returns all active screen share tracks in the room, across all participants.
     pub fn active_screen_shares(&self) -> Vec<(ParticipantId, TrackId)> {
-        let participants = self.participants.read().expect("lock not poisoned");
+        let participants = self.read_participants();
         participants
             .iter()
             .flat_map(|(pid, entry)| {
@@ -536,7 +552,8 @@ impl Room {
         participant: &ParticipantId,
         track_id: TrackId,
     ) {
-        if let Ok(mut participants) = self.participants.write() {
+        {
+            let mut participants = self.write_participants();
             if let Some(entry) = participants.get_mut(participant) {
                 entry.screen_tracks.insert(track_id);
             }
@@ -553,7 +570,8 @@ impl Room {
         participant: &ParticipantId,
         track_id: TrackId,
     ) {
-        if let Ok(mut participants) = self.participants.write() {
+        {
+            let mut participants = self.write_participants();
             if let Some(entry) = participants.get_mut(participant) {
                 entry.screen_tracks.remove(&track_id);
             }

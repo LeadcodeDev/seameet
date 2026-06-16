@@ -598,6 +598,9 @@ pub fn broadcast_room_status(state: &SignalingState, room_id: &str) {
 ///
 /// The `max_chat_history` parameter controls how many chat messages are
 /// retained per room for late joiners (0 = unlimited, for backward compat).
+/// The `max_room_members` parameter is re-checked atomically under the write
+/// lock in the `Join` branch to close the TOCTOU race with the pre-check in
+/// `run_connection`.
 pub async fn dispatch(
     sdp: &SdpMessage,
     raw: &str,
@@ -605,6 +608,7 @@ pub async fn dispatch(
     self_tx: &WsSink,
     state: &Arc<RwLock<SignalingState>>,
     max_chat_history: usize,
+    max_room_members: usize,
 ) {
     match sdp {
         SdpMessage::Join {
@@ -622,6 +626,25 @@ pub async fn dispatch(
                 for stale_pid in &pruned {
                     info!(participant = %stale_pid, room = room_id, "pruned stale member on join");
                 }
+            }
+
+            // Atomic re-check of room capacity under the held write lock.
+            // Closes the TOCTOU window between the pre-check in run_connection
+            // (read lock, already released) and this insert.
+            let full = st
+                .room(room_id)
+                .map(|r| r.member_count() >= max_room_members)
+                .unwrap_or(false);
+            if full {
+                warn!(participant = %participant, room = %room_id, "room full (atomic re-check)");
+                let err = SdpMessage::Error {
+                    code: 403,
+                    message: "room is full".into(),
+                };
+                if let Ok(json) = serde_json::to_string(&err) {
+                    let _ = self_tx.send(json);
+                }
+                return;
             }
 
             // Collect existing peer IDs and display names *before* joining.
@@ -786,6 +809,92 @@ pub async fn dispatch(
     }
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seameet_core::ParticipantId;
+    use tokio::sync::mpsc;
+
+    /// Fill a room to exactly `cap` members via `dispatch`, then verify that
+    /// a (cap+1)-th `Join` via `dispatch` is rejected with a 403 and does NOT
+    /// increase room membership. This exercises the atomic re-check added
+    /// under the write lock in the `Join` branch.
+    ///
+    /// Note: we keep all sinks alive for the duration of the test so that
+    /// `prune_stale` (which checks `sink.is_closed()`) does not evict the
+    /// existing members before the overflow join is attempted.
+    #[tokio::test]
+    async fn test_dispatch_rejects_overfull_join() {
+        let cap: usize = 2;
+        let state: Arc<RwLock<SignalingState>> = Arc::new(RwLock::new(SignalingState::new()));
+        let room_id = "capacity-test-room";
+
+        // Keep all sink halves alive so prune_stale does not evict members.
+        let mut _live_sinks: Vec<mpsc::UnboundedReceiver<String>> = Vec::new();
+
+        // Fill the room to `cap` members.
+        for _ in 0..cap {
+            let pid = ParticipantId::random();
+            let (sink_tx, sink_rx) = mpsc::unbounded_channel::<String>();
+            _live_sinks.push(sink_rx);
+            let join_msg = SdpMessage::Join {
+                participant: pid,
+                room_id: room_id.to_owned(),
+                display_name: None,
+                token: None,
+            };
+            let raw = serde_json::to_string(&join_msg).unwrap();
+            dispatch(&join_msg, &raw, pid, &sink_tx, &state, 1000, cap).await;
+        }
+
+        // Verify the room is at capacity.
+        {
+            let st = state.read().await;
+            assert_eq!(
+                st.room(room_id).map(|r| r.member_count()).unwrap_or(0),
+                cap,
+                "room should be at cap before the over-limit join"
+            );
+        }
+
+        // Attempt to join one more participant.
+        let overflow_pid = ParticipantId::random();
+        let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel::<String>();
+        let overflow_join = SdpMessage::Join {
+            participant: overflow_pid,
+            room_id: room_id.to_owned(),
+            display_name: None,
+            token: None,
+        };
+        let overflow_raw = serde_json::to_string(&overflow_join).unwrap();
+        dispatch(&overflow_join, &overflow_raw, overflow_pid, &overflow_tx, &state, 1000, cap).await;
+
+        // The room count MUST NOT have increased.
+        {
+            let st = state.read().await;
+            assert_eq!(
+                st.room(room_id).map(|r| r.member_count()).unwrap_or(0),
+                cap,
+                "room member count must not increase beyond cap"
+            );
+        }
+
+        // The overflow participant must have received a 403 error.
+        let mut got_403 = false;
+        while let Ok(raw_json) = overflow_rx.try_recv() {
+            if let Ok(SdpMessage::Error { code, .. }) = serde_json::from_str::<SdpMessage>(&raw_json) {
+                if code == 403 {
+                    got_403 = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_403, "overflow joiner must receive a 403 error");
+    }
+}
+
 // ── Connection lifecycle ────────────────────────────────────────────────
 
 /// Runs the full lifecycle of a single connection through the signaling engine.
@@ -947,7 +1056,7 @@ pub async fn run_connection<H: SignalingHooks>(
                     .on_message(&sanitized_sdp, &sanitized_raw, pid, &tx, &state)
                     .await;
                 if !handled {
-                    dispatch(&sanitized_sdp, &sanitized_raw, pid, &tx, &state, hooks.max_chat_history()).await;
+                    dispatch(&sanitized_sdp, &sanitized_raw, pid, &tx, &state, hooks.max_chat_history(), hooks.max_room_members()).await;
                 }
 
                 // ── Arm the E2EE handshake deadline ────────────────────
@@ -988,7 +1097,7 @@ pub async fn run_connection<H: SignalingHooks>(
         // Let hooks intercept the message first.
         let handled = hooks.on_message(&sdp, &msg, pid, &tx, &state).await;
         if !handled {
-            dispatch(&sdp, &msg, pid, &tx, &state, hooks.max_chat_history()).await;
+            dispatch(&sdp, &msg, pid, &tx, &state, hooks.max_chat_history(), hooks.max_room_members()).await;
         }
     }
 
