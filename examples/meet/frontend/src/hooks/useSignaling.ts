@@ -1,6 +1,9 @@
 import { useRef, useCallback, useState, useEffect } from 'react'
 import type { SignalingMessage } from '@/types'
 
+const QUEUE_CAP = 100
+const NON_QUEUEABLE = new Set(['offer', 'answer', 'ice_candidate', 'join'])
+
 export interface UseSignalingOptions {
   url?: string
   onMessage: (msg: SignalingMessage) => void
@@ -29,6 +32,7 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
   const reconnectDelayRef = useRef(1000)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mountedRef = useRef(true)
+  const outboundQueueRef = useRef<SignalingMessage[]>([])
   const [state, setState] = useState<'connecting' | 'open' | 'closed'>('connecting')
 
   // Keep onMessage ref fresh to avoid stale closures
@@ -95,6 +99,12 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
   const send = useCallback((msg: SignalingMessage) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg))
+    } else if (!NON_QUEUEABLE.has(msg.type)) {
+      outboundQueueRef.current.push(msg)
+      if (outboundQueueRef.current.length > QUEUE_CAP) {
+        outboundQueueRef.current.shift()
+        console.warn('[signaling] outbound queue full, dropping oldest')
+      }
     }
   }, [])
 
@@ -106,6 +116,11 @@ export function useSignaling({ url, onMessage }: UseSignalingOptions): UseSignal
       display_name: displayName,
       token,
     })
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      const queued = outboundQueueRef.current
+      outboundQueueRef.current = []
+      for (const m of queued) wsRef.current.send(JSON.stringify(m))
+    }
   }, [send])
 
   const sendOffer = useCallback((from: string, roomId: string, sdp: string) => {
