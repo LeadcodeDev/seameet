@@ -384,6 +384,24 @@ pub async fn run_media(
                             }
                             // Track per-source keyframe burst
                             source_keyframe_pending.insert(m.source_pid, Instant::now());
+
+                            // Notify this receiver of the exact mid carrying the sharer's
+                            // screen RTP, so the client doesn't have to guess.
+                            if gained_screen_mid {
+                                if let Some(s_mid) = source_slots
+                                    .get(&m.source_pid)
+                                    .and_then(|s| s.screen_mid)
+                                {
+                                    let routed = SdpMessage::ScreenShareRouted {
+                                        from: m.source_pid,
+                                        mid: format!("{s_mid}"),
+                                        room_id: room_id.clone(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&routed) {
+                                        let _ = ws_tx.send(json);
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(PeerCmd::RequestKeyframe) => {

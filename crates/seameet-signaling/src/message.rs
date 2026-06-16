@@ -262,6 +262,17 @@ pub enum SdpMessage {
         /// Audio level (0 = silence, 127 = loudest).
         level: u8,
     },
+    /// Server → a specific receiver: the sharer `from`'s screen-share RTP is being
+    /// forwarded on transceiver `mid` for THIS receiver. The client binds its screen
+    /// tile to exactly this mid instead of guessing.
+    ScreenShareRouted {
+        /// The participant sharing their screen.
+        from: ParticipantId,
+        /// The transceiver mid on which this receiver will receive the screen RTP.
+        mid: String,
+        /// The room this share belongs to.
+        room_id: String,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -297,7 +308,8 @@ impl SdpMessage {
             | Self::E2eeSenderKey { room_id, .. }
             | Self::E2eeKeyRotation { room_id, .. }
             | Self::ChatMessage { room_id, .. }
-            | Self::ActiveSpeaker { room_id, .. } => Some(room_id),
+            | Self::ActiveSpeaker { room_id, .. }
+            | Self::ScreenShareRouted { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
         }
     }
@@ -329,6 +341,7 @@ impl SdpMessage {
             Self::E2eeKeyRotation { .. } => "e2ee_key_rotation",
             Self::ChatMessage { .. } => "chat_message",
             Self::ActiveSpeaker { .. } => "active_speaker",
+            Self::ScreenShareRouted { .. } => "screen_share_routed",
             Self::Error { .. } => "error",
         }
     }
@@ -638,5 +651,21 @@ mod tests {
         let back: SdpMessage = serde_json::from_str(&json).expect("de");
         assert_eq!(back, msg);
         assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_screen_share_routed_serde() {
+        let msg = SdpMessage::ScreenShareRouted {
+            from: id_a(),
+            mid: "5".into(),
+            room_id: "room-1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"screen_share_routed\""));
+        assert!(json.contains("\"mid\":\"5\""));
+        let back: SdpMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), "screen_share_routed");
+        assert_eq!(back.room_id(), Some("room-1"));
+        assert_eq!(back, msg);
     }
 }
