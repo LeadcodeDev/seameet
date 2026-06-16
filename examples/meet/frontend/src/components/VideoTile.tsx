@@ -32,19 +32,33 @@ function getInitials(name: string): string {
 
 export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioEnabled, videoEnabled, isScreenShare, e2eeActive, e2eeNotReady, isActiveSpeaker, verification }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const attachedTrackIdsRef = useRef<string>('')
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
-    // Null first to force Chrome to tear down and reinit the decoder
-    // even when the same track objects are reused on a new MediaStream.
-    video.srcObject = null
-    video.srcObject = stream
+    const ids = stream ? stream.getTracks().map(t => t.id).sort().join(',') : ''
+    const trackSetChanged = ids !== attachedTrackIdsRef.current
+    attachedTrackIdsRef.current = ids
 
+    if (trackSetChanged) {
+      // Only tear down the decoder when the track set actually changed.
+      // Null first to force Chrome to tear down and reinit the decoder
+      // even when the same track objects are reused on a new MediaStream.
+      video.srcObject = null
+      video.srcObject = stream
+    }
     if (!stream) return
 
-    const tryPlay = () => { video.play().catch(() => {}) }
+    let cancelled = false
+    const tryPlay = () => {
+      video.play().catch((err: unknown) => {
+        if (!cancelled && err instanceof DOMException && err.name === 'AbortError') {
+          requestAnimationFrame(() => { if (!cancelled) video.play().catch(() => {}) })
+        }
+      })
+    }
     tryPlay()
 
     // When a track unmutes (RTP starts arriving after reconnection),
@@ -53,6 +67,7 @@ export const VideoTile = memo(function VideoTile({ stream, name, isLocal, audioE
     const tracks = stream.getTracks()
     for (const t of tracks) t.addEventListener('unmute', tryPlay)
     return () => {
+      cancelled = true
       for (const t of tracks) t.removeEventListener('unmute', tryPlay)
     }
   }, [stream])
