@@ -82,9 +82,12 @@ pub struct SfuPeer {
     /// Monotonic generation set when the media task is spawned.
     /// Used to avoid removing a replacement entry on task exit.
     pub gen: u64,
-    /// Count of media packets currently enqueued but not yet processed.
-    /// Used to gate media forwarding without affecting control commands.
-    pub media_inflight: Arc<AtomicUsize>,
+    /// Count of audio packets currently enqueued but not yet processed.
+    /// Used to gate audio forwarding without affecting control commands or video.
+    pub audio_inflight: Arc<AtomicUsize>,
+    /// Count of video (and screen-share) packets currently enqueued but not yet processed.
+    /// Used to gate video forwarding without affecting control commands or audio.
+    pub video_inflight: Arc<AtomicUsize>,
 }
 
 pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
@@ -92,15 +95,19 @@ pub type Peers = Arc<RwLock<HashMap<ParticipantId, SfuPeer>>>;
 /// Uses DashMap for lock-free reads on the hot UDP path.
 pub type RouteTable = Arc<DashMap<SocketAddr, ParticipantId>>;
 
-/// Max media packets in flight per peer before new media is dropped to bound
-/// memory and isolate a slow/stalled consumer. Control commands are unaffected.
-const MEDIA_INFLIGHT_CAP: usize = 512;
+/// Max audio packets in flight per peer before new audio is dropped to bound
+/// memory and isolate a slow/stalled consumer. Audio has a smaller cap so that
+/// a video burst cannot starve audio (which lacks keyframe recovery).
+const AUDIO_INFLIGHT_CAP: usize = 128;
+/// Max video (and screen-share) packets in flight per peer before new video is
+/// dropped. Larger cap to accommodate keyframe bursts without losing audio.
+const VIDEO_INFLIGHT_CAP: usize = 512;
 
-/// Try to reserve an in-flight media slot for a peer. Returns true and
-/// increments the counter if below the cap; returns false (caller drops the
-/// packet) if at/over the cap.
-fn try_reserve_media_slot(inflight: &AtomicUsize) -> bool {
-    if inflight.load(Ordering::Relaxed) >= MEDIA_INFLIGHT_CAP {
+/// Try to reserve an in-flight media slot for a peer with the given cap.
+/// Returns true and increments the counter if below the cap; returns false
+/// (caller drops the packet) if at/over the cap.
+fn try_reserve_media_slot(inflight: &AtomicUsize, cap: usize) -> bool {
+    if inflight.load(Ordering::Relaxed) >= cap {
         return false;
     }
     inflight.fetch_add(1, Ordering::Relaxed);
@@ -154,7 +161,8 @@ pub async fn run_media(
     local_addr: SocketAddr,
     pid: ParticipantId,
     mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
-    media_inflight: Arc<AtomicUsize>,
+    audio_inflight: Arc<AtomicUsize>,
+    video_inflight: Arc<AtomicUsize>,
     peers: Peers,
     routes: RouteTable,
     own_audio_pt: u8,
@@ -340,7 +348,11 @@ pub async fn run_media(
                         // Release the in-flight slot immediately — before any
                         // early continue — so every dequeued media packet
                         // decrements the counter exactly once.
-                        media_inflight.fetch_sub(1, Ordering::Relaxed);
+                        if m.is_audio {
+                            audio_inflight.fetch_sub(1, Ordering::Relaxed);
+                        } else {
+                            video_inflight.fetch_sub(1, Ordering::Relaxed);
+                        }
                         // Skip audio from muted peers.
                         if m.is_audio && muted_peers.contains(&m.source_pid) {
                             continue;
@@ -849,7 +861,12 @@ async fn drain_outputs(
                     let p = peers.read().await;
                     for (id, peer) in p.iter() {
                         if id != pid {
-                            if try_reserve_media_slot(&peer.media_inflight) {
+                            let (counter, cap) = if is_audio {
+                                (&peer.audio_inflight, AUDIO_INFLIGHT_CAP)
+                            } else {
+                                (&peer.video_inflight, VIDEO_INFLIGHT_CAP)
+                            };
+                            if try_reserve_media_slot(counter, cap) {
                                 let _ = peer.cmd_tx.send(PeerCmd::Media(ForwardedMedia {
                                     pt: *pkt.header.payload_type,
                                     seq_no: (*pkt.seq_no).into(),
@@ -1861,13 +1878,24 @@ a=mid:3\r\n";
 
     #[test]
     fn try_reserve_media_slot_caps_inflight() {
-        let inflight = AtomicUsize::new(MEDIA_INFLIGHT_CAP - 1);
+        let inflight = AtomicUsize::new(VIDEO_INFLIGHT_CAP - 1);
         // One slot left → reserve succeeds, now at cap.
-        assert!(try_reserve_media_slot(&inflight));
-        assert_eq!(inflight.load(Ordering::Relaxed), MEDIA_INFLIGHT_CAP);
+        assert!(try_reserve_media_slot(&inflight, VIDEO_INFLIGHT_CAP));
+        assert_eq!(inflight.load(Ordering::Relaxed), VIDEO_INFLIGHT_CAP);
         // At cap → reservation fails and the counter does not grow.
-        assert!(!try_reserve_media_slot(&inflight));
-        assert_eq!(inflight.load(Ordering::Relaxed), MEDIA_INFLIGHT_CAP);
+        assert!(!try_reserve_media_slot(&inflight, VIDEO_INFLIGHT_CAP));
+        assert_eq!(inflight.load(Ordering::Relaxed), VIDEO_INFLIGHT_CAP);
+    }
+
+    #[test]
+    fn audio_and_video_backpressure_are_independent() {
+        let audio = AtomicUsize::new(0);
+        let video = AtomicUsize::new(VIDEO_INFLIGHT_CAP); // video saturated
+        // Video is at cap → reservation fails.
+        assert!(!try_reserve_media_slot(&video, VIDEO_INFLIGHT_CAP));
+        // Audio is independent and still has capacity.
+        assert!(try_reserve_media_slot(&audio, AUDIO_INFLIGHT_CAP));
+        assert_eq!(audio.load(Ordering::Relaxed), 1);
     }
 
     // ── E2E: write_forwarded_rtp with real Rtc ──────────────────────
