@@ -29,7 +29,6 @@ export default function LobbyPage() {
   const [roomCode, setRoomCode] = useState(code ?? '')
   const [cameraOn, setCameraOn] = useState(false)
   const [micOn, setMicOn] = useState(false)
-  const [e2eeOn, setE2eeOn] = useState(false)
   const e2eeSupported = isE2EESupported()
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -88,7 +87,9 @@ export default function LobbyPage() {
       streamRef.current.getTracks().forEach((t) => t.stop())
       streamRef.current = null
     }
-    navigate(`/room/${finalCode}`, { state: { cameraOn, micOn, e2eeOn } })
+    // E2EE is mandatory server-side: every participant must publish a public
+    // key within 5s of Join or the SFU disconnects them with 403 e2ee_required.
+    navigate(`/room/${finalCode}`, { state: { cameraOn, micOn, e2eeOn: true } })
   }
 
   return (
@@ -142,19 +143,25 @@ export default function LobbyPage() {
               >
                 {cameraOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
               </Button>
-              {e2eeSupported && (
-                <Button
-                  data-testid="lobby-toggle-e2ee"
-                  type="button"
-                  variant={e2eeOn ? 'default' : 'secondary'}
-                  size="icon"
-                  onClick={() => setE2eeOn((v) => !v)}
-                  title="End-to-end encryption"
-                >
-                  <ShieldCheck className="w-4 h-4" />
-                </Button>
-              )}
+              <div
+                data-testid="lobby-e2ee-status"
+                className="inline-flex items-center justify-center h-9 w-9 rounded-md bg-primary/10 text-primary"
+                title="End-to-end encryption is enforced for every participant"
+              >
+                <ShieldCheck className="w-4 h-4" />
+              </div>
             </div>
+
+            {!e2eeSupported && (
+              <p
+                data-testid="lobby-e2ee-unsupported"
+                className="text-xs text-destructive text-center"
+              >
+                Your browser does not support end-to-end encryption (Insertable
+                Streams). Please use a recent Chrome, Edge, or Safari build to
+                join this room.
+              </p>
+            )}
 
             <div className="space-y-2">
               <Input
@@ -176,7 +183,12 @@ export default function LobbyPage() {
               />
             </div>
 
-            <Button data-testid="btn-join" type="submit" className="w-full" disabled={!displayName.trim()}>
+            <Button
+              data-testid="btn-join"
+              type="submit"
+              className="w-full"
+              disabled={!displayName.trim() || !e2eeSupported}
+            >
               Join
             </Button>
           </form>

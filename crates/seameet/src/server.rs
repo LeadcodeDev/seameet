@@ -48,6 +48,8 @@ pub(crate) struct ClosureHooks<H: SignalingHooks> {
     max_chat_history: Option<usize>,
     max_room_id_len: Option<usize>,
     max_display_name_len: Option<usize>,
+    require_e2ee: bool,
+    e2ee_join_timeout: Option<std::time::Duration>,
 }
 
 impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
@@ -128,10 +130,9 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
             _ => {}
         }
 
-        let message_type = message_type_name(sdp);
         let _ = self.event_tx.send(ServerEvent::MessageReceived {
             participant: pid,
-            message_type: message_type.to_owned(),
+            message_type: sdp.kind().to_owned(),
         });
 
         suppressed
@@ -179,33 +180,14 @@ impl<H: SignalingHooks> SignalingHooks for ClosureHooks<H> {
         self.max_display_name_len
             .unwrap_or_else(|| self.inner.max_display_name_len())
     }
-}
 
-fn message_type_name(sdp: &SdpMessage) -> &'static str {
-    match sdp {
-        SdpMessage::Join { .. } => "join",
-        SdpMessage::Leave { .. } => "leave",
-        SdpMessage::Offer { .. } => "offer",
-        SdpMessage::Answer { .. } => "answer",
-        SdpMessage::IceCandidate { .. } => "ice_candidate",
-        SdpMessage::Ready { .. } => "ready",
-        SdpMessage::PeerJoined { .. } => "peer_joined",
-        SdpMessage::PeerLeft { .. } => "peer_left",
-        SdpMessage::ScreenShareStarted { .. } => "screen_share_started",
-        SdpMessage::ScreenShareStopped { .. } => "screen_share_stopped",
-        SdpMessage::MuteAudio { .. } => "mute_audio",
-        SdpMessage::UnmuteAudio { .. } => "unmute_audio",
-        SdpMessage::MuteVideo { .. } => "mute_video",
-        SdpMessage::UnmuteVideo { .. } => "unmute_video",
-        SdpMessage::VideoConfigChanged { .. } => "video_config_changed",
-        SdpMessage::RequestRenegotiation { .. } => "request_renegotiation",
-        SdpMessage::RoomStatus { .. } => "room_status",
-        SdpMessage::E2eePublicKey { .. } => "e2ee_public_key",
-        SdpMessage::E2eeSenderKey { .. } => "e2ee_sender_key",
-        SdpMessage::E2eeKeyRotation { .. } => "e2ee_key_rotation",
-        SdpMessage::ChatMessage { .. } => "chat_message",
-        SdpMessage::ActiveSpeaker { .. } => "active_speaker",
-        SdpMessage::Error { .. } => "error",
+    fn require_e2ee(&self) -> bool {
+        self.require_e2ee
+    }
+
+    fn e2ee_join_timeout(&self) -> std::time::Duration {
+        self.e2ee_join_timeout
+            .unwrap_or_else(|| self.inner.e2ee_join_timeout())
     }
 }
 
@@ -218,12 +200,15 @@ pub struct SeaMeetServerBuilder {
     bwe_kbps: Option<u32>,
     auth_fn: Option<AuthFn>,
     rate_fn: Option<RateCheckFn>,
+    allow_unauth_joins: bool,
     max_room_members: Option<usize>,
     max_chat_history: Option<usize>,
     max_room_id_len: Option<usize>,
     max_display_name_len: Option<usize>,
     event_capacity: usize,
     connection_fn: Option<ConnectionFn>,
+    require_e2ee: bool,
+    e2ee_join_timeout: Option<std::time::Duration>,
 }
 
 impl SeaMeetServerBuilder {
@@ -235,12 +220,15 @@ impl SeaMeetServerBuilder {
             bwe_kbps: None,
             auth_fn: None,
             rate_fn: None,
+            allow_unauth_joins: false,
             max_room_members: None,
             max_chat_history: None,
             max_room_id_len: None,
             max_display_name_len: None,
             event_capacity: 256,
             connection_fn: None,
+            require_e2ee: false,
+            e2ee_join_timeout: None,
         }
     }
 
@@ -317,6 +305,34 @@ impl SeaMeetServerBuilder {
         self
     }
 
+    /// Require end-to-end encryption for every participant. When enabled,
+    /// the server enforces that each peer publishes an `e2ee_public_key`
+    /// within [`Self::e2ee_join_timeout`] of their `Join`. Peers that
+    /// miss the deadline are disconnected with `403 e2ee_required`.
+    pub fn require_e2ee(mut self, required: bool) -> Self {
+        self.require_e2ee = required;
+        self
+    }
+
+    /// Override the grace period peers have to publish their E2EE public
+    /// key after `Join`. Defaults to 5 seconds. Only consulted when
+    /// [`Self::require_e2ee`] is true.
+    pub fn e2ee_join_timeout(mut self, dur: std::time::Duration) -> Self {
+        self.e2ee_join_timeout = Some(dur);
+        self
+    }
+
+    /// Explicitly opt out of authentication. Use this only for local
+    /// development, tests, or trusted-network deployments.
+    ///
+    /// `build()` refuses to construct a server without either
+    /// `on_authenticate` or this opt-in, to avoid silently shipping
+    /// open rooms. When this flag is set, `build()` logs a loud warning.
+    pub fn allow_unauthenticated_joins(mut self) -> Self {
+        self.allow_unauth_joins = true;
+        self
+    }
+
     // ── Connection handler ─────────────────────────────────────────────
 
     pub fn on_connection<F, Fut>(mut self, f: F) -> Self
@@ -331,6 +347,23 @@ impl SeaMeetServerBuilder {
     // ── Build ────────────────────────────────────────────────────────
 
     pub async fn build(self) -> Result<SeaMeetServer, SeaMeetError> {
+        if self.auth_fn.is_none() && !self.allow_unauth_joins {
+            return Err(SeaMeetError::Signaling(
+                "no authentication policy configured: call \
+                 SeaMeetServerBuilder::on_authenticate(...) or, for local \
+                 development only, ::allow_unauthenticated_joins()"
+                    .to_owned(),
+            ));
+        }
+        if self.auth_fn.is_none() {
+            tracing::warn!(
+                ws_addr = %self.ws_addr,
+                "SeaMeetServer starting WITHOUT authentication \
+                 (allow_unauthenticated_joins). Any client can join any room. \
+                 Do not use this in production."
+            );
+        }
+
         let sfu_config = SfuConfig {
             udp_port: self.udp_port,
             public_ip: self.public_ip,
@@ -340,6 +373,9 @@ impl SeaMeetServerBuilder {
 
         let sfu = SfuServer::new(sfu_config).await?;
         let state = sfu.signaling_state();
+        if self.require_e2ee {
+            state.write().await.set_e2ee_required(true);
+        }
         let udp_port = sfu.udp_local_addr().port();
 
         let (event_tx, _) = broadcast::channel::<ServerEvent>(self.event_capacity);
@@ -353,6 +389,8 @@ impl SeaMeetServerBuilder {
             max_chat_history: self.max_chat_history,
             max_room_id_len: self.max_room_id_len,
             max_display_name_len: self.max_display_name_len,
+            require_e2ee: self.require_e2ee,
+            e2ee_join_timeout: self.e2ee_join_timeout,
         });
 
         let connection_fn: ConnectionFn = match self.connection_fn {

@@ -231,6 +231,7 @@ mod tests {
                 if let SdpMessage::RoomStatus {
                     room_id,
                     participants,
+                    ..
                 } = &msg
                 {
                     if room_id == "room-leave" && !participants.iter().any(|p| p.id == id_a) {
@@ -246,6 +247,7 @@ mod tests {
             SdpMessage::RoomStatus {
                 room_id,
                 participants,
+                ..
             } => {
                 assert_eq!(room_id, "room-leave");
                 assert!(
@@ -396,6 +398,7 @@ mod tests {
                 Ok(Ok(SdpMessage::RoomStatus {
                     room_id,
                     participants,
+                    ..
                 })) => {
                     if !participants.iter().any(|p| p.id == id_a) {
                         leave_rooms.insert(room_id);
@@ -604,6 +607,211 @@ mod tests {
                 assert_eq!(track_id, 99);
             }
             other => panic!("expected ScreenShareStarted, got {other:?}"),
+        }
+    }
+
+    /// Starts a server that requires E2EE with a short (200ms) deadline so
+    /// the test runs quickly. Returns the `ws://` URL.
+    #[cfg(feature = "tungstenite")]
+    async fn start_e2ee_server(timeout: Duration) -> String {
+        let server = RoomServer::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .require_e2ee(true)
+            .with_e2ee_join_timeout(timeout);
+        let addr = server.local_addr().expect("local_addr");
+        server.run();
+        format!("ws://{addr}")
+    }
+
+    /// A peer that joins but never publishes its E2EE public key must be
+    /// disconnected with a 403 `e2ee_required` error.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_e2ee_required_timeout_disconnects() {
+        let url = start_e2ee_server(Duration::from_millis(200)).await;
+        let id = ParticipantId::random();
+
+        let mut ws = WsSignaling::connect(&url).await.expect("connect");
+        ws.send(SdpMessage::Join {
+            participant: id,
+            room_id: "e2ee-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("join");
+
+        // Wait past the deadline. Expect an Error message from the server.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let mut got_error = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, ws.recv()).await {
+                Ok(Ok(SdpMessage::Error { code, message })) => {
+                    assert_eq!(code, 403);
+                    assert_eq!(message, "e2ee_required");
+                    got_error = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(got_error, "expected 403 e2ee_required before deadline");
+    }
+
+    /// Same participant reconnecting with a fresh WebSocket must not be
+    /// removed from the room by the original connection's cleanup path.
+    /// This is the M3 invariant: identity survives a transient WS drop.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_reconnect_preserves_room_membership() {
+        let url = start_server().await;
+        let id_a = ParticipantId::random();
+        let id_b = ParticipantId::random();
+
+        // Peer B joins and stays connected to observe A's reconnect.
+        let mut b = WsSignaling::connect(&url).await.expect("connect B");
+        b.send(SdpMessage::Join {
+            participant: id_b,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("B join");
+
+        // First A connection.
+        let a1 = WsSignaling::connect(&url).await.expect("connect A1");
+        a1.send(SdpMessage::Join {
+            participant: id_a,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("A1 join");
+
+        // Wait until B has observed A in the room before swapping connections.
+        let saw_a = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = b.recv().await.expect("recv on B");
+                if let SdpMessage::RoomStatus {
+                    room_id,
+                    participants,
+                    ..
+                } = &msg
+                {
+                    if room_id == "reconnect-room"
+                        && participants.iter().any(|p| p.id == id_a)
+                    {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B to see A1 join");
+        assert!(saw_a);
+
+        // Second A connection arrives before A1 closes — common during a
+        // brief network blip on mobile.
+        let a2 = WsSignaling::connect(&url).await.expect("connect A2");
+        a2.send(SdpMessage::Join {
+            participant: id_a,
+            room_id: "reconnect-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("A2 join");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now drop the original connection. Its cleanup must detect that a
+        // newer generation has taken over and skip removing A from the room.
+        a1.close().await.expect("A1 close");
+        drop(a1);
+
+        // After A1's stale cleanup has had time to run, every subsequent
+        // RoomStatus that B receives MUST still contain A. We watch a
+        // window of ~500ms after the drop.
+        let result: Result<Result<(), &'static str>, _> =
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let msg = b.recv().await.expect("recv on B");
+                    if let SdpMessage::RoomStatus {
+                        room_id,
+                        participants,
+                        ..
+                    } = &msg
+                    {
+                        if room_id == "reconnect-room"
+                            && !participants.iter().any(|p| p.id == id_a)
+                        {
+                            return Err("A was removed from room after A1 closed");
+                        }
+                    }
+                }
+            })
+            .await;
+
+        if let Ok(Err(e)) = result {
+            panic!("{e}");
+        }
+        // `Err(timeout)` means we observed no "A missing" snapshot in the
+        // window — that's the success case.
+
+        // A2 should still be functional — send a message to verify.
+        a2.send(SdpMessage::Offer {
+            from: id_a,
+            to: None,
+            room_id: "reconnect-room".into(),
+            sdp: "v=0\r\n".into(),
+        })
+        .await
+        .expect("A2 still writable after A1 cleanup");
+    }
+
+    /// A peer that publishes its E2EE public key inside the deadline keeps
+    /// the connection alive past it.
+    #[cfg(feature = "tungstenite")]
+    #[tokio::test]
+    async fn test_e2ee_required_handshake_disarms_timer() {
+        let url = start_e2ee_server(Duration::from_millis(200)).await;
+        let id = ParticipantId::random();
+
+        let mut ws = WsSignaling::connect(&url).await.expect("connect");
+        ws.send(SdpMessage::Join {
+            participant: id,
+            room_id: "e2ee-room".into(),
+            display_name: None,
+            token: None,
+        })
+        .await
+        .expect("join");
+
+        ws.send(SdpMessage::E2eePublicKey {
+            from: id,
+            room_id: "e2ee-room".into(),
+            public_key: "test-pubkey".into(),
+        })
+        .await
+        .expect("e2ee public key");
+
+        // Past the deadline, no Error should arrive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let res = tokio::time::timeout(Duration::from_millis(50), ws.recv()).await;
+        match res {
+            Ok(Ok(SdpMessage::Error { message, .. })) if message == "e2ee_required" => {
+                panic!("connection was killed despite publishing e2ee_public_key");
+            }
+            _ => {}
         }
     }
 }

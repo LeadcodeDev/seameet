@@ -177,12 +177,30 @@ pub enum SdpMessage {
         /// Number of additional slots (audio+video pairs) needed.
         needed_slots: u32,
     },
+    /// Client → server: ask the SFU to PLI a specific peer's encoder so a fresh
+    /// keyframe is produced. Used by E2EE: a late joiner emits this after the
+    /// peer's sender key has been installed in its decryption worker, so the
+    /// next decoded keyframe is no longer dropped for "no key yet".
+    RequestKeyframe {
+        /// The participant making the request.
+        from: ParticipantId,
+        /// The participant whose encoder should produce a fresh keyframe.
+        target: ParticipantId,
+        /// The room this request belongs to.
+        room_id: String,
+    },
     /// Server-driven snapshot of all participants' media state in a room.
     RoomStatus {
         /// The room this status belongs to.
         room_id: String,
         /// Status of every participant in the room.
         participants: Vec<ParticipantStatus>,
+        /// Server-side enforcement flag. When true, the SFU will disconnect
+        /// any participant that does not emit an `e2ee_public_key` within
+        /// the join window. Clients should refuse to render media for
+        /// peers without E2EE state when this is true.
+        #[serde(default)]
+        e2ee_required: bool,
     },
     /// E2EE: broadcasts a participant's ECDH public key to the room.
     E2eePublicKey {
@@ -244,6 +262,17 @@ pub enum SdpMessage {
         /// Audio level (0 = silence, 127 = loudest).
         level: u8,
     },
+    /// Server → a specific receiver: the sharer `from`'s screen-share RTP is being
+    /// forwarded on transceiver `mid` for THIS receiver. The client binds its screen
+    /// tile to exactly this mid instead of guessing.
+    ScreenShareRouted {
+        /// The participant sharing their screen.
+        from: ParticipantId,
+        /// The transceiver mid on which this receiver will receive the screen RTP.
+        mid: String,
+        /// The room this share belongs to.
+        room_id: String,
+    },
     /// Error response from the server.
     Error {
         /// Error code.
@@ -273,13 +302,47 @@ impl SdpMessage {
             | Self::UnmuteVideo { room_id, .. }
             | Self::VideoConfigChanged { room_id, .. }
             | Self::RequestRenegotiation { room_id, .. }
+            | Self::RequestKeyframe { room_id, .. }
             | Self::RoomStatus { room_id, .. }
             | Self::E2eePublicKey { room_id, .. }
             | Self::E2eeSenderKey { room_id, .. }
             | Self::E2eeKeyRotation { room_id, .. }
             | Self::ChatMessage { room_id, .. }
-            | Self::ActiveSpeaker { room_id, .. } => Some(room_id),
+            | Self::ActiveSpeaker { room_id, .. }
+            | Self::ScreenShareRouted { room_id, .. } => Some(room_id),
             Self::Error { .. } => None,
+        }
+    }
+
+    /// Stable string tag for the variant — matches the `type` discriminator
+    /// produced by serde. Cheap to call, suitable for log fields.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Join { .. } => "join",
+            Self::Leave { .. } => "leave",
+            Self::Offer { .. } => "offer",
+            Self::Answer { .. } => "answer",
+            Self::IceCandidate { .. } => "ice_candidate",
+            Self::Ready { .. } => "ready",
+            Self::PeerJoined { .. } => "peer_joined",
+            Self::PeerLeft { .. } => "peer_left",
+            Self::ScreenShareStarted { .. } => "screen_share_started",
+            Self::ScreenShareStopped { .. } => "screen_share_stopped",
+            Self::MuteAudio { .. } => "mute_audio",
+            Self::UnmuteAudio { .. } => "unmute_audio",
+            Self::MuteVideo { .. } => "mute_video",
+            Self::UnmuteVideo { .. } => "unmute_video",
+            Self::VideoConfigChanged { .. } => "video_config_changed",
+            Self::RequestRenegotiation { .. } => "request_renegotiation",
+            Self::RequestKeyframe { .. } => "request_keyframe",
+            Self::RoomStatus { .. } => "room_status",
+            Self::E2eePublicKey { .. } => "e2ee_public_key",
+            Self::E2eeSenderKey { .. } => "e2ee_sender_key",
+            Self::E2eeKeyRotation { .. } => "e2ee_key_rotation",
+            Self::ChatMessage { .. } => "chat_message",
+            Self::ActiveSpeaker { .. } => "active_speaker",
+            Self::ScreenShareRouted { .. } => "screen_share_routed",
+            Self::Error { .. } => "error",
         }
     }
 }
@@ -499,6 +562,7 @@ mod tests {
                     e2ee: true,
                 },
             ],
+            e2ee_required: false,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("\"type\":\"room_status\""));
@@ -560,6 +624,21 @@ mod tests {
     }
 
     #[test]
+    fn test_request_keyframe_serde() {
+        let msg = SdpMessage::RequestKeyframe {
+            from: id_a(),
+            target: id_b(),
+            room_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("\"type\":\"request_keyframe\""));
+        let back: SdpMessage = serde_json::from_str(&json).expect("de");
+        assert_eq!(back, msg);
+        assert_eq!(msg.room_id(), Some("r1"));
+        assert_eq!(msg.kind(), "request_keyframe");
+    }
+
+    #[test]
     fn test_e2ee_key_rotation_serde() {
         let msg = SdpMessage::E2eeKeyRotation {
             from: id_a(),
@@ -572,5 +651,21 @@ mod tests {
         let back: SdpMessage = serde_json::from_str(&json).expect("de");
         assert_eq!(back, msg);
         assert_eq!(msg.room_id(), Some("r1"));
+    }
+
+    #[test]
+    fn test_screen_share_routed_serde() {
+        let msg = SdpMessage::ScreenShareRouted {
+            from: id_a(),
+            mid: "5".into(),
+            room_id: "room-1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"screen_share_routed\""));
+        assert!(json.contains("\"mid\":\"5\""));
+        let back: SdpMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind(), "screen_share_routed");
+        assert_eq!(back.room_id(), Some("room-1"));
+        assert_eq!(back, msg);
     }
 }

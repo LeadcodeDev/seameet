@@ -14,6 +14,10 @@ function getBitrate(height: number, fps: number): number {
   return fps > 30 ? Math.round(bitrate * 1.6) : bitrate
 }
 
+export function clampToBwe(base: number, bweCap: number | null): number {
+  return bweCap == null ? base : Math.min(base, bweCap)
+}
+
 interface TransceiverSlot {
   audioTransceiver: RTCRtpTransceiver
   videoTransceiver: RTCRtpTransceiver
@@ -70,6 +74,7 @@ export function useWebRTC({
   const renegotiatingRef = useRef(false)
   const renegotiationPendingRef = useRef(false)
   const renegotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const renegotiateRef = useRef<() => Promise<void>>(async () => {})
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const screenTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
   const localAudioTransceiverRef = useRef<RTCRtpTransceiver | null>(null)
@@ -78,6 +83,17 @@ export function useWebRTC({
 
   // Pool of pre-allocated transceiver pairs from the initial offer.
   const transceiverPoolRef = useRef<TransceiverSlot[]>([])
+
+  // Last participants list from room_status — used to re-reconcile after pool growth.
+  const lastParticipantsRef = useRef<Array<{
+    id: string; display_name?: string; audio_muted: boolean; video_muted: boolean; screen_sharing: boolean; e2ee?: boolean
+  }>>([])
+
+  // Tracks that arrived via ontrack before their peer/mid was reconciled.
+  const pendingTracksByMid = useRef<Map<string, MediaStreamTrack>>(new Map())
+
+  // ICE candidates that arrived before setRemoteDescription was called.
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([])
 
   // Message queue to serialize async message processing (like browser-demo's await)
   const messageQueueRef = useRef<SignalingMessage[]>([])
@@ -92,6 +108,7 @@ export function useWebRTC({
   const videoSettingsRef = useRef(videoSettings)
   const e2eeWorkerRef = useRef(e2eeWorker)
   const e2eeEnabledRef = useRef(e2eeEnabled)
+  const latestBweCapRef = useRef<number | null>(null)
 
   participantIdRef.current = participantId
   roomIdRef.current = roomId
@@ -125,6 +142,11 @@ export function useWebRTC({
       }
     }
 
+    // Clear any buffered tracks for this peer's mids so a future slot occupant
+    // does not inherit a stale track from a previous occupant.
+    if (info.audioMid) pendingTracksByMid.current.delete(info.audioMid)
+    if (info.videoMid) pendingTracksByMid.current.delete(info.videoMid)
+
     remotePeersRef.current.delete(peerId)
     updateRemotePeersState()
     console.log(`[WebRTC] removeRemotePeer: ${peerId.slice(0, 8)}, pool: ${transceiverPoolRef.current.length}`)
@@ -154,6 +176,19 @@ export function useWebRTC({
     if (audioTrack) stream.addTrack(audioTrack)
     if (videoTrack) stream.addTrack(videoTrack)
 
+    // Drain tracks that arrived before this peer was (re)added.
+    for (const mid of [audioMid, videoMid]) {
+      if (!mid) continue
+      const pending = pendingTracksByMid.current.get(mid)
+      if (pending) {
+        for (const old of stream.getTracks()) {
+          if (old.kind === pending.kind && old.id !== pending.id) stream.removeTrack(old)
+        }
+        stream.addTrack(pending)
+        pendingTracksByMid.current.delete(mid)
+      }
+    }
+
     const peer: RemotePeer = {
       id: peerId,
       displayName: displayName ?? peerId.slice(0, 8),
@@ -182,8 +217,63 @@ export function useWebRTC({
     }
 
     updateRemotePeersState()
+    signalingRef.current.send({
+      type: 'request_keyframe',
+      from: participantIdRef.current,
+      target: peerId,
+      room_id: roomIdRef.current,
+    })
     console.log(`[WebRTC] addRemotePeer: ${peerId.slice(0, 8)}, mids: audio=${audioMid} video=${videoMid}, tracks: ${stream.getTracks().length}, pool remaining: ${transceiverPoolRef.current.length}`)
   }, [removeRemotePeer, updateRemotePeersState])
+
+  const reconcile = useCallback((participants: Array<{
+    id: string; display_name?: string; audio_muted: boolean; video_muted: boolean; e2ee?: boolean
+  }>) => {
+    lastParticipantsRef.current = participants
+    const myId = participantIdRef.current
+    const remote = participants.filter(p => p.id !== myId)
+    const desired = new Set(remote.map(p => p.id))
+
+    // Remove peers no longer present.
+    for (const peerId of [...remotePeersRef.current.keys()]) {
+      if (!desired.has(peerId)) removeRemotePeer(peerId)
+    }
+    // Add peers not yet tracked.
+    for (const p of remote) {
+      if (!remotePeersRef.current.has(p.id)) addRemotePeer(p.id, p.display_name)
+    }
+    // Update flags on tracked peers.
+    for (const p of remote) {
+      const info = remotePeersRef.current.get(p.id)
+      if (info) {
+        info.audioMuted = p.audio_muted
+        info.videoMuted = p.video_muted
+        info.e2ee = p.e2ee ?? false
+      }
+    }
+    // Defensive track-disable for E2EE peers when local client has no E2EE.
+    if (!e2eeEnabledRef.current) {
+      for (const p of remote) {
+        if (!(p.e2ee ?? false)) continue
+        const info = remotePeersRef.current.get(p.id)
+        if (!info) continue
+        for (const track of info.stream.getTracks()) track.enabled = false
+      }
+    }
+    updateRemotePeersState()
+  }, [addRemotePeer, removeRemotePeer, updateRemotePeersState])
+
+  const finishRenegotiation = useCallback((): void => {
+    if (renegotiationTimerRef.current) {
+      clearTimeout(renegotiationTimerRef.current)
+      renegotiationTimerRef.current = null
+    }
+    renegotiatingRef.current = false
+    if (renegotiationPendingRef.current) {
+      renegotiationPendingRef.current = false
+      queueMicrotask(() => { void renegotiateRef.current() })
+    }
+  }, [])
 
   const renegotiate = useCallback(async () => {
     const pc = pcRef.current
@@ -202,11 +292,7 @@ export function useWebRTC({
     renegotiationTimerRef.current = setTimeout(() => {
       if (renegotiatingRef.current) {
         console.warn('[WebRTC] renegotiation timeout (10s) — resetting')
-        renegotiatingRef.current = false
-        if (renegotiationPendingRef.current) {
-          renegotiationPendingRef.current = false
-          renegotiate()
-        }
+        finishRenegotiation()
       }
     }, 10000)
 
@@ -216,7 +302,9 @@ export function useWebRTC({
       offer.sdp!,
     )
     console.log('[WebRTC] renegotiation offer sent')
-  }, [])
+  }, [finishRenegotiation])
+
+  renegotiateRef.current = renegotiate
 
   const createOfferToServer = useCallback(async (existingPeers: string[], displayNames?: Record<string, string>) => {
     console.log(`[WebRTC] createOfferToServer, existingPeers: ${existingPeers.length}, localStream: ${!!localStreamRef.current}`)
@@ -276,7 +364,11 @@ export function useWebRTC({
           return
         }
       }
-      console.log(`[WebRTC] unmatched track (mid=${mid})`)
+      // No peer owns this mid yet — buffer it; addRemotePeer drains on (re)add.
+      if (mid) {
+        pendingTracksByMid.current.set(mid, evt.track)
+        console.log(`[WebRTC] buffered track for unassigned mid=${mid}`)
+      }
     }
 
     pc.onconnectionstatechange = () => {
@@ -397,26 +489,18 @@ export function useWebRTC({
     if (data.type === 'answer') {
       const pc = pcRef.current
       if (!pc) return
-
-      if (renegotiationTimerRef.current) {
-        clearTimeout(renegotiationTimerRef.current)
-        renegotiationTimerRef.current = null
-      }
-
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp })
+        console.log('[WebRTC] answer applied')
+        const buffered = pendingIceRef.current
+        pendingIceRef.current = []
+        for (const init of buffered) {
+          try { await pc.addIceCandidate(init) } catch (e) { console.warn('[WebRTC] buffered ICE candidate error:', e) }
+        }
       } catch (e) {
         console.error('[WebRTC] setRemoteDescription failed:', e)
-        renegotiatingRef.current = false
-        return
-      }
-
-      console.log('[WebRTC] answer applied')
-      renegotiatingRef.current = false
-
-      if (renegotiationPendingRef.current) {
-        renegotiationPendingRef.current = false
-        await renegotiate()
+      } finally {
+        finishRenegotiation()
       }
       return
     }
@@ -424,12 +508,17 @@ export function useWebRTC({
     if (data.type === 'ice_candidate') {
       const pc = pcRef.current
       if (!pc) return
+      const init: RTCIceCandidateInit = {
+        candidate: data.candidate,
+        sdpMid: data.sdp_mid ?? null,
+        sdpMLineIndex: data.sdp_mline_index ?? null,
+      }
+      if (!pc.remoteDescription) {
+        pendingIceRef.current.push(init)
+        return
+      }
       try {
-        await pc.addIceCandidate({
-          candidate: data.candidate,
-          sdpMid: data.sdp_mid ?? null,
-          sdpMLineIndex: data.sdp_mline_index ?? null,
-        })
+        await pc.addIceCandidate(init)
       } catch (e) {
         console.warn('[WebRTC] ICE candidate error:', e)
       }
@@ -437,50 +526,7 @@ export function useWebRTC({
     }
 
     if (data.type === 'room_status') {
-      const myId = participantIdRef.current
-      const remoteParticipants = data.participants.filter(p => p.id !== myId)
-      const remoteIds = new Set(remoteParticipants.map(p => p.id))
-
-      // Remove peers no longer in the room
-      for (const peerId of remotePeersRef.current.keys()) {
-        if (!remoteIds.has(peerId)) {
-          removeRemotePeer(peerId)
-        }
-      }
-
-      // Add new peers not yet tracked
-      for (const p of remoteParticipants) {
-        if (!remotePeersRef.current.has(p.id)) {
-          addRemotePeer(p.id, p.display_name)
-        }
-      }
-
-      // Update media state for all remote peers
-      for (const p of remoteParticipants) {
-        const info = remotePeersRef.current.get(p.id)
-        if (info) {
-          info.audioMuted = p.audio_muted
-          info.videoMuted = p.video_muted
-          info.e2ee = p.e2ee ?? false
-        }
-      }
-
-      // Disable tracks for E2EE peers when local client has no E2EE.
-      // This prevents the browser from playing encrypted bytes as garbled audio/video.
-      // Note: we do NOT remove decrypt transforms for non-E2EE peers — the E2EE worker
-      // handles passthrough natively (no sender key → frame enqueued as-is).
-      if (!e2eeEnabledRef.current) {
-        for (const p of remoteParticipants) {
-          if (!(p.e2ee ?? false)) continue
-          const info = remotePeersRef.current.get(p.id)
-          if (!info) continue
-          for (const track of info.stream.getTracks()) {
-            track.enabled = false
-          }
-        }
-      }
-
-      updateRemotePeersState()
+      reconcile(data.participants)
       return
     }
 
@@ -495,60 +541,42 @@ export function useWebRTC({
         })
       }
       await renegotiate()
+      // Pool grew — re-attempt any peers that were skipped while the pool was
+      // exhausted (they were never added to remotePeers, so reconcile adds them now).
+      reconcile(lastParticipantsRef.current)
       return
     }
 
     if (data.type === 'screen_share_started') {
+      // Binding is now driven by the authoritative `screen_share_routed`
+      // message from the SFU (carries the exact mid). Nothing to do here.
+      console.log(`[WebRTC] screen_share_started from ${data.from.slice(0, 8)} (awaiting screen_share_routed)`)
+      return
+    }
+
+    if (data.type === 'screen_share_routed') {
       const peerId = data.from
       const pc = pcRef.current
       if (!pc) return
       const info = remotePeersRef.current.get(peerId)
       if (!info) return
-      console.log(`[WebRTC] screen_share_started from ${peerId.slice(0, 8)}`)
-
-      // The SFU routes screen share RTP to the first free video mid in its
-      // slot for this source peer.  That mid corresponds to a pre-allocated
-      // pool transceiver on this browser — find it by looking for the first
-      // video transceiver whose mid isn't already assigned to any peer or
-      // used for our own local tracks.
-      const usedMids = new Set<string | null>()
-      for (const [, peer] of remotePeersRef.current) {
-        usedMids.add(peer.audioMid)
-        usedMids.add(peer.videoMid)
-        if (peer.screenTransceiver) usedMids.add(peer.screenTransceiver.mid)
-      }
-
-      let screenTransceiver: RTCRtpTransceiver | null = null
-      for (const t of pc.getTransceivers()) {
-        if (t.mid === null) continue
-        if (t.receiver.track.kind !== 'video') continue
-        if (usedMids.has(t.mid)) continue
-        // Skip own transceivers (they have a local send track attached)
-        if (t.sender.track !== null) continue
-        screenTransceiver = t
-        break
-      }
-
-      if (!screenTransceiver) {
-        console.warn(`[WebRTC] no free video transceiver for screen share from ${peerId.slice(0, 8)}`)
+      const t = pc.getTransceivers().find(tr => tr.mid === data.mid)
+      if (!t) {
+        console.warn(`[WebRTC] screen_share_routed: no transceiver for mid=${data.mid}`)
         return
       }
-
       const screenStream = new MediaStream()
-      const videoTrack = screenTransceiver.receiver.track
+      const videoTrack = t.receiver.track
       if (videoTrack) screenStream.addTrack(videoTrack)
-
-      // Apply E2EE to remote screen share receiver
       if (e2eeEnabledRef.current && e2eeWorkerRef.current) {
-        screenTransceiver.receiver.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
+        t.receiver.transform = new RTCRtpScriptTransform(e2eeWorkerRef.current, {
           operation: 'decrypt', senderId: peerId,
         })
       }
-
-      info.screenTransceiver = screenTransceiver
+      info.screenTransceiver = t
       info.screenStream = screenStream
       updateRemotePeersState()
-      console.log(`[WebRTC] screen share routed via mid=${screenTransceiver.mid}`)
+      console.log(`[WebRTC] screen share bound to authoritative mid=${data.mid} for ${peerId.slice(0, 8)}`)
       return
     }
 
@@ -557,11 +585,11 @@ export function useWebRTC({
       if (!pc) return
       const floor = 100_000 // 100 kbps minimum
       const cap = Math.max(data.max_bitrate_bps, floor)
+      latestBweCapRef.current = cap
       for (const sender of pc.getSenders().filter(s => s.track?.kind === 'video')) {
         const params = sender.getParameters()
         if (params.encodings.length > 0) {
-          const currentMax = getBitrate(videoSettingsRef.current.height, videoSettingsRef.current.frameRate)
-          params.encodings[0].maxBitrate = Math.min(cap, currentMax)
+          params.encodings[0].maxBitrate = clampToBwe(getBitrate(videoSettingsRef.current.height, videoSettingsRef.current.frameRate), cap)
           sender.setParameters(params)
         }
       }
@@ -589,7 +617,7 @@ export function useWebRTC({
       updateRemotePeersState()
       return
     }
-  }, [createOfferToServer, addRemotePeer, removeRemotePeer, renegotiate, updateRemotePeersState])
+  }, [createOfferToServer, addRemotePeer, removeRemotePeer, reconcile, renegotiate, finishRenegotiation, updateRemotePeersState])
 
   const replaceLocalTracks = useCallback(async (stream: MediaStream) => {
     const audioTrack = stream.getAudioTracks()[0] ?? null
@@ -702,7 +730,7 @@ export function useWebRTC({
       for (const sender of videoSenders) {
         const params = sender.getParameters()
         if (params.encodings.length > 0) {
-          params.encodings[0].maxBitrate = getBitrate(videoSettings.height, videoSettings.frameRate)
+          params.encodings[0].maxBitrate = clampToBwe(getBitrate(videoSettings.height, videoSettings.frameRate), latestBweCapRef.current)
           params.encodings[0].maxFramerate = videoSettings.frameRate
           params.degradationPreference = 'maintain-resolution'
           sender.setParameters(params)

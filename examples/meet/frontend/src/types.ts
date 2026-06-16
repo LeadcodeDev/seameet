@@ -1,5 +1,5 @@
 export type SignalingMessage =
-  | { type: 'join'; participant: string; room_id: string; display_name?: string }
+  | { type: 'join'; participant: string; room_id: string; display_name?: string; token?: string }
   | { type: 'leave'; participant: string; room_id: string }
   | { type: 'ready'; room_id: string; initiator: boolean; peers: string[]; display_names?: Record<string, string> }
   | { type: 'offer'; from: string; to: string | null; room_id: string; sdp: string }
@@ -9,12 +9,14 @@ export type SignalingMessage =
   | { type: 'peer_left'; participant: string; room_id: string }
   | { type: 'screen_share_started'; from: string; room_id: string; track_id: number }
   | { type: 'screen_share_stopped'; from: string; room_id: string; track_id: number }
+  | { type: 'screen_share_routed'; from: string; mid: string; room_id: string }
   | { type: 'mute_audio'; from: string; room_id: string }
   | { type: 'unmute_audio'; from: string; room_id: string }
   | { type: 'mute_video'; from: string; room_id: string }
   | { type: 'unmute_video'; from: string; room_id: string }
   | { type: 'video_config_changed'; from: string; room_id: string; width: number; height: number; fps: number }
   | { type: 'request_renegotiation'; room_id: string; needed_slots: number }
+  | { type: 'request_keyframe'; from: string; target: string; room_id: string }
   | {
       type: 'room_status';
       room_id: string;
@@ -26,6 +28,7 @@ export type SignalingMessage =
         screen_sharing: boolean;
         e2ee?: boolean;
       }>;
+      e2ee_required?: boolean;
     }
   | { type: 'e2ee_public_key'; from: string; room_id: string; public_key: string }
   | { type: 'e2ee_sender_key'; from: string; to: string; room_id: string; encrypted_key: string; key_id: number }

@@ -1,16 +1,59 @@
-import { useMemo, useState, useCallback } from 'react'
-import { useParams, useLocation, Navigate } from 'react-router-dom'
+import { useState, useCallback, useEffect } from 'react'
+import { useParams, useLocation, Navigate, useNavigate } from 'react-router-dom'
 import { CallProvider, useCall } from '@/context/CallContext'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { VideoGrid } from '@/components/VideoGrid'
 import { ControlBar } from '@/components/ControlBar'
 import { ChatPanel } from '@/components/ChatPanel'
+import { useRoomSession } from '@/hooks/useRoomSession'
+import { getAuthToken } from '@/lib/auth'
 
 function RoomContent() {
-  const { chatMessages, sendChatMessage, participantId, mediaError, roomId } = useCall()
+  const navigate = useNavigate()
+  const {
+    chatMessages,
+    sendChatMessage,
+    participantId,
+    mediaError,
+    roomId,
+    reconnecting,
+    fatalError,
+    leave,
+  } = useCall()
   const [chatOpen, setChatOpen] = useState(false)
 
   const toggleChat = useCallback(() => setChatOpen(prev => !prev), [])
+
+  // Auth was rejected by the SFU's on_authenticate hook (e.g. an integrator
+  // wired a real IAM and the JWT is expired/invalid) — bounce back to the
+  // lobby so the user can re-auth with their IdP.
+  if (fatalError && fatalError.code === 401) {
+    return (
+      <div className="h-dvh flex items-center justify-center bg-background">
+        <div className="max-w-md w-full p-6 rounded-lg border bg-card text-card-foreground space-y-4 text-center">
+          <div className="text-lg font-medium text-destructive">
+            Session expirée
+          </div>
+          <div className="text-sm text-muted-foreground">
+            Votre jeton d'authentification a été refusé. Reconnectez-vous
+            pour rejoindre la room.
+          </div>
+          <div className="flex gap-2 justify-center">
+            <button
+              data-testid="btn-relogin"
+              className="px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
+              onClick={() => {
+                leave()
+                navigate(`/${roomId}`)
+              }}
+            >
+              Reconnexion
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="h-dvh flex flex-col">
@@ -18,6 +61,26 @@ function RoomContent() {
       {mediaError && (
         <div className="bg-destructive/10 border-b border-destructive/20 px-4 py-2 text-sm text-destructive">
           Camera/microphone unavailable: {mediaError}
+        </div>
+      )}
+
+      {/* Reconnect banner */}
+      {reconnecting && (
+        <div
+          data-testid="reconnect-banner"
+          className="bg-amber-500/10 border-b border-amber-500/30 px-4 py-2 text-sm text-amber-700 dark:text-amber-400 text-center"
+        >
+          Connexion perdue, tentative de reconnexion…
+        </div>
+      )}
+
+      {/* Other fatal signalling errors (403 e2ee_required, etc.) */}
+      {fatalError && fatalError.code !== 401 && (
+        <div
+          data-testid="fatal-error-banner"
+          className="bg-destructive/10 border-b border-destructive/20 px-4 py-2 text-sm text-destructive text-center"
+        >
+          Erreur {fatalError.code} : {fatalError.message}
         </div>
       )}
 
@@ -50,28 +113,109 @@ function RoomContent() {
   )
 }
 
+function SessionGate({
+  status,
+  error,
+  onRetry,
+  onLeave,
+}: {
+  status: 'idle' | 'creating' | 'error'
+  error: string | null
+  onRetry: () => void
+  onLeave: () => void
+}) {
+  return (
+    <div className="h-dvh flex items-center justify-center bg-background">
+      <div className="max-w-md w-full p-6 rounded-lg border bg-card text-card-foreground space-y-4 text-center">
+        {status === 'creating' && (
+          <>
+            <div className="text-lg font-medium">Préparation de la room…</div>
+            <div className="text-sm text-muted-foreground">
+              Création de votre identité côté serveur.
+            </div>
+          </>
+        )}
+        {status === 'error' && (
+          <>
+            <div className="text-lg font-medium text-destructive">
+              Impossible de rejoindre la room
+            </div>
+            <div className="text-sm text-muted-foreground">{error ?? 'Erreur inconnue'}</div>
+            <div className="flex gap-2 justify-center">
+              <button
+                className="px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90"
+                onClick={onRetry}
+              >
+                Réessayer
+              </button>
+              <button
+                className="px-4 py-2 rounded-md border hover:bg-accent"
+                onClick={onLeave}
+              >
+                Retour
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function RoomPage() {
   const { code } = useParams<{ code: string }>()
   const location = useLocation()
+  const navigate = useNavigate()
   const displayName = sessionStorage.getItem('seameet-display-name')
 
-  const participantId = useMemo(() => crypto.randomUUID(), [])
+  const lobbyState = location.state as
+    | { cameraOn?: boolean; micOn?: boolean; e2eeOn?: boolean }
+    | null
 
-  const lobbyState = location.state as { cameraOn?: boolean; micOn?: boolean; e2eeOn?: boolean } | null
+  const [authToken, setAuthToken] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    getAuthToken().then((t) => {
+      if (!cancelled) setAuthToken(t)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Gate the REST POST on authToken being ready: we want the
+  // Authorization header set on the very first request.
+  const { session, status, error, retry } = useRoomSession(
+    authToken ? code : undefined,
+    authToken ? displayName ?? undefined : undefined,
+    { authToken: authToken ?? undefined },
+  )
 
   if (!displayName || !code) {
     return <Navigate to="/" replace />
   }
 
+  if (!authToken || status !== 'ready' || !session) {
+    return (
+      <SessionGate
+        status={status === 'ready' ? 'creating' : status}
+        error={error}
+        onRetry={retry}
+        onLeave={() => navigate('/')}
+      />
+    )
+  }
+
   return (
     <ErrorBoundary>
       <CallProvider
-        participantId={participantId}
+        participantId={session.participantId}
+        authToken={authToken}
         displayName={displayName}
         roomId={code}
         initialAudioEnabled={lobbyState?.micOn}
         initialVideoEnabled={lobbyState?.cameraOn}
-        initialE2EEEnabled={lobbyState?.e2eeOn}
+        initialE2EEEnabled={true}
       >
         <RoomContent />
       </CallProvider>

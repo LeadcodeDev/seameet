@@ -23,6 +23,11 @@ COPY --from=builder /build/target/release/meet /usr/local/bin/meet
 EXPOSE 3001/tcp
 EXPOSE 10000/udp
 
-ENV RUST_LOG=meet=debug,str0m=warn
+ENV RUST_LOG=meet=info,str0m=warn
+
+# Production note: this image listens on plain ws://0.0.0.0:3001. Terminate
+# TLS upstream (nginx, Caddy, ALB, …) and forward to this container. Set
+# SEAMEET_AUTH_TOKEN to a strong shared secret, or replace the example's
+# auth hook with a real identity check before exposing publicly.
 
 CMD ["meet"]

@@ -36,7 +36,14 @@ function createWrapper(opts: WrapperOptions | string = {}) {
       { initialEntries: [`/room/${roomId}`] },
       createElement(
         CallProvider,
-        { participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled },
+        {
+          participantId,
+          displayName,
+          roomId,
+          authToken: 'test-token',
+          initialAudioEnabled,
+          initialVideoEnabled,
+        },
         children
       )
     )
@@ -234,5 +241,42 @@ describe('CallContext', () => {
     await flushAsync(50)
 
     expect(hook.result.current.signalingState).toBe('open')
+  })
+
+  it('reconnecting becomes true after the WS drops post-open', async () => {
+    const { hook, ws } = await setupCall()
+    expect(hook.result.current.signalingState).toBe('open')
+    expect(hook.result.current.reconnecting).toBe(false)
+
+    await act(async () => {
+      ws.close()
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.signalingState).not.toBe('open')
+    expect(hook.result.current.reconnecting).toBe(true)
+  })
+
+  it('inbound error 401 surfaces fatalError', async () => {
+    const { hook, ws } = await setupCall()
+    expect(hook.result.current.fatalError).toBeNull()
+
+    await act(async () => {
+      ws.serverPush({ type: 'error', code: 401, message: 'token rejected' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.fatalError).toEqual({ code: 401, message: 'token rejected' })
+  })
+
+  it('inbound error 403 surfaces fatalError', async () => {
+    const { hook, ws } = await setupCall()
+
+    await act(async () => {
+      ws.serverPush({ type: 'error', code: 403, message: 'e2ee_required' })
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
+
+    expect(hook.result.current.fatalError).toEqual({ code: 403, message: 'e2ee_required' })
   })
 })

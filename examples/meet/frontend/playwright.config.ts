@@ -20,6 +20,9 @@ export default defineConfig({
       port: 3001,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
+      env: {
+        HTTP_ADDR: '0.0.0.0:3002',
+      },
     },
     {
       command: 'pnpm dev',

@@ -6,6 +6,8 @@ import { useWebRTC, type RemotePeer } from '@/hooks/useWebRTC'
 import { useE2EE, type E2EEPeerState } from '@/hooks/useE2EE'
 import type { ChatMessage } from '@/components/ChatPanel'
 import type { SignalingMessage } from '@/types'
+import { pushRecentSpeaker } from '@/lib/roomMode'
+import { useVerification, type VerificationStatus } from '@/hooks/useVerification'
 
 interface CallContextValue {
   participantId: string
@@ -24,13 +26,37 @@ interface CallContextValue {
   localScreenStream: MediaStream | null
   connectionState: RTCPeerConnectionState
   signalingState: 'connecting' | 'open' | 'closed'
+  /** True after the WebSocket has been open at least once and is now
+   *  re-establishing — used to render the "Reconnecting…" banner. */
+  reconnecting: boolean
+  /** Latest fatal signalling error from the SFU (e.g. 401 expired token,
+   *  403 e2ee_required). Null when none. */
+  fatalError: { code: number; message: string } | null
   leave: () => void
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, E2EEPeerState>
   e2eeSafetyNumbers: Map<string, string>
+  /** Tiles whose video frames the worker is currently dropping because no
+   *  E2EE key is installed yet. `local` is true when our own outbound
+   *  encryption is blocked; `peers` lists peer ids whose inbound frames we
+   *  cannot decrypt yet. The UI renders a "waiting for E2EE" overlay on
+   *  matching tiles. */
+  e2eeNotReady: { local: boolean; peers: Set<string> }
   chatMessages: ChatMessage[]
   sendChatMessage: (content: string) => void
   activeSpeakerId: string | null
+  /** Most-recent-first list of speakers, capped — used by VideoGrid to
+   *  decide who keeps live video when the room is too large to render
+   *  every tile. */
+  recentSpeakers: string[]
+  /** Per-peer verification status (session-scoped). Drives the "verified"
+   *  shield on tiles and the verify button in the safety-number panel. */
+  verificationStatus: (peerId: string) => VerificationStatus
+  /** Mark a peer as verified. The current safety number is snapshotted; if
+   *  it ever changes mid-session the status flips to 'changed'. */
+  markPeerVerified: (peerId: string) => void
+  /** Clear a peer's verification flag (manual revoke / dismiss warning). */
+  clearPeerVerification: (peerId: string) => void
   mediaError: string | null
 }
 
@@ -40,17 +66,27 @@ interface CallProviderProps {
   participantId: string
   displayName: string
   roomId: string
+  /**
+   * Bearer credential the SFU's `on_authenticate` hook will see. In this
+   * example it's a stub from `lib/auth.ts::getAuthToken()`; in production
+   * pass whatever your IAM returns (typically a JWT).
+   */
+  authToken: string
   initialAudioEnabled?: boolean
   initialVideoEnabled?: boolean
   initialE2EEEnabled?: boolean
   children: ReactNode
 }
 
-export function CallProvider({ participantId, displayName, roomId, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
+export function CallProvider({ participantId, displayName, roomId, authToken, initialAudioEnabled, initialVideoEnabled, initialE2EEEnabled, children }: CallProviderProps) {
   const navigate = useNavigate()
   const joinedRef = useRef(false)
+  const [joined, setJoined] = useState(false)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
+  const [recentSpeakers, setRecentSpeakers] = useState<string[]>([])
+  const [fatalError, setFatalError] = useState<{ code: number; message: string } | null>(null)
+  const everOpenRef = useRef(false)
 
   // Ref-based message routing: useSignaling → useWebRTC
   const webrtcHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
@@ -94,6 +130,16 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
       // Handle active speaker
       if (msg.type === 'active_speaker') {
         setActiveSpeakerId(msg.speaker)
+        setRecentSpeakers(prev => pushRecentSpeaker(prev, msg.speaker))
+        return
+      }
+      // Surface fatal signalling errors. 401 means the bearer was rejected
+      // by `on_authenticate` — the example only checks non-empty so we
+      // never see 401 in dev; integrators with a real IAM will, and should
+      // bounce the user back to their login flow.
+      if (msg.type === 'error') {
+        console.warn(`[CallContext] signaling error ${msg.code}: ${msg.message}`)
+        setFatalError({ code: msg.code, message: msg.message })
         return
       }
       webrtcHandlerRef.current(msg)
@@ -106,7 +152,10 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     participantId,
     roomId,
     signaling,
+    joined,
   })
+
+  const verification = useVerification(e2ee.safetyNumbers)
 
   // Ref for e2ee handler to avoid stale closures
   const e2eeHandlerRef = useRef<(msg: SignalingMessage) => void>(() => {})
@@ -154,17 +203,22 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     if (signaling.state === 'open' && media.mediaReady && !joinedRef.current) {
       joinedRef.current = true
       console.log(`[CallContext] joining room ${roomId} as ${participantId.slice(0, 8)}`)
-      signaling.join(participantId, roomId, displayName)
+      signaling.join(participantId, roomId, displayName, authToken)
       // Signal current mute state (correct on first join and on reconnection)
       signaling.send({ type: videoEnabledRef.current ? 'unmute_video' : 'mute_video', from: participantId, room_id: roomId })
       signaling.send({ type: audioEnabledRef.current ? 'unmute_audio' : 'mute_audio', from: participantId, room_id: roomId })
+      setJoined(true)
     }
-  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName])
+  }, [signaling.state, signaling, media.mediaReady, participantId, roomId, displayName, authToken])
 
   // Reset joinedRef when signaling reconnects
   useEffect(() => {
     if (signaling.state === 'closed') {
       joinedRef.current = false
+      setJoined(false)
+    }
+    if (signaling.state === 'open') {
+      everOpenRef.current = true
     }
   }, [signaling.state])
 
@@ -260,8 +314,16 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
             key_id: result.keyId,
           } as SignalingMessage)
         } else {
-          // Fallback to plaintext if encryption fails
-          signaling.sendChatMessage(participantId, roomId, content, displayName)
+          console.error('[chat] encryption failed; message NOT sent (no plaintext fallback)')
+          const ts = Date.now()
+          setChatMessages(prev => [...prev, {
+            id: `__system-${ts}`,
+            from: '__system',
+            displayName: 'system',
+            content: 'Message non envoyé : échec du chiffrement E2EE.',
+            timestamp: ts,
+            system: true,
+          }])
         }
       })
     } else {
@@ -291,13 +353,20 @@ export function CallProvider({ participantId, displayName, roomId, initialAudioE
     localScreenStream: webrtc.localScreenStream,
     connectionState: webrtc.connectionState,
     signalingState: signaling.state,
+    reconnecting: everOpenRef.current && signaling.state !== 'open',
+    fatalError,
     leave,
     e2eeEnabled: e2ee.enabled,
     e2eePeerStates: e2ee.peerStates,
     e2eeSafetyNumbers: e2ee.safetyNumbers,
+    e2eeNotReady: e2ee.e2eeNotReady,
     chatMessages,
     sendChatMessage: handleSendChatMessage,
     activeSpeakerId,
+    recentSpeakers,
+    verificationStatus: verification.status,
+    markPeerVerified: verification.markVerified,
+    clearPeerVerification: verification.clear,
     mediaError: media.error,
   }
 

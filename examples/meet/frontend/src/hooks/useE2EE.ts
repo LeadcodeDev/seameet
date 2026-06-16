@@ -2,6 +2,20 @@ import { useRef, useEffect, useCallback, useState } from 'react'
 import type { UseSignalingReturn } from '@/hooks/useSignaling'
 import type { SignalingMessage } from '@/types'
 
+// ── Constants ──────────────────────────────────────────────────────────
+
+/** Maximum number of queued e2ee_sender_key messages per peer before we start
+ *  dropping the oldest entry (oldest = lowest keyId). This prevents a slow or
+ *  misbehaving peer from growing the queue without bound. */
+const PENDING_SENDER_KEY_CAP = 20
+
+/** How often (ms) the not-ready recovery watchdog fires to re-broadcast our
+ *  public key toward peers stuck without a sender key installed. */
+const RECOVERY_INTERVAL_MS = 3000
+
+/** Maximum number of re-broadcast attempts per stuck peer before giving up. */
+const MAX_RECOVERY_ATTEMPTS = 5
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 export interface E2EEPeerState {
@@ -14,6 +28,11 @@ export interface UseE2EEOptions {
   participantId: string
   roomId: string
   signaling: UseSignalingReturn
+  /** True once the parent has sent its Join message to the SFU. The pubkey
+   *  broadcast is gated on this so the SFU has an active session when the
+   *  E2eePublicKey arrives — otherwise it is dropped and the e2ee_required
+   *  deadline (5s after Join) fires, kicking the participant. */
+  joined: boolean
 }
 
 export interface UseE2EEReturn {
@@ -37,6 +56,13 @@ export interface UseE2EEReturn {
   decryptChat: (from: string, ciphertext: string, keyId: number) => Promise<string | null>
   /** Per-peer safety numbers for identity verification (hex fingerprints). */
   safetyNumbers: Map<string, string>
+  /**
+   * Frames the worker had to drop because a key was not yet installed.
+   * `local` is true when our own outbound encryption was blocked (handshake
+   * not finished). `peers` lists peer IDs whose inbound frames we could not
+   * decrypt yet. The UI should render a "waiting for E2EE" overlay accordingly.
+   */
+  e2eeNotReady: { local: boolean; peers: Set<string> }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -138,7 +164,7 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 
 // ── Hook ───────────────────────────────────────────────────────────────
 
-export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOptions): UseE2EEReturn {
+export function useE2EE({ enabled, participantId, roomId, signaling, joined }: UseE2EEOptions): UseE2EEReturn {
   const workerRef = useRef<Worker | null>(null)
   const ecdhKeyPairRef = useRef<CryptoKeyPair | null>(null)
   const senderKeyRawRef = useRef<ArrayBuffer | null>(null)
@@ -157,9 +183,32 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   // Safety numbers per peer
   const safetyNumbersRef = useRef<Map<string, string>>(new Map())
   const [safetyNumbers, setSafetyNumbers] = useState<Map<string, string>>(new Map())
+  // Sender-key messages received before our shared secret with the peer was
+  // derived — either out-of-order arrival, or because handleMessage is async
+  // and an e2ee_sender_key handler can interleave between awaits of an
+  // in-flight e2ee_public_key handler from the same peer.
+  const pendingSenderKeysRef = useRef<Map<string, Array<{ encrypted_key: string; key_id: number }>>>(new Map())
+
+  // Fail-closed reporting: tiles whose video frames the worker had to drop
+  // because no key is installed yet.
+  const [e2eeNotReady, setE2eeNotReady] = useState<{ local: boolean; peers: Set<string> }>(
+    () => ({ local: false, peers: new Set() }),
+  )
 
   const signalingRef = useRef(signaling)
   signalingRef.current = signaling
+
+  // Mirror of e2eeNotReady kept fresh on every render so interval closures
+  // don't capture a stale value.
+  const e2eeNotReadyRef = useRef(e2eeNotReady)
+  e2eeNotReadyRef.current = e2eeNotReady
+
+  // Per-peer attempt counters for the recovery watchdog.
+  const recoveryAttemptsRef = useRef<Map<string, number>>(new Map())
+
+  // Forward reference to drainPendingSenderKeys (defined below) so the
+  // broadcast effect can call it without a circular declaration.
+  const drainPendingSenderKeysRef = useRef<((peerId: string) => Promise<void>) | null>(null)
 
   const updatePeerStates = useCallback(() => {
     setPeerStates(new Map(peerStatesRef.current))
@@ -177,18 +226,52 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     const worker = new Worker(new URL('../workers/e2ee-worker.ts', import.meta.url), { type: 'module' })
     workerRef.current = worker
 
+    const onWorkerMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; operation?: 'encrypt' | 'decrypt'; participantId?: string }
+      if (data?.type !== 'e2ee_not_ready') return
+      const op = data.operation
+      const pid = data.participantId
+      if (!op || !pid) return
+      setE2eeNotReady(prev => {
+        if (op === 'encrypt' && pid === participantId) {
+          if (prev.local) return prev
+          return { ...prev, local: true }
+        }
+        if (op === 'decrypt') {
+          if (prev.peers.has(pid)) return prev
+          const peers = new Set(prev.peers)
+          peers.add(pid)
+          return { ...prev, peers }
+        }
+        return prev
+      })
+    }
+    worker.addEventListener('message', onWorkerMessage)
+
     return () => {
+      worker.removeEventListener('message', onWorkerMessage)
       worker.terminate()
       workerRef.current = null
     }
-  }, [enabled])
+  }, [enabled, participantId])
 
   // ── Key Generation on Mount ────────────────────────────────────────
+  //
+  // Split into two effects: key generation runs once on mount (no network),
+  // public-key broadcast runs only when the WebSocket reaches `open`. The
+  // server enforces e2ee_required with a 5s timer after Join — if we send
+  // e2ee_public_key before the WS is OPEN, useSignaling.send() drops the
+  // message silently (readyState gate), the server times out and kicks the
+  // client with a 403 e2ee_required.
+
+  const keysReadyRef = useRef(false)
+  const [keysReady, setKeysReady] = useState(false)
+  const broadcastedRef = useRef(false)
 
   useEffect(() => {
     if (!enabled) return
 
-    async function init() {
+    async function genKeys() {
       ecdhKeyPairRef.current = await generateECDHKeyPair()
       senderKeyRawRef.current = await generateSenderKey()
       localKeyIdRef.current = 0
@@ -202,25 +285,49 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         rawKey: senderKeyRawRef.current,
       })
 
+      // Local sender key is now installed — clear the fail-closed local flag
+      // so the UI removes any "E2EE not ready" overlay on our own tile.
+      setE2eeNotReady(prev => (prev.local ? { ...prev, local: false } : prev))
+
+      keysReadyRef.current = true
+      setKeysReady(true)
+    }
+
+    genKeys()
+  }, [enabled, participantId])
+
+  // Reset the broadcast latch on disconnect so a reconnected WS gets a fresh
+  // pubkey broadcast (the server's view of who's E2EE-capable is per-session).
+  useEffect(() => {
+    if (signaling.state === 'closed') {
+      broadcastedRef.current = false
+    }
+  }, [signaling.state])
+
+  useEffect(() => {
+    if (!enabled || !keysReady) return
+    if (signaling.state !== 'open') return
+    if (!joined) return
+    if (broadcastedRef.current) return
+    broadcastedRef.current = true
+
+    async function broadcast() {
       // Derive shared secrets for any pubkeys received before keys were ready.
       // The handleMessage callback stored them in peerPublicKeysRef but couldn't
       // derive shared secrets because ecdhKeyPairRef was null at that point.
       const pendingPeers: string[] = []
       for (const [peerId, peerPubKey] of peerPublicKeysRef.current) {
         if (sharedSecretsRef.current.has(peerId)) continue
-        const shared = await deriveSharedSecret(ecdhKeyPairRef.current.privateKey, peerPubKey)
+        const shared = await deriveSharedSecret(ecdhKeyPairRef.current!.privateKey, peerPubKey)
         sharedSecretsRef.current.set(peerId, shared)
-        const sn = await computeSafetyNumber(ecdhKeyPairRef.current.publicKey, peerPubKey)
+        const sn = await computeSafetyNumber(ecdhKeyPairRef.current!.publicKey, peerPubKey)
         safetyNumbersRef.current.set(peerId, sn)
         pendingPeers.push(peerId)
       }
       updateSafetyNumbers()
 
-      // Broadcast public key. If not yet in the room (join not sent),
-      // the server will drop this — but onPeerJoined will re-broadcast
-      // when room_status arrives. If already in the room, this kicks off
-      // the key exchange with any peers waiting for our public key.
-      const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+      const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current!.publicKey)
+      console.log(`[E2EE][diag] broadcasting pubkey, pendingPeers=${pendingPeers.length}`)
       signalingRef.current.send({
         type: 'e2ee_public_key',
         from: participantId,
@@ -228,9 +335,16 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         public_key: pubKeyBase64,
       } as SignalingMessage)
 
-      // Send our sender key to peers whose pubkeys arrived before init completed.
-      // Without this, the remote peer has our pubkey (and can send us their sender
-      // key) but never receives ours — causing asymmetric decryption failure.
+      // Replay any sender_keys queued before our keys were ready (the peer's
+      // sender_key arrived before we had an ECDH keypair to derive a shared
+      // secret with).
+      for (const peerId of pendingPeers) {
+        await drainPendingSenderKeysRef.current?.(peerId)
+      }
+
+      // Send our sender key to peers whose pubkeys arrived before keys were
+      // ready. Without this, the remote peer has our pubkey (and can send us
+      // their sender key) but never receives ours — asymmetric decrypt fail.
       for (const peerId of pendingPeers) {
         const sharedSecret = sharedSecretsRef.current.get(peerId)
         if (!sharedSecret || !senderKeyRawRef.current) continue
@@ -246,14 +360,15 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       }
     }
 
-    init()
-  }, [enabled, participantId, roomId])
+    broadcast()
+  }, [enabled, keysReady, signaling.state, joined, participantId, roomId, updateSafetyNumbers])
 
   // ── Send public key to room ────────────────────────────────────────
 
   const broadcastPublicKey = useCallback(async () => {
     if (!enabled || !ecdhKeyPairRef.current) return
     const pubKeyBase64 = await exportPublicKey(ecdhKeyPairRef.current.publicKey)
+    console.log(`[E2EE][diag] broadcastPublicKey from=${participantId.slice(0, 8)}`)
     signalingRef.current.send({
       type: 'e2ee_public_key',
       from: participantId,
@@ -267,9 +382,13 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
   const sendSenderKeyTo = useCallback(async (peerId: string) => {
     const sharedSecret = sharedSecretsRef.current.get(peerId)
     const senderKeyRaw = senderKeyRawRef.current
-    if (!sharedSecret || !senderKeyRaw) return
+    if (!sharedSecret || !senderKeyRaw) {
+      console.warn(`[E2EE][diag] sendSenderKeyTo(${peerId.slice(0, 8)}) skipped — sharedSecret=${!!sharedSecret} senderKeyRaw=${!!senderKeyRaw}`)
+      return
+    }
 
     const encrypted = await encryptSenderKey(sharedSecret, senderKeyRaw)
+    console.log(`[E2EE][diag] sending sender key → ${peerId.slice(0, 8)}, keyId=${localKeyIdRef.current}, from=${participantId.slice(0, 8)}`)
     signalingRef.current.send({
       type: 'e2ee_sender_key',
       from: participantId,
@@ -279,38 +398,6 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       key_id: localKeyIdRef.current,
     } as SignalingMessage)
   }, [participantId, roomId])
-
-  // ── Rotate sender key (generate new, distribute to all peers) ──────
-
-  const rotateSenderKey = useCallback(async () => {
-    if (!enabled || !senderKeyRawRef.current) return
-    const newKeyId = localKeyIdRef.current + 1
-    senderKeyRawRef.current = await generateSenderKey()
-    localKeyIdRef.current = newKeyId
-    setLocalKeyId(newKeyId)
-
-    // Update worker with new key
-    workerRef.current?.postMessage({
-      type: 'setKey',
-      participantId,
-      keyId: newKeyId,
-      rawKey: senderKeyRawRef.current,
-    })
-
-    // Purge old keys after a delay (allow in-transit frames)
-    setTimeout(() => {
-      workerRef.current?.postMessage({
-        type: 'purgeOldKeys',
-        participantId,
-        keepKeyId: newKeyId,
-      })
-    }, 5000)
-
-    // Send new key to all peers
-    for (const peerId of sharedSecretsRef.current.keys()) {
-      await sendSenderKeyTo(peerId)
-    }
-  }, [enabled, participantId, sendSenderKeyTo])
 
   // ── DH Ratchet (every 2 minutes) ─────────────────────────────────
   //
@@ -354,7 +441,15 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
       // 5. Clear old shared secrets (they used the old ECDH keypair)
       sharedSecretsRef.current.clear()
 
-      // 6. Broadcast new public key — peers will:
+      // 6. Notify peers that a rotation occurred so they can mark our key stale.
+      signalingRef.current.send({
+        type: 'e2ee_key_rotation',
+        from: participantId,
+        room_id: roomId,
+        key_id: newKeyId,
+      } as SignalingMessage)
+
+      // 7. Broadcast new public key — peers will:
       //    a) Derive new shared secret (their private + our new public)
       //    b) Respond with their public key
       //    c) We re-derive shared secret and send new sender key
@@ -366,7 +461,107 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     return () => clearInterval(interval)
   }, [enabled, participantId, roomId, broadcastPublicKey])
 
+  // ── Not-ready recovery watchdog ───────────────────────────────────
+  //
+  // While a peer is stuck in e2eeNotReady (the worker couldn't decrypt their
+  // frames because no sender key is installed yet), periodically re-broadcast
+  // our own public key. Re-broadcasting triggers the peer's e2ee_public_key
+  // handler, which calls sendSenderKeyTo(us), re-delivering their sender key so
+  // processSenderKey can install it and clear the overlay.
+  // Bounded to MAX_RECOVERY_ATTEMPTS per peer to avoid infinite churn.
+
+  useEffect(() => {
+    if (!enabled) return
+
+    const interval = setInterval(() => {
+      const stuck = [...e2eeNotReadyRef.current.peers]
+
+      // Drop attempt counters for peers that are no longer stuck.
+      for (const peerId of recoveryAttemptsRef.current.keys()) {
+        if (!stuck.includes(peerId)) {
+          recoveryAttemptsRef.current.delete(peerId)
+        }
+      }
+
+      // Peers that still have attempts remaining.
+      const needy = stuck.filter(
+        p => (recoveryAttemptsRef.current.get(p) ?? 0) < MAX_RECOVERY_ATTEMPTS,
+      )
+
+      if (needy.length > 0) {
+        void broadcastPublicKey()
+        for (const p of needy) {
+          recoveryAttemptsRef.current.set(p, (recoveryAttemptsRef.current.get(p) ?? 0) + 1)
+        }
+      }
+    }, RECOVERY_INTERVAL_MS)
+
+    return () => clearInterval(interval)
+  }, [enabled, broadcastPublicKey])
+
   // ── Handle E2EE signaling messages ─────────────────────────────────
+
+  const processSenderKey = useCallback(async (
+    senderId: string,
+    encryptedKey: string,
+    keyId: number,
+  ) => {
+    const sharedSecret = sharedSecretsRef.current.get(senderId)
+    if (!sharedSecret) {
+      console.warn(`[E2EE] processSenderKey called without shared secret for ${senderId.slice(0, 8)}`)
+      return
+    }
+
+    try {
+      const senderKeyRaw = await decryptSenderKey(sharedSecret, encryptedKey)
+
+      peerSenderKeysRef.current.set(senderId, { raw: senderKeyRaw, keyId })
+
+      workerRef.current?.postMessage({
+        type: 'setKey',
+        participantId: senderId,
+        keyId,
+        rawKey: senderKeyRaw,
+      })
+
+      peerStatesRef.current.set(senderId, { ready: true, keyId })
+      updatePeerStates()
+      // Sender key for this peer is now in the worker — clear the
+      // fail-closed overlay flag for this peer.
+      setE2eeNotReady(prev => {
+        if (!prev.peers.has(senderId)) return prev
+        const peers = new Set(prev.peers)
+        peers.delete(senderId)
+        return { ...prev, peers }
+      })
+      console.log(`[E2EE] sender key received from ${senderId.slice(0, 8)}, keyId=${keyId}`)
+
+      // Ask the SFU to PLI this peer's encoder. Until the worker had this
+      // key, every encrypted frame from the peer was dropped — including any
+      // keyframe — which left a black tile until the SFU's 30s safety-net
+      // PLI. A fresh keyframe now decodes immediately because the key is
+      // present.
+      console.log(`[E2EE][diag] sending request_keyframe → ${senderId.slice(0, 8)}`)
+      signalingRef.current.send({
+        type: 'request_keyframe',
+        from: participantId,
+        target: senderId,
+        room_id: roomId,
+      } as SignalingMessage)
+    } catch (e) {
+      console.error(`[E2EE] failed to decrypt sender key from ${senderId.slice(0, 8)}:`, e)
+    }
+  }, [participantId, roomId, updatePeerStates])
+
+  const drainPendingSenderKeys = useCallback(async (senderId: string) => {
+    const queue = pendingSenderKeysRef.current.get(senderId)
+    if (!queue || queue.length === 0) return
+    pendingSenderKeysRef.current.delete(senderId)
+    for (const item of queue) {
+      await processSenderKey(senderId, item.encrypted_key, item.key_id)
+    }
+  }, [processSenderKey])
+  drainPendingSenderKeysRef.current = drainPendingSenderKeys
 
   const handleMessage = useCallback(async (msg: SignalingMessage) => {
     if (!enabled) return
@@ -389,8 +584,17 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         safetyNumbersRef.current.set(senderId, safetyNumber)
         updateSafetyNumbers()
 
-        // Reply with our own public key (they may not have it yet)
-        await broadcastPublicKey()
+        // Drain any sender_key messages that arrived before the shared secret
+        // was ready (e.g. interleaved between the awaits above, or simply
+        // out-of-order on the wire).
+        await drainPendingSenderKeys(senderId)
+
+        // Do NOT broadcast our pubkey here. Our pubkey is broadcast on three
+        // explicit triggers: WS-open (broadcast effect), peer_joined
+        // (onPeerJoined), and DH ratchet. Auto-replying here creates an
+        // unbounded ping-pong: peer receives our reply → replies → we receive
+        // → reply → ... flooding signaling and tripping the SFU's
+        // e2ee_required deadline on Alice's side as the loop saturates.
 
         // Send our current sender key immediately — no rotation here.
         // Forward secrecy is already ensured: the new peer never had
@@ -410,31 +614,20 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
 
       const sharedSecret = sharedSecretsRef.current.get(senderId)
       if (!sharedSecret) {
-        console.warn(`[E2EE] received sender key from ${senderId.slice(0, 8)} but no shared secret`)
+        // Shared secret not yet derived — queue for replay once
+        // e2ee_public_key handling completes.
+        const queue = pendingSenderKeysRef.current.get(senderId) ?? []
+        queue.push({ encrypted_key: msg.encrypted_key, key_id: msg.key_id })
+        if (queue.length > PENDING_SENDER_KEY_CAP) {
+          queue.shift() // drop oldest to enforce the cap
+          console.warn(`[E2EE] pending sender-key queue for ${senderId.slice(0, 8)} exceeded cap (${PENDING_SENDER_KEY_CAP}), dropping oldest`)
+        }
+        pendingSenderKeysRef.current.set(senderId, queue)
+        console.log(`[E2EE] queued sender key from ${senderId.slice(0, 8)} pending shared secret`)
         return
       }
 
-      try {
-        const senderKeyRaw = await decryptSenderKey(sharedSecret, msg.encrypted_key)
-
-        // Store peer sender key for chat decryption
-        peerSenderKeysRef.current.set(senderId, { raw: senderKeyRaw, keyId: msg.key_id })
-
-        // Set in worker
-        workerRef.current?.postMessage({
-          type: 'setKey',
-          participantId: senderId,
-          keyId: msg.key_id,
-          rawKey: senderKeyRaw,
-        })
-
-        // Update peer state
-        peerStatesRef.current.set(senderId, { ready: true, keyId: msg.key_id })
-        updatePeerStates()
-        console.log(`[E2EE] sender key received from ${senderId.slice(0, 8)}, keyId=${msg.key_id}`)
-      } catch (e) {
-        console.error(`[E2EE] failed to decrypt sender key from ${senderId.slice(0, 8)}:`, e)
-      }
+      await processSenderKey(senderId, msg.encrypted_key, msg.key_id)
     }
 
     if (msg.type === 'e2ee_key_rotation') {
@@ -449,7 +642,7 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
         updatePeerStates()
       }
     }
-  }, [enabled, participantId, broadcastPublicKey, sendSenderKeyTo, updatePeerStates, updateSafetyNumbers])
+  }, [enabled, participantId, sendSenderKeyTo, processSenderKey, drainPendingSenderKeys, updatePeerStates, updateSafetyNumbers])
 
   // ── Peer lifecycle callbacks ───────────────────────────────────────
 
@@ -471,15 +664,23 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     sharedSecretsRef.current.delete(peerId)
     peerSenderKeysRef.current.delete(peerId)
     safetyNumbersRef.current.delete(peerId)
+    pendingSenderKeysRef.current.delete(peerId)
     updatePeerStates()
     updateSafetyNumbers()
+    setE2eeNotReady(prev => {
+      if (!prev.peers.has(peerId)) return prev
+      const peers = new Set(prev.peers)
+      peers.delete(peerId)
+      return { ...prev, peers }
+    })
 
     // Remove departed peer's keys from worker
     workerRef.current?.postMessage({ type: 'removeKeys', participantId: peerId })
 
-    // Rotate key so the departed peer can't decrypt future frames
-    await rotateSenderKey()
-  }, [enabled, rotateSenderKey, updatePeerStates, updateSafetyNumbers])
+    // No sender-key rotation on departure: the periodic DH ratchet (every 2
+    // minutes) provides forward secrecy without the per-departure freeze that
+    // hit existing peers when a tile left mid-call. See M2 in the spec.
+  }, [enabled, updatePeerStates, updateSafetyNumbers])
 
   // ── Chat encryption / decryption ──────────────────────────────────
 
@@ -537,5 +738,6 @@ export function useE2EE({ enabled, participantId, roomId, signaling }: UseE2EEOp
     encryptChat,
     decryptChat,
     safetyNumbers,
+    e2eeNotReady,
   }
 }

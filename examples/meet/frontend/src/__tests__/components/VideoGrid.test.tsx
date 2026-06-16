@@ -26,7 +26,9 @@ interface MockCallValues {
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, { ready: boolean }>
   activeSpeakerId: string | null
+  recentSpeakers: string[]
   participantId: string
+  verificationStatus: (peerId: string) => 'unverified' | 'verified' | 'changed'
 }
 
 let mockCallValues: MockCallValues
@@ -58,9 +60,19 @@ function setCallValues(overrides: Partial<MockCallValues> = {}) {
     e2eeEnabled: false,
     e2eePeerStates: new Map(),
     activeSpeakerId: null,
+    recentSpeakers: [],
     participantId: 'local-id',
+    verificationStatus: () => 'unverified',
     ...overrides,
   }
+}
+
+function makeMany(n: number): Map<string, ReturnType<typeof makePeer>> {
+  const m = new Map<string, ReturnType<typeof makePeer>>()
+  for (let i = 0; i < n; i++) {
+    m.set(`peer-${i}`, makePeer(`peer-${i}`, `User ${i}`))
+  }
+  return m
 }
 
 describe('VideoGrid', () => {
@@ -129,5 +141,59 @@ describe('VideoGrid', () => {
     const tiles = container.querySelectorAll('[data-testid="video-tile"]')
     // local + local screen share = 2
     expect(tiles.length).toBe(2)
+  })
+
+  it('large mode (31–50 tiles) caps live videos and renders avatars for the rest', () => {
+    setCallValues({
+      remotePeers: makeMany(40),
+      activeSpeakerId: 'peer-3',
+      recentSpeakers: ['peer-3', 'peer-7'],
+    })
+    const { container } = render(<VideoGrid />)
+    const grid = container.querySelector('[data-testid="video-grid"]')!
+    expect(grid.getAttribute('data-room-mode')).toBe('large')
+
+    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
+    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+
+    // Local + bounded peers in the video region (LARGE_VIDEO_BUDGET = 12)
+    expect(videoTiles.length).toBeLessThanOrEqual(13)
+    // Avatar grid contains everyone not in the video set
+    expect(avatarTiles.length).toBeGreaterThan(0)
+    expect(videoTiles.length + avatarTiles.length).toBeGreaterThanOrEqual(40)
+  })
+
+  it('webinar mode (>50 tiles) shows video only for the active speaker', () => {
+    setCallValues({
+      remotePeers: makeMany(60),
+      activeSpeakerId: 'peer-12',
+      recentSpeakers: ['peer-12', 'peer-3'],
+    })
+    const { container } = render(<VideoGrid />)
+    const grid = container.querySelector('[data-testid="video-grid"]')!
+    expect(grid.getAttribute('data-room-mode')).toBe('webinar')
+
+    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
+    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+
+    // Local + active speaker = 2 video tiles total
+    expect(videoTiles.length).toBe(2)
+    // Everyone else (59) is an avatar
+    expect(avatarTiles.length).toBe(59)
+  })
+
+  it('webinar mode without an active speaker shows only the local video', () => {
+    setCallValues({
+      remotePeers: makeMany(60),
+      activeSpeakerId: null,
+      recentSpeakers: [],
+    })
+    const { container } = render(<VideoGrid />)
+
+    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
+    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+
+    expect(videoTiles.length).toBe(1)
+    expect(avatarTiles.length).toBe(60)
   })
 })

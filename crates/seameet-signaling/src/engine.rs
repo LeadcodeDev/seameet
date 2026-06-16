@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use seameet_core::ParticipantId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::Sleep;
 use tracing::{info, warn};
 
 use crate::message::{ParticipantStatus, SdpMessage};
@@ -262,6 +264,10 @@ pub struct SignalingState {
     /// atomic counter; a stale disconnect can detect that a newer
     /// connection replaced it and skip cleanup.
     connection_gens: HashMap<ParticipantId, u64>,
+    /// Server-wide flag exposed in every `RoomStatus` so clients know
+    /// the SFU is going to kick non-E2EE peers. Set once at boot via
+    /// `set_e2ee_required`.
+    e2ee_required: bool,
 }
 
 impl SignalingState {
@@ -271,7 +277,19 @@ impl SignalingState {
             rooms: HashMap::new(),
             connections: HashMap::new(),
             connection_gens: HashMap::new(),
+            e2ee_required: false,
         }
+    }
+
+    /// Toggle the global E2EE-required flag. Callers should set this once
+    /// at boot before accepting connections.
+    pub fn set_e2ee_required(&mut self, required: bool) {
+        self.e2ee_required = required;
+    }
+
+    /// Whether E2EE is mandatory for this server.
+    pub fn e2ee_required(&self) -> bool {
+        self.e2ee_required
     }
 
     /// Registers a participant in a room with an optional display name.
@@ -481,6 +499,21 @@ pub trait SignalingHooks: Send + Sync + 'static {
     fn max_display_name_len(&self) -> usize {
         64
     }
+
+    /// Whether the server enforces E2EE: a peer that does not emit a valid
+    /// `e2ee_public_key` within [`e2ee_join_timeout`] after `Join` is
+    /// disconnected with an `e2ee_required` error.
+    /// Default: false.
+    fn require_e2ee(&self) -> bool {
+        false
+    }
+
+    /// Window during which a freshly joined peer must announce its E2EE
+    /// public key. Only consulted when [`require_e2ee`] is true.
+    /// Default: 5 seconds.
+    fn e2ee_join_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
 }
 
 /// No-op hooks for a plain signaling relay server.
@@ -507,6 +540,41 @@ impl SignalingHooks for NoopHooks {
     }
 }
 
+/// `NoopHooks` variant that enforces an E2EE handshake deadline.
+/// Used by [`RoomServer::require_e2ee`](crate::room_server::RoomServer::require_e2ee).
+pub struct E2eeNoopHooks {
+    pub timeout: std::time::Duration,
+}
+
+impl SignalingHooks for E2eeNoopHooks {
+    async fn on_message(
+        &self,
+        _sdp: &SdpMessage,
+        _raw: &str,
+        _pid: ParticipantId,
+        _self_tx: &mpsc::UnboundedSender<String>,
+        _state: &Arc<RwLock<SignalingState>>,
+    ) -> bool {
+        false
+    }
+
+    async fn on_disconnect(
+        &self,
+        _pid: ParticipantId,
+        _affected_rooms: &[(String, bool)],
+        _state: &Arc<RwLock<SignalingState>>,
+    ) {
+    }
+
+    fn require_e2ee(&self) -> bool {
+        true
+    }
+
+    fn e2ee_join_timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+}
+
 // ── Room status broadcast ────────────────────────────────────────────────
 
 /// Broadcasts a `room_status` snapshot to ALL members of the room (including the sender).
@@ -516,6 +584,7 @@ pub fn broadcast_room_status(state: &SignalingState, room_id: &str) {
         let msg = SdpMessage::RoomStatus {
             room_id: room_id.to_owned(),
             participants: room.participants_snapshot(),
+            e2ee_required: state.e2ee_required(),
         };
         if let Ok(json) = serde_json::to_string(&msg) {
             room.broadcast_all(&json);
@@ -743,7 +812,43 @@ pub async fn run_connection<H: SignalingHooks>(
     static NEXT_CONN_GEN: AtomicU64 = AtomicU64::new(1);
     let my_gen = NEXT_CONN_GEN.fetch_add(1, Ordering::Relaxed);
 
-    while let Some(msg) = reader.recv().await {
+    // Deadline to receive an `e2ee_public_key` from this connection. Armed
+    // after `Join` when `require_e2ee()` is true, disarmed when the key
+    // arrives. If it fires, the connection is closed with an error.
+    let mut e2ee_deadline: Option<Pin<Box<Sleep>>> = None;
+
+    loop {
+        let msg = match e2ee_deadline.as_mut() {
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = deadline => {
+                    let pid_str = participant_id
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_owned());
+                    warn!(
+                        participant = %pid_str,
+                        "E2EE handshake timed out — disconnecting"
+                    );
+                    let err = SdpMessage::Error {
+                        code: 403,
+                        message: "e2ee_required".into(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&err) {
+                        let _ = tx.send(json);
+                    }
+                    // Yield briefly so the writer task drains the buffered
+                    // error frame to the WS sink before we abort it on the
+                    // disconnect path. Without this the client sees a raw
+                    // socket close instead of a structured 403.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    break;
+                }
+                msg = reader.recv() => msg,
+            },
+            None => reader.recv().await,
+        };
+        let Some(msg) = msg else { break };
+
         let sdp: SdpMessage = match serde_json::from_str(&msg) {
             Ok(m) => m,
             Err(e) => {
@@ -844,6 +949,13 @@ pub async fn run_connection<H: SignalingHooks>(
                 if !handled {
                     dispatch(&sanitized_sdp, &sanitized_raw, pid, &tx, &state, hooks.max_chat_history()).await;
                 }
+
+                // ── Arm the E2EE handshake deadline ────────────────────
+                if hooks.require_e2ee() {
+                    e2ee_deadline =
+                        Some(Box::pin(tokio::time::sleep(hooks.e2ee_join_timeout())));
+                }
+
                 continue;
             } else {
                 continue;
@@ -852,9 +964,16 @@ pub async fn run_connection<H: SignalingHooks>(
 
         let pid = participant_id.expect("set above");
 
+        // Disarm the E2EE deadline as soon as we hear a public key from
+        // this connection — the WS is bound to the participant, so any
+        // `e2ee_public_key` arriving here originates from this peer.
+        if matches!(&sdp, SdpMessage::E2eePublicKey { .. }) {
+            e2ee_deadline = None;
+        }
+
         // ── Rate limit check ───────────────────────────────────────────
         if !hooks.on_rate_check(pid).await {
-            warn!(participant = %pid, "rate limited");
+            warn!(participant = %pid, kind = sdp.kind(), "rate limited");
             continue;
         }
 
