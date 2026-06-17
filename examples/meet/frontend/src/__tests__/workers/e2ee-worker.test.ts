@@ -13,6 +13,7 @@ import {
   MAX_SKIP,
   MAX_INITIAL_SKIP,
   GCM_TAG_LENGTH,
+  HEADER_KID_LENGTH,
   E2EE_HEADER_LENGTH,
   TRAILER_LENGTH,
   REPLAY_WINDOW_SIZE,
@@ -350,6 +351,150 @@ describe('encrypt → decrypt round-trip', () => {
     )
 
     expect(Array.from(new Uint8Array(decrypted))).toEqual(Array.from(plaintext))
+  })
+})
+
+// ── Worker decryptFrame — stale-key deduplication (regression) ─────────
+//
+// Regression test for the bug where `setKey` accumulated multiple chain
+// entries for the SAME keyId, and `entries.find(e => (e.keyId & 0xff) ===
+// kid)` picked the FIRST (stale) one, causing decryption to fail with a
+// black tile. The fix filters out same-keyId entries before pushing, so
+// only the LATEST key material for a given keyId is retained.
+//
+// Test strategy:
+//   1. Install a stale key K1 at keyId=0.
+//   2. Re-install a current key K2 at the same keyId=0 (re-delivery, reuse).
+//   3. Build a real AES-GCM frame encrypted with K2.
+//   4. Route it through the worker's decrypt transform.
+//   5. Assert the frame was enqueued (decrypted successfully).
+//      — With old push-always behaviour entries.find() returns K1 → decrypt
+//        throws → frame is dropped and no enqueue occurs.
+//      — With the fix K2 is the sole entry → decrypt succeeds → enqueued.
+
+describe('e2ee-worker decryptFrame — stale same-keyId replacement', () => {
+  let originalPostMessage: typeof self.postMessage
+  const postedMessages: unknown[] = []
+
+  beforeEach(() => {
+    originalPostMessage = self.postMessage
+    postedMessages.length = 0
+    ;(self as unknown as Worker).postMessage = (msg: unknown) => {
+      postedMessages.push(msg)
+    }
+  })
+
+  afterEach(() => {
+    ;(self as unknown as Worker).postMessage = originalPostMessage
+  })
+
+  it('decrypts a frame with the LATEST key when the same keyId is delivered twice with different material', async () => {
+    await import('@/workers/e2ee-worker')
+
+    // Unique sender so module-level state from other tests does not bleed in.
+    const senderId = `test-sender-dedup-${Math.random().toString(36).slice(2)}`
+    const keyId = 0
+
+    // ── Generate two different keys with the same keyId ──────────────────
+    const rawKeyK1 = await generateRawKey()
+    const rawKeyK2 = await generateRawKey()
+
+    // Helper: dispatch a setKey message and wait for the async handler to finish.
+    async function dispatchSetKey(rawKey: ArrayBuffer) {
+      await new Promise<void>(resolve => {
+        self.dispatchEvent(
+          Object.assign(new MessageEvent('message', {
+            data: { type: 'setKey', participantId: senderId, keyId, rawKey },
+          }), {}),
+        )
+        // Give the async initChainEntry inside the handler time to complete.
+        Promise.resolve().then(() => setTimeout(resolve, 50))
+      })
+    }
+
+    // Install K1 first (stale), then K2 (current). After the fix, only K2
+    // survives in the senderChains entry for this sender.
+    await dispatchSetKey(rawKeyK1)
+    await dispatchSetKey(rawKeyK2)
+
+    // ── Build a real encrypted frame using K2 ────────────────────────────
+    // We use the same chain-entry helpers the worker itself uses so the frame
+    // format matches exactly what decryptFrame expects.
+    const encEntry = await initChainEntry(rawKeyK2, keyId)
+    const ctr = 1 // first frame counter
+    const plaintext = new TextEncoder().encode('regression-stale-key')
+
+    // Derive the per-frame message key (advances chain, mirrors encryptFrame).
+    const encKey = await getEncryptionKey(encEntry)
+    const iv = computeNonce(encEntry.baseSalt, ctr)
+
+    // Build the E2EE header: [KID 1B][CTR 4B big-endian]
+    const e2eeHeader = new Uint8Array(E2EE_HEADER_LENGTH)
+    e2eeHeader[0] = keyId & 0xff
+    new DataView(e2eeHeader.buffer).setUint32(HEADER_KID_LENGTH, ctr)
+
+    // No codec header for audio (payloadType=111 → 0 unencrypted bytes).
+    const codecHeader = new Uint8Array(0)
+    const aad = buildAAD(senderId, codecHeader, e2eeHeader)
+
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: aad, tagLength: GCM_TAG_LENGTH },
+      encKey,
+      plaintext,
+    )
+
+    // Frame layout: [e2eeHeader 5B][ciphertext+tag][trailer 1B = 0]
+    const ciphertextBytes = new Uint8Array(ciphertext)
+    const frameBuf = new ArrayBuffer(E2EE_HEADER_LENGTH + ciphertextBytes.byteLength + TRAILER_LENGTH)
+    const frameView = new Uint8Array(frameBuf)
+    frameView.set(e2eeHeader, 0)
+    frameView.set(ciphertextBytes, E2EE_HEADER_LENGTH)
+    frameView[E2EE_HEADER_LENGTH + ciphertextBytes.byteLength] = 0 // trailer: 0 unencrypted codec bytes
+
+    const frame = {
+      data: frameBuf,
+      getMetadata: () => ({ payloadType: 111 }), // audio → 0 unencrypted bytes
+    }
+
+    // ── Drive the frame through the worker's decrypt transform ───────────
+    const enqueuedFrames: unknown[] = []
+
+    const readable = new ReadableStream({
+      start(controller) {
+        controller.enqueue(frame)
+        controller.close()
+      },
+    })
+    const writable = new WritableStream({
+      write(chunk) {
+        enqueuedFrames.push(chunk)
+      },
+    })
+
+    self.dispatchEvent(
+      Object.assign(new Event('rtctransform'), {
+        transformer: {
+          readable,
+          writable,
+          options: { operation: 'decrypt', senderId },
+        },
+      }),
+    )
+
+    // Wait for the async pipeline to fully drain.
+    await new Promise(r => setTimeout(r, 200))
+
+    // ── Assert ───────────────────────────────────────────────────────────
+    // Exactly one frame should have been enqueued (decryption succeeded with K2).
+    // With the old push-always behaviour, entries.find() would return K1 (stale),
+    // AES-GCM decryption would throw, the frame would be dropped, and
+    // enqueuedFrames would remain empty.
+    expect(enqueuedFrames).toHaveLength(1)
+
+    // Verify the decrypted plaintext is correct (belt-and-suspenders).
+    const decryptedData = (enqueuedFrames[0] as { data: ArrayBuffer }).data
+    const decryptedText = new TextDecoder().decode(decryptedData)
+    expect(decryptedText).toBe('regression-stale-key')
   })
 })
 
