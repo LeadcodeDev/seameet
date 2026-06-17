@@ -354,7 +354,15 @@ self.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
 
   if (msg.type === 'setKey') {
     const entry = await initChainEntry(msg.rawKey, msg.keyId)
-    const entries = senderChains.get(msg.participantId) ?? []
+    // Replace any existing entry for the SAME keyId rather than accumulating.
+    // A peer's key for a given keyId can be (re)delivered multiple times with
+    // DIFFERENT material — keyId resets to 0 on refresh/reconnect/regeneration,
+    // and the recovery watchdog + re-handshakes re-send keys. Pushing duplicates
+    // left stale (keyId, key) pairs in the chain; `entries.find(keyId===kid)`
+    // then picked a stale entry and decryption failed (black tile). Keeping one
+    // entry per keyId — the latest delivered, i.e. the peer's current key —
+    // fixes it while still allowing distinct keyIds to coexist (ratchet overlap).
+    const entries = (senderChains.get(msg.participantId) ?? []).filter(e => e.keyId !== msg.keyId)
     entries.push(entry)
     senderChains.set(msg.participantId, entries)
     // Re-arm not-ready notifications: a future drop for this participant
