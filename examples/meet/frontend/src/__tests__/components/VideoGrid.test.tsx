@@ -3,6 +3,7 @@ import { render, cleanup } from '@testing-library/react'
 import { VideoGrid } from '@/components/VideoGrid'
 import { createMockStream } from '../mocks/mock-media'
 import React from 'react'
+import { VIDEO_GRID_BUDGET } from '@/lib/roomMode'
 
 afterEach(cleanup)
 
@@ -25,6 +26,7 @@ interface MockCallValues {
   localScreenStream: MediaStream | null
   e2eeEnabled: boolean
   e2eePeerStates: Map<string, { ready: boolean }>
+  e2eeNotReady: { local: boolean; peers: Set<string> }
   activeSpeakerId: string | null
   recentSpeakers: string[]
   participantId: string
@@ -59,6 +61,7 @@ function setCallValues(overrides: Partial<MockCallValues> = {}) {
     localScreenStream: null,
     e2eeEnabled: false,
     e2eePeerStates: new Map(),
+    e2eeNotReady: { local: false, peers: new Set() },
     activeSpeakerId: null,
     recentSpeakers: [],
     participantId: 'local-id',
@@ -75,53 +78,39 @@ function makeMany(n: number): Map<string, ReturnType<typeof makePeer>> {
   return m
 }
 
-describe('VideoGrid', () => {
-  it('1 participant renders grid-cols-1', () => {
-    setCallValues()
-    const { container } = render(<VideoGrid />)
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.className).toContain('grid-cols-1')
-  })
-
-  it('2 participants renders grid-cols-2', () => {
+describe('VideoGrid — uniform grid', () => {
+  it('always renders a single video-grid container (no spotlight, no filmstrip)', () => {
     setCallValues({
-      remotePeers: new Map([['peer-1', makePeer('peer-1', 'Bob')]]),
+      remotePeers: new Map([
+        ['p1', makePeer('p1', 'A')],
+        ['p2', makePeer('p2', 'B')],
+        ['p3', makePeer('p3', 'C')],
+        ['p4', makePeer('p4', 'D')],
+      ]),
+      activeSpeakerId: 'p1',
     })
     const { container } = render(<VideoGrid />)
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.className).toContain('grid-cols-2')
+
+    const grids = container.querySelectorAll('[data-testid="video-grid"]')
+    expect(grids.length).toBe(1)
+    // Must be a CSS grid, not a flex filmstrip
+    expect(grids[0].className).toContain('grid')
   })
 
-  it('5+ tiles with active speaker uses spotlight layout', () => {
-    const peers = new Map([
-      ['p1', makePeer('p1', 'A')],
-      ['p2', makePeer('p2', 'B')],
-      ['p3', makePeer('p3', 'C')],
-      ['p4', makePeer('p4', 'D')],
-    ])
-    setCallValues({ remotePeers: peers, activeSpeakerId: 'p1' })
+  it('renders the local tile plus one tile per remote peer', () => {
+    setCallValues({
+      remotePeers: new Map([
+        ['p1', makePeer('p1', 'Bob')],
+        ['p2', makePeer('p2', 'Carol')],
+      ]),
+    })
     const { container } = render(<VideoGrid />)
-
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.className).toContain('flex')
-    expect(grid.className).not.toContain('grid-cols')
+    const tiles = container.querySelectorAll('[data-testid="video-tile"]')
+    // local + 2 peers
+    expect(tiles.length).toBe(3)
   })
 
-  it('5+ tiles without active speaker uses grid layout', () => {
-    const peers = new Map([
-      ['p1', makePeer('p1', 'A')],
-      ['p2', makePeer('p2', 'B')],
-      ['p3', makePeer('p3', 'C')],
-      ['p4', makePeer('p4', 'D')],
-    ])
-    setCallValues({ remotePeers: peers, activeSpeakerId: null })
-    const { container } = render(<VideoGrid />)
-
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.className).toContain('grid')
-  })
-
-  it('renders screen share tiles separately', () => {
+  it('renders screen share tiles inside the same grid', () => {
     setCallValues({
       remotePeers: new Map([
         ['p1', makePeer('p1', 'Bob', { screenStream: createMockStream(['video']) as unknown as MediaStream })],
@@ -130,11 +119,17 @@ describe('VideoGrid', () => {
     const { container } = render(<VideoGrid />)
 
     const tiles = container.querySelectorAll('[data-testid="video-tile"]')
-    // local + remote + remote's screen share = 3
+    // local + remote camera + remote screen share = 3
     expect(tiles.length).toBe(3)
+
+    // All tiles are children of the same grid
+    const grid = container.querySelector('[data-testid="video-grid"]')!
+    expect(grid).toBeTruthy()
+    // No separate filmstrip or avatar-grid element
+    expect(container.querySelector('[data-testid="avatar-grid"]')).toBeNull()
   })
 
-  it('renders local screen share tile', () => {
+  it('renders local screen share tile inside the same grid', () => {
     setCallValues({ localScreenStream: createMockStream(['video']) as unknown as MediaStream })
     const { container } = render(<VideoGrid />)
 
@@ -143,57 +138,88 @@ describe('VideoGrid', () => {
     expect(tiles.length).toBe(2)
   })
 
-  it('large mode (31–50 tiles) caps live videos and renders avatars for the rest', () => {
-    setCallValues({
-      remotePeers: makeMany(40),
-      activeSpeakerId: 'peer-3',
-      recentSpeakers: ['peer-3', 'peer-7'],
-    })
+  it('with ≤ VIDEO_GRID_BUDGET total tiles, every peer tile reflects its own mute state', () => {
+    // 1 local + 3 peers = 4 total (well within budget=10)
+    const peers = new Map([
+      ['p1', makePeer('p1', 'A', { videoMuted: false })],
+      ['p2', makePeer('p2', 'B', { videoMuted: true })],
+      ['p3', makePeer('p3', 'C', { videoMuted: false })],
+    ])
+    setCallValues({ remotePeers: peers })
     const { container } = render(<VideoGrid />)
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.getAttribute('data-room-mode')).toBe('large')
 
-    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
-    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+    const tileByName = (name: string) =>
+      container.querySelector(`[data-participant="${name}"]`)!
 
-    // Local + bounded peers in the video region (LARGE_VIDEO_BUDGET = 12)
-    expect(videoTiles.length).toBeLessThanOrEqual(13)
-    // Avatar grid contains everyone not in the video set
-    expect(avatarTiles.length).toBeGreaterThan(0)
-    expect(videoTiles.length + avatarTiles.length).toBeGreaterThanOrEqual(40)
+    expect(tileByName('A').getAttribute('data-video')).toBe('on')
+    expect(tileByName('B').getAttribute('data-video')).toBe('off')
+    expect(tileByName('C').getAttribute('data-video')).toBe('on')
   })
 
-  it('webinar mode (>50 tiles) shows video only for the active speaker', () => {
+  it('with > VIDEO_GRID_BUDGET total tiles, only budget peers show video; rest show avatar', () => {
+    // 1 local + 14 peers = 15 total > budget(10)
+    // peer-0 is active speaker, peer-1 peer-2 are recent speakers
+    // They should be in the visible video set; peer-3 through peer-13 fill rest up to budget
+    // Budget is 10, so active + 2 recent + 7 more = 10 video peers
+    const n = 14
     setCallValues({
-      remotePeers: makeMany(60),
-      activeSpeakerId: 'peer-12',
-      recentSpeakers: ['peer-12', 'peer-3'],
+      remotePeers: makeMany(n),
+      activeSpeakerId: 'peer-0',
+      recentSpeakers: ['peer-0', 'peer-1', 'peer-2'],
     })
     const { container } = render(<VideoGrid />)
-    const grid = container.querySelector('[data-testid="video-grid"]')!
-    expect(grid.getAttribute('data-room-mode')).toBe('webinar')
 
-    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
-    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+    const allTiles = container.querySelectorAll('[data-testid="video-tile"]')
+    // 1 local + 14 peers (no screen shares)
+    expect(allTiles.length).toBe(15)
 
-    // Local + active speaker = 2 video tiles total
-    expect(videoTiles.length).toBe(2)
-    // Everyone else (59) is an avatar
-    expect(avatarTiles.length).toBe(59)
+    const videoOnTiles = container.querySelectorAll('[data-video="on"]')
+    const videoOffTiles = container.querySelectorAll('[data-video="off"]')
+
+    // Local tile is always on (videoEnabled=true in defaults)
+    // Budget peers are on, rest are off
+    // Total "on" = 1 (local) + VIDEO_GRID_BUDGET peers = 11
+    expect(videoOnTiles.length).toBe(1 + VIDEO_GRID_BUDGET)
+    expect(videoOffTiles.length).toBe(n - VIDEO_GRID_BUDGET)
   })
 
-  it('webinar mode without an active speaker shows only the local video', () => {
+  it('with > budget tiles, speakers are in the video set and non-speakers get avatars', () => {
+    const n = 15
+    // 1 local + 15 peers = 16 > budget(10)
+    const remotePeers = makeMany(n)
     setCallValues({
-      remotePeers: makeMany(60),
-      activeSpeakerId: null,
+      remotePeers,
+      activeSpeakerId: 'peer-14', // last peer (would not be in budget by iteration order)
+      recentSpeakers: ['peer-14'],
+    })
+    const { container } = render(<VideoGrid />)
+
+    // peer-14 must have video on (it's the active speaker)
+    const speakerTile = container.querySelector('[data-participant="User 14"]')!
+    expect(speakerTile).toBeTruthy()
+    expect(speakerTile.getAttribute('data-video')).toBe('on')
+
+    // peer-10 through peer-13 should be off (beyond budget after speaker+9 others)
+    // Actually: active speaker peer-14 is slot 1; then recent speakers (already in set);
+    // then peer-0 to peer-8 fill slots 2-10. peer-9 through peer-13 (except peer-14) are off.
+    // peer-9 is beyond budget (10 slots used: peer-14 + peer-0..peer-8)
+    const peer9Tile = container.querySelector('[data-participant="User 9"]')!
+    expect(peer9Tile.getAttribute('data-video')).toBe('off')
+  })
+
+  it('no avatar-tile elements are rendered — budget peers use VideoTile with videoEnabled=false', () => {
+    setCallValues({
+      remotePeers: makeMany(20),
+      activeSpeakerId: 'peer-0',
       recentSpeakers: [],
     })
     const { container } = render(<VideoGrid />)
 
-    const videoTiles = container.querySelectorAll('[data-testid="video-tile"]')
-    const avatarTiles = container.querySelectorAll('[data-testid="avatar-tile"]')
+    // AvatarTile has data-testid="avatar-tile"; it must not exist
+    expect(container.querySelector('[data-testid="avatar-tile"]')).toBeNull()
 
-    expect(videoTiles.length).toBe(1)
-    expect(avatarTiles.length).toBe(60)
+    // But avatar-placeholders inside VideoTile exist for the non-budget peers
+    const avatarPlaceholders = container.querySelectorAll('[data-testid="avatar-placeholder"]')
+    expect(avatarPlaceholders.length).toBeGreaterThan(0)
   })
 })
