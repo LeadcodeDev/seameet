@@ -377,7 +377,7 @@ pub async fn run_media(
                             || get_or_create_slot(
                                 m.source_pid, &mut source_slots,
                                 &all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
-                                &mid_seq_watermark,
+                                &mid_seq_watermark, m.is_screen,
                             ).is_some();
 
                         if !has_slot {
@@ -1015,11 +1015,16 @@ fn get_or_create_slot<'a>(
     own_audio_pt: u8,
     own_video_pt: u8,
     mid_seq_watermark: &HashMap<Mid, u64>,
+    media_is_screen: bool,
 ) -> Option<&'a mut SourceSlot> {
     if source_slots.contains_key(&source_pid) {
-        // Update screen_mid if it was previously None and a free video mid is now available.
+        // Update screen_mid if it was previously None and a free video mid is now available,
+        // but ONLY when the packet being forwarded is actual screen media. Assigning a
+        // screen_mid for regular camera/audio packets would steal video mids out of pool
+        // order, causing mid-assignment to diverge from the frontend's pre-allocated
+        // transceiver pool and making new participants invisible to existing peers.
         let needs_screen = source_slots.get(&source_pid).unwrap().screen_mid.is_none();
-        if needs_screen {
+        if media_is_screen && needs_screen {
             let used_mids: std::collections::HashSet<Mid> = source_slots
                 .values()
                 .flat_map(|s| {
@@ -1122,7 +1127,7 @@ fn write_forwarded_rtp(
     let Some(slot) = get_or_create_slot(
         media.source_pid, source_slots,
         all_mids, own_audio_mid, own_video_mid, own_screen_mid, own_audio_pt, own_video_pt,
-        mid_seq_watermark,
+        mid_seq_watermark, media.is_screen,
     ) else {
         warn!(source = %media.source_pid, "write_forwarded_rtp: no slot");
         return;
@@ -1389,7 +1394,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
         );
         assert!(slot.is_some());
         let slot = slot.unwrap();
@@ -1407,9 +1412,9 @@ a=recvonly\r\n";
         let own_video = Some(mid("1"));
 
         // Create slot
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), false);
         // Get same slot again
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), false);
         assert!(slot.is_some());
         assert_eq!(slot.unwrap().audio_mid, mid("2")); // same mid
         assert_eq!(slots.len(), 1); // still just one slot
@@ -1422,8 +1427,8 @@ a=recvonly\r\n";
         let own_audio = Some(mid("0"));
         let own_video = Some(mid("1"));
 
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), false);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), false);
 
         assert_eq!(slots.len(), 2);
         let s1 = slots.get(&pid(1)).unwrap();
@@ -1442,18 +1447,25 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
         ).unwrap();
         // Screen mid is NOT pre-assigned — it's assigned lazily when screen
         // share media actually arrives.
         assert!(slot.screen_mid.is_none());
 
-        // Calling get_or_create_slot again triggers the lazy upgrade path,
-        // which finds a free video mid and assigns it as screen_mid.
+        // A non-screen call must NOT assign a screen_mid even when a free video mid exists.
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             own_audio, own_video, None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
+        ).unwrap();
+        assert!(slot.screen_mid.is_none());
+
+        // Only when actual screen media is forwarded does the lazy upgrade fire.
+        let slot = get_or_create_slot(
+            pid(1), &mut slots, &all_mids,
+            own_audio, own_video, None, 111, 96,
+            &no_watermarks(), true,
         ).unwrap();
         assert!(slot.screen_mid.is_some());
     }
@@ -1473,9 +1485,9 @@ a=recvonly\r\n";
         let own_audio = Some(mid("0"));
         let own_video = Some(mid("1"));
 
-        // 1. Create slot + lazy screen_mid assignment (simulates first screen share).
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks());
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks()).unwrap();
+        // 1. Create slot, then simulate a screen packet arriving (media_is_screen = true).
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), false);
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), true).unwrap();
         let assigned_mid = slot.screen_mid;
         assert!(assigned_mid.is_some(), "screen_mid should be Some after lazy upgrade");
 
@@ -1492,7 +1504,7 @@ a=recvonly\r\n";
         let had_screen_mid_before = slots.get(&pid(1)).and_then(|s| s.screen_mid).is_some();
         assert!(!had_screen_mid_before);
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_audio, own_video, None, 111, 96, &no_watermarks(), true).unwrap();
         let gained_screen_mid = !had_screen_mid_before && slot.screen_mid.is_some();
 
         assert!(slot.screen_mid.is_some(), "screen_mid should be re-assigned after restart");
@@ -1511,7 +1523,7 @@ a=recvonly\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
         );
         assert!(slot.is_none());
     }
@@ -1535,10 +1547,10 @@ a=recvonly\r\n";
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
-        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
-        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
+        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).is_some());
+        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).is_some());
         // Peer 3 — no free audio/video mid
-        assert!(get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_none());
+        assert!(get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).is_none());
     }
 
     // ── Slot reuse after peer removal ───────────────────────────────
@@ -1556,15 +1568,15 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
 
         // Peer 1 takes the only available slot
-        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_some());
+        assert!(get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).is_some());
         // No room for peer 2
-        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).is_none());
+        assert!(get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).is_none());
 
         // Remove peer 1 → frees mid("2") and mid("3")
         slots.remove(&pid(1));
 
         // Now peer 2 can get a slot
-        let slot = get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        let slot = get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
         assert!(slot.is_some());
         let slot = slot.unwrap();
         assert_eq!(slot.audio_mid, mid("2"));
@@ -1586,14 +1598,14 @@ a=recvonly\r\n";
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false).unwrap();
         assert!(slot.screen_mid.is_none()); // no free video mid for screen
 
         // A new video mid becomes available (renegotiation added it)
         all_mids.push((mid("4"), MediaKind::Video));
 
-        // Re-access the slot — should pick up screen mid
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks()).unwrap();
+        // Re-access the slot with actual screen media — should pick up screen mid
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true).unwrap();
         assert_eq!(slot.screen_mid, Some(mid("4")));
     }
 
@@ -1607,7 +1619,7 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
         let own_s = Some(mid("6")); // reserve mid("6") as own screen
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, own_s, 111, 96, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, own_s, 111, 96, &no_watermarks(), false).unwrap();
         // Slot should NOT use mid("6") for its video or screen
         assert_ne!(slot.video_mid, mid("6"));
         assert_ne!(slot.screen_mid, Some(mid("6")));
@@ -1623,15 +1635,15 @@ a=recvonly\r\n";
         let own_v = Some(mid("1"));
 
         // Initial creation — screen_mid is None (lazy).
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
 
         assert!(slots.get(&pid(1)).unwrap().screen_mid.is_none());
         assert!(slots.get(&pid(2)).unwrap().screen_mid.is_none());
 
-        // Second access triggers lazy screen_mid upgrade.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        // Actual screen packets trigger lazy screen_mid assignment.
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
 
         let s1 = slots.get(&pid(1)).unwrap();
         let s2 = slots.get(&pid(2)).unwrap();
@@ -1650,6 +1662,37 @@ a=recvonly\r\n";
         assert_eq!(unique.len(), all_used.len(), "all mids should be unique across slots");
     }
 
+    // ── Regression: screen_mid must only be assigned for real screen media ──
+
+    /// Regression test: a camera-only source must never have a screen_mid
+    /// assigned just because a free video mid exists. Previously, the
+    /// existing-source branch would opportunistically assign a screen_mid on
+    /// every get_or_create_slot call, stealing a video mid from the pool and
+    /// diverging mid ordering from the frontend's pre-allocated transceiver pool.
+    #[test]
+    fn screen_mid_assigned_only_for_screen_media() {
+        let all_mids = make_mids();
+        let own_a = Some(mid("0"));
+        let own_v = Some(mid("1"));
+        let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
+
+        // Create a slot for a camera-only source (media_is_screen = false).
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
+        // A second non-screen call must NOT assign a screen_mid, even though a free video mid exists.
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
+        assert!(
+            slots.get(&pid(1)).unwrap().screen_mid.is_none(),
+            "non-screen media must not assign a screen_mid"
+        );
+
+        // Once actual screen media is forwarded, the screen_mid IS assigned.
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
+        assert!(
+            slots.get(&pid(1)).unwrap().screen_mid.is_some(),
+            "screen media must assign a screen_mid"
+        );
+    }
+
     // ── Seq number tracking ─────────────────────────────────────────
 
     #[test]
@@ -1657,7 +1700,7 @@ a=recvonly\r\n";
         let all_mids = make_mids();
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks(), false).unwrap();
         assert_eq!(slot.audio_tx_seq, 0);
         assert_eq!(slot.video_tx_seq, 0);
         assert_eq!(slot.screen_tx_seq, 0);
@@ -1670,13 +1713,13 @@ a=recvonly\r\n";
         let all_mids = make_mids();
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
 
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 111, 96, &no_watermarks(), false).unwrap();
         assert_eq!(slot.audio_pt, 111);
         assert_eq!(slot.video_pt, 96);
 
         // Different PTs
         slots.clear();
-        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 109, 100, &no_watermarks()).unwrap();
+        let slot = get_or_create_slot(pid(1), &mut slots, &all_mids, Some(mid("0")), Some(mid("1")), None, 109, 100, &no_watermarks(), false).unwrap();
         assert_eq!(slot.audio_pt, 109);
         assert_eq!(slot.video_pt, 100);
     }
@@ -1764,7 +1807,7 @@ a=mid:3\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
         );
         assert!(slot.is_none(), "should fail: free audio but no free video");
     }
@@ -1781,7 +1824,7 @@ a=mid:3\r\n";
         let slot = get_or_create_slot(
             pid(1), &mut slots, &all_mids,
             Some(mid("0")), Some(mid("1")), None, 111, 96,
-            &no_watermarks(),
+            &no_watermarks(), false,
         );
         assert!(slot.is_none(), "should fail: free video but no free audio");
     }
@@ -1803,7 +1846,7 @@ a=mid:3\r\n";
         // Cycle: create → remove → create different peer → remove → create first again
         for round in 0..3 {
             let peer = pid(round as u128 + 1);
-            let slot = get_or_create_slot(peer, &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+            let slot = get_or_create_slot(peer, &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
             assert!(slot.is_some(), "round {round}: should get slot");
             assert_eq!(slots.len(), 1);
             slots.remove(&peer);
@@ -1835,16 +1878,16 @@ a=mid:3\r\n";
         let own_v = Some(mid("1"));
 
         // First creation — no screen_mid.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
+        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
         assert_eq!(slots.len(), 3, "all 3 peers should get slots");
         assert!(slots.values().all(|s| s.screen_mid.is_none()), "no screen mids pre-assigned");
 
-        // Second access triggers lazy screen_mid upgrade.
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
-        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        // Actual screen packets trigger lazy screen_mid assignment.
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
+        get_or_create_slot(pid(2), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
+        get_or_create_slot(pid(3), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), true);
 
         let screens: Vec<_> = slots.values().filter(|s| s.screen_mid.is_some()).collect();
         assert_eq!(screens.len(), 3, "each peer should get a screen mid after lazy upgrade");
@@ -1859,7 +1902,7 @@ a=mid:3\r\n";
         let mut slots: HashMap<ParticipantId, SourceSlot> = HashMap::new();
         let own_a = Some(mid("0"));
         let own_v = Some(mid("1"));
-        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks());
+        get_or_create_slot(pid(1), &mut slots, &all_mids, own_a, own_v, None, 111, 96, &no_watermarks(), false);
 
         // 2 remote peers, 1 slot used, 1 free pair available → no deficit
         assert_eq!(needs_renegotiation(&all_mids, 2, &slots, 2), None);
