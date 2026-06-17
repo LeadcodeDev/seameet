@@ -1,59 +1,40 @@
-export type RoomMode = 'meeting' | 'large' | 'webinar'
-
-export const MEETING_MAX = 30
-export const WEBINAR_MIN = 50
-
 /**
- * In `large` mode we keep at most this many tiles with live video — the
- * rest fall back to avatar-only. Picked to match the visible budget the
- * `meeting` mode handles comfortably without overwhelming the decoder.
+ * The maximum number of peer tiles that should show live video simultaneously.
+ * When the total tile count (local + peers + screen shares) stays within this
+ * budget, every peer gets video. When it exceeds it, only the most-active
+ * speakers receive a live stream; the rest render an avatar placeholder inside
+ * the same grid.
  */
-export const LARGE_VIDEO_BUDGET = 12
-
-/**
- * Classify a room based on total tile count (local + remote + screen
- * shares — the same count the layout already uses to switch grids).
- *
- *   ≤ MEETING_MAX  → 'meeting'  (current behaviour, all tiles get video)
- *   ≤ WEBINAR_MIN  → 'large'    (cap video tiles, rest are avatars)
- *   else           → 'webinar'  (only the active speaker shows video)
- */
-export function classifyRoom(totalTiles: number): RoomMode {
-  if (totalTiles <= MEETING_MAX) return 'meeting'
-  if (totalTiles <= WEBINAR_MIN) return 'large'
-  return 'webinar'
-}
+export const VIDEO_GRID_BUDGET = 10
 
 export interface VisibleVideoSetInput {
   /** Every peer id that could potentially be rendered, in deterministic order. */
   peerIds: string[]
-  /** The local participant id — always allowed to see their own video. */
+  /** The local participant id — always renders their own video unconditionally. */
   localId: string
   /** Currently-talking participant, if any. */
   activeSpeakerId: string | null
   /** Most-recent-first speaker history (capped by the caller). */
   recentSpeakers: string[]
-  mode: RoomMode
+  /** Maximum number of peers to show video for. Defaults to VIDEO_GRID_BUDGET. */
+  budget?: number
 }
 
 /**
  * Decide which peers should render with their video stream attached.
- * Peers not in the returned set should render an avatar-only tile.
+ * Peers not in the returned set should render an avatar-only placeholder (same
+ * VideoTile component, videoEnabled=false) inside the uniform grid.
  *
- * Local always sees their own video (so it's *not* in this set, but the
- * caller is expected to render the local tile unconditionally).
+ * Local always sees their own video (so it is *not* in this set — the caller
+ * renders the local tile unconditionally).
  *
- * Order of preference for filling the budget in `large` mode:
+ * Fill order (up to `budget`):
  *   1. The active speaker (if any).
  *   2. Recent speakers, most-recent first.
  *   3. The remaining peers in iteration order (deterministic).
  */
 export function pickVisibleVideoSet(input: VisibleVideoSetInput): Set<string> {
-  const { peerIds, localId, activeSpeakerId, recentSpeakers, mode } = input
-
-  if (mode === 'meeting') {
-    return new Set(peerIds)
-  }
+  const { peerIds, localId, activeSpeakerId, recentSpeakers, budget = VIDEO_GRID_BUDGET } = input
 
   const visible = new Set<string>()
 
@@ -61,23 +42,20 @@ export function pickVisibleVideoSet(input: VisibleVideoSetInput): Set<string> {
     if (!id) return
     if (id === localId) return
     if (!peerIds.includes(id)) return
+    if (visible.size >= budget) return
     visible.add(id)
   }
 
   consider(activeSpeakerId)
 
-  if (mode === 'webinar') {
-    return visible
-  }
-
-  // large: fill remaining slots with recent speakers, then the rest.
   for (const speaker of recentSpeakers) {
-    if (visible.size >= LARGE_VIDEO_BUDGET) break
+    if (visible.size >= budget) break
     consider(speaker)
   }
+
   for (const peer of peerIds) {
-    if (visible.size >= LARGE_VIDEO_BUDGET) break
-    visible.add(peer)
+    if (visible.size >= budget) break
+    consider(peer)
   }
 
   return visible
